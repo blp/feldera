@@ -4043,18 +4043,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1435fa1053d8b2fbbe9be7e97eca7f33d37b28409959813daefc1446a14247f1"
 
 [[package]]
-name = "duct"
-version = "0.13.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4ab5718d1224b63252cd0c6f74f6480f9ffeb117438a2e0f5cf6d9a4798929c"
-dependencies = [
- "libc",
- "once_cell",
- "os_pipe",
- "shared_child",
-]
-
-[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5985,15 +5973,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "krb5-src"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a04b2f0dfefd7b54af22d22768dc3ab1ed5e55e6d5ff6af3f619069aa17c0ba4"
-dependencies = [
- "duct",
-]
-
-[[package]]
 name = "kv-log-macro"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7015,16 +6994,6 @@ checksum = "49203cdcae0030493bad186b28da2fa25645fa276a51b6fec8010d281e02ef79"
 dependencies = [
  "dlv-list 0.5.2",
  "hashbrown 0.14.5",
-]
-
-[[package]]
-name = "os_pipe"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ffd2b0a5634335b135d5728d84c5e0fd726954b87111f7506a61c502280d982"
-dependencies = [
- "libc",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8269,7 +8238,6 @@ dependencies = [
  "num_enum",
  "openssl-sys",
  "pkg-config",
- "sasl2-sys",
  "zstd-sys",
 ]
 
@@ -9067,19 +9035,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sasl2-sys"
-version = "0.1.22+2.1.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05f2a7f7efd9fc98b3a9033272df10709f5ee3fa0eabbd61a527a3a1ed6bd3c6"
-dependencies = [
- "cc",
- "duct",
- "krb5-src",
- "libc",
- "pkg-config",
-]
-
-[[package]]
 name = "scc"
 version = "2.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9460,16 +9415,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
-]
-
-[[package]]
-name = "shared_child"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09fa9338aed9a1df411814a5b2252f7cd206c55ae9bf2fa763f8de84603aa60c"
-dependencies = [
- "libc",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
