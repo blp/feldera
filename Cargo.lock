@@ -3625,7 +3625,7 @@ dependencies = [
  "metrics",
  "mimalloc-rust-sys",
  "minitrace",
- "nix 0.27.1",
+ "nix 0.29.0",
  "num",
  "num-derive",
  "num-format",
