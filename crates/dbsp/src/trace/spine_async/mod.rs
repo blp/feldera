@@ -16,8 +16,11 @@ use crate::{
     storage::buffer_cache::CacheStats,
     time::Timestamp,
     trace::{
-        cursor::CursorList, merge_batches, ord::fallback::pick_merge_destination, Batch,
-        BatchReader, BatchReaderFactories, Builder, Cursor, Filter, Trace,
+        cursor::{CursorList, Pending},
+        merge_batches,
+        ord::fallback::pick_merge_destination,
+        spine_async::{push_merger::ArcPushMerger, snapshot::FetchList},
+        Batch, BatchReader, BatchReaderFactories, Builder, Cursor, Filter, Trace,
     },
     Error, NumEntries, Runtime,
 };
@@ -27,7 +30,6 @@ pub use crate::trace::spine_async::snapshot::SpineSnapshot;
 use crate::trace::CommittedSpine;
 use enum_map::EnumMap;
 use feldera_storage::StoragePath;
-use list_merger::ArcMerger;
 use metrics::counter;
 use ouroboros::self_referencing;
 use rand::Rng;
@@ -49,11 +51,14 @@ use textwrap::indent;
 
 mod index_set;
 mod list_merger;
+mod push_merger;
 mod snapshot;
+use self::thread::{BackgroundThread, WorkerStatus};
+
+use super::{cursor::CursorFactory, BatchLocation};
+
 mod thread;
 
-use self::thread::{BackgroundThread, WorkerStatus};
-use super::BatchLocation;
 use crate::circuit::metrics::{BATCHES_PER_LEVEL, COMPACTION_STALL_TIME, ONGOING_MERGES_PER_LEVEL};
 pub use list_merger::ListMerger;
 
@@ -269,6 +274,7 @@ where
         let cache_stats = batches.iter().fold(CacheStats::default(), |stats, batch| {
             stats + batch.cache_stats()
         });
+
         self.merge_stats.report_merge(
             batches.iter().map(|b| b.len()).sum(),
             new_batch.len(),
@@ -357,6 +363,44 @@ where
     idle: Arc<Condvar>,
 }
 
+struct AsyncMerge<B>
+where
+    B: Batch,
+{
+    merger: ArcPushMerger<B>,
+    builder: B::Builder,
+}
+
+impl<B> AsyncMerge<B>
+where
+    B: Batch,
+{
+    fn new(
+        batches: Vec<Arc<B>>,
+        key_filter: &Option<Filter<B::Key>>,
+        value_filter: &Option<Filter<B::Val>>,
+    ) -> Self {
+        let factories = batches[0].factories();
+        let builder = B::Builder::for_merge(&factories, &batches, None);
+        Self {
+            merger: ArcPushMerger::new(&factories, batches, &key_filter, &value_filter),
+            builder,
+        }
+    }
+
+    fn merge(&mut self, frontier: &B::Time) -> Result<(), Pending> {
+        self.merger.merge(&mut self.builder, frontier)
+    }
+
+    fn prime(&mut self) {
+        self.merger.prime();
+    }
+
+    fn done(self) -> B {
+        self.builder.done()
+    }
+}
+
 impl<B> AsyncMerger<B>
 where
     B: Batch,
@@ -371,16 +415,7 @@ where
             let no_backpressure = Arc::clone(&no_backpressure);
             Box::new(|| {
                 let mut mergers = std::array::from_fn(|_| None);
-                let mut stored_fuel = std::array::from_fn(|_| 0);
-                Box::new(move || {
-                    Self::run(
-                        &mut stored_fuel,
-                        &mut mergers,
-                        &state,
-                        &idle,
-                        &no_backpressure,
-                    )
-                })
+                Box::new(move || Self::run(&mut mergers, &state, &idle, &no_backpressure))
             })
         });
         Self {
@@ -580,8 +615,7 @@ where
     }
 
     fn run(
-        stored_fuel: &mut [isize; MAX_LEVELS],
-        mergers: &mut [Option<ArcMerger<B>>; MAX_LEVELS],
+        mergers: &mut [Option<AsyncMerge<B>>; MAX_LEVELS],
         state: &Arc<Mutex<SharedState<B>>>,
         idle: &Arc<Condvar>,
         no_backpressure: &Arc<Condvar>,
@@ -594,23 +628,13 @@ where
 
         for (level, m) in mergers.iter_mut().enumerate() {
             if let Some(merger) = m.as_mut() {
-                // The following treatment of fuel works well for the test case
-                // used to tune it, but it is not theoretically sound or well
-                // principled. It is likely that it should be redone.
-                let starting_fuel = if level == 0 {
-                    isize::MAX
-                } else {
-                    stored_fuel[level].max(10_000)
-                };
-                let mut fuel = starting_fuel;
-                merger.work(&frontier, &mut fuel);
-                let fuel_consumed = starting_fuel - fuel;
-                stored_fuel[level] = (stored_fuel[level] - fuel_consumed).max(0);
-                stored_fuel[level + 1] += fuel_consumed;
-                if fuel > 0 {
+                let done = merger.merge(&frontier).is_ok();
+                if done {
                     let merger = m.take().unwrap();
                     let new_batch = Arc::new(merger.done());
                     state.lock().unwrap().merge_complete(level, new_batch);
+                } else {
+                    merger.prime();
                 }
             }
         }
@@ -629,15 +653,9 @@ where
             .filter_map(|(level, slot)| slot.try_start_merge(level).map(|batches| (level, batches)))
             .collect::<Vec<_>>();
         for (level, batches) in start_merges {
-            let factories = batches[0].factories();
-            let builder = B::Builder::for_merge(&factories, &batches, None);
-            mergers[level] = Some(ArcMerger::new(
-                &factories,
-                builder,
-                batches,
-                &key_filter,
-                &value_filter,
-            ));
+            let mut merger = AsyncMerge::new(batches, &key_filter, &value_filter);
+            merger.prime();
+            mergers[level] = Some(merger);
         }
 
         let state = state.lock().unwrap();
@@ -915,6 +933,23 @@ where
                 }
             }
         }
+    }
+
+    async fn fetch<KR>(
+        &self,
+        keys: &KR,
+    ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
+    where
+        KR: BatchReader<Key = Self::Key, Time = ()>,
+    {
+        Some(Box::new(
+            FetchList::new(
+                self.merger.get_batches(),
+                keys,
+                self.factories.weight_factory(),
+            )
+            .await,
+        ))
     }
 }
 
