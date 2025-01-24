@@ -14,7 +14,6 @@ use feldera_storage::{
 use feldera_types::config::{
     FileBackendConfig, StorageBackendConfig, StorageCacheConfig, StorageConfig,
 };
-use feldera_types::config::{StorageBackendConfig, StorageCacheConfig, StorageConfig};
 use metrics::counter;
 use std::ffi::OsString;
 use std::fs::{create_dir_all, DirEntry};
