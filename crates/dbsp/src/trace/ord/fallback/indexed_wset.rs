@@ -3,7 +3,7 @@ use crate::{
     dynamic::{DataTrait, DynVec, Erase, WeightTrait, WeightTraitTyped},
     storage::{buffer_cache::CacheStats, file::reader::Error as ReaderError},
     trace::{
-        cursor::DelegatingCursor,
+        cursor::{CursorFactory, DelegatingCursor},
         merge_batches_by_reference,
         ord::{
             file::indexed_wset_batch::FileIndexedWSetBuilder,
@@ -288,6 +288,19 @@ where
         match &self.inner {
             Inner::Vec(vec) => vec.maybe_contains_key(key),
             Inner::File(file) => file.maybe_contains_key(key),
+        }
+    }
+
+    async fn fetch<B>(
+        &self,
+        keys: &B,
+    ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
+    where
+        B: Batch<Key = Self::Key, Time = ()>,
+    {
+        match &self.inner {
+            Inner::Vec(vec) => vec.fetch(keys).await,
+            Inner::File(file) => file.fetch(keys).await,
         }
     }
 }
