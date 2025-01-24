@@ -940,97 +940,126 @@ where
     }
 }
 
-/*
-/// A cursor for taking ownership of ordered `(K, V, R, T)` tuples
-pub trait Consumer<K, V, R, T> {
-    /// The consumer for the values and diffs associated with a particular key
-    type ValueConsumer<'a>: ValueConsumer<'a, V, R, T>
-    where
-        Self: 'a;
+/// Row is not available yet.
+///
+/// This value indicates that data may exist, but that it is not available yet,
+/// because it is being loaded asynchronously in the background.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Pending;
 
-    /// Returns `true` if the current key is valid
-    fn key_valid(&self) -> bool;
-
-    /// Returns a reference to the current key
-    fn peek_key(&self) -> &K;
-
-    /// Takes ownership of the current key and gets the consumer for its
-    /// associated values
-    fn next_key(&mut self) -> (K, Self::ValueConsumer<'_>);
-
-    /// Advances the cursor to the specified value
-    fn seek_key(&mut self, key: &K)
-    where
-        K: Ord;
-}
-
-/// A cursor for taking ownership of the values and diffs associated with a
-/// given key
-pub trait ValueConsumer<'a, V, R, T> {
-    /// Returns `true` if the current value is valid
-    fn value_valid(&self) -> bool;
-
-    /// Takes ownership of the current value & diff pair
-    // TODO: Maybe this should yield another consumer for `(R, T)` pairs
-    fn next_value(&mut self) -> (V, R, T);
-
-    /// Provides the number of remaining values
-    fn remaining_values(&self) -> usize;
-
-    // TODO: Seek value method?
-}
-*/
-
-/*
-/// Debugging and testing utilities for Cursor.
-pub trait CursorDebug<K: Clone, V: Clone, T: Clone, R: Clone>: Cursor<K, V, T, R> {
-    /// Rewinds the cursor and outputs its contents to a Vec
-    #[allow(clippy::type_complexity)]
-    fn to_vec(&mut self) -> Vec<((K, V), Vec<(T, R)>)> {
-        let mut out = Vec::new();
-        self.rewind_keys();
-        self.rewind_vals();
-        while self.key_valid() {
-            while self.val_valid() {
-                let mut kv_out = Vec::new();
-                self.map_times(|ts, r| kv_out.push((ts.clone(), r.clone())));
-                out.push(((self.key().clone(), self.val().clone()), kv_out));
-                self.step_val();
-            }
-            self.step_key();
-        }
-        out
-    }
-
-    /// Returns values with time, weights for a given cursor.
-    ///
-    /// Starts wherever the current cursor is pointing to and walks to the end
-    /// of the values for the current key.
-    ///
-    /// Should only be called with `key_valid() == true`.
-    ///
-    /// # Panics
-    /// - Panics (in debug mode) if the key is not valid.
-    fn val_to_vec(&mut self) -> Vec<(V, Vec<(T, R)>)> {
-        debug_assert!(self.key_valid());
-        let mut vs = Vec::new();
-        while self.val_valid() {
-            let mut weights = Vec::new();
-            self.map_times(|ts, r| {
-                weights.push((ts.clone(), r.clone()));
-            });
-
-            vs.push((self.val().clone(), weights));
-            self.step_val();
-        }
-
-        vs
-    }
-}
-
-
-impl<C, K: Clone, V: Clone, T: Clone, R: Clone> CursorDebug<K, V, T, R> for C where
-    C: Cursor<K, V, T, R>
+pub trait PushCursor<K, V, T, R>
+where
+    K: ?Sized,
+    V: ?Sized,
+    R: ?Sized,
 {
+    fn key(&self) -> Result<Option<&K>, Pending>;
+    fn val(&self) -> Result<Option<&V>, Pending>;
+    fn map_times(&mut self, logic: &mut dyn FnMut(&T, &R));
+    fn weight(&mut self) -> &R
+    where
+        T: PartialEq<()>;
+    fn step_key(&mut self);
+    fn step_val(&mut self);
+    fn prime(&mut self) {}
 }
-*/
+
+impl<K, V, T, R, C> PushCursor<K, V, T, R> for Box<C>
+where
+    C: PushCursor<K, V, T, R> + ?Sized,
+    K: ?Sized,
+    V: ?Sized,
+    R: ?Sized,
+{
+    fn key(&self) -> Result<Option<&K>, Pending> {
+        (**self).key()
+    }
+
+    fn val(&self) -> Result<Option<&V>, Pending> {
+        (**self).val()
+    }
+
+    fn map_times(&mut self, logic: &mut dyn FnMut(&T, &R)) {
+        (**self).map_times(logic);
+    }
+
+    fn weight(&mut self) -> &R
+    where
+        T: PartialEq<()>,
+    {
+        (**self).weight()
+    }
+
+    fn step_key(&mut self) {
+        (**self).step_key();
+    }
+
+    fn step_val(&mut self) {
+        (**self).step_val();
+    }
+
+    fn prime(&mut self) {
+        (**self).prime();
+    }
+}
+
+pub struct DefaultPushCursor<K, V, T, R, C>
+where
+    K: ?Sized,
+    V: ?Sized,
+    R: ?Sized,
+    C: Cursor<K, V, T, R>,
+{
+    cursor: C,
+    phantom: PhantomData<(Box<K>, Box<V>, T, Box<R>)>,
+}
+
+impl<K, V, T, R, C> DefaultPushCursor<K, V, T, R, C>
+where
+    K: ?Sized,
+    V: ?Sized,
+    R: ?Sized,
+    C: Cursor<K, V, T, R>,
+{
+    pub fn new(cursor: C) -> Self {
+        Self {
+            cursor,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<K, V, T, R, C> PushCursor<K, V, T, R> for DefaultPushCursor<K, V, T, R, C>
+where
+    K: ?Sized,
+    V: ?Sized,
+    R: ?Sized,
+    C: Cursor<K, V, T, R>,
+{
+    fn key(&self) -> Result<Option<&K>, Pending> {
+        Ok(self.cursor.get_key())
+    }
+
+    fn val(&self) -> Result<Option<&V>, Pending> {
+        Ok(self.cursor.get_val())
+    }
+
+    fn map_times(&mut self, logic: &mut dyn FnMut(&T, &R)) {
+        self.cursor.map_times(logic);
+    }
+
+    fn weight(&mut self) -> &R
+    where
+        T: PartialEq<()>,
+    {
+        self.cursor.weight()
+    }
+
+    fn step_key(&mut self) {
+        self.cursor.step_key();
+    }
+
+    fn step_val(&mut self) {
+        self.cursor.step_val();
+    }
+}

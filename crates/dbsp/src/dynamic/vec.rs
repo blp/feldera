@@ -81,6 +81,15 @@ pub trait Vector<T: DataTrait + ?Sized>: Data {
         }
     }
 
+    /// Return a mutable reference to the last element, or `None` if empty.
+    fn last_mut(&mut self) -> Option<&mut T> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.index_mut(self.len() - 1))
+        }
+    }
+
     /// Return a reference to the element at `index`, eliding bounds checks.
     ///
     /// # Safety

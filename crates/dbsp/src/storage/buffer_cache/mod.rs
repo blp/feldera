@@ -6,6 +6,6 @@ mod cache;
 pub use feldera_storage::fbuf::{FBuf, FBufSerializer, LimitExceeded};
 
 pub use cache::{
-    AtomicCacheCounts, AtomicCacheStats, BufferCache, CacheAccess, CacheCounts, CacheEntry,
-    CacheStats,
+    AsyncCacheContext, AtomicCacheCounts, AtomicCacheStats, BufferCache, CacheAccess, CacheCounts,
+    CacheEntry, CacheStats,
 };
