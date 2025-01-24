@@ -3763,6 +3763,7 @@ dependencies = [
  "tracing",
  "typedmap",
  "uuid",
+ "walkdir",
  "xxhash-rust",
  "zip 0.6.6",
  "zstd 0.12.4",

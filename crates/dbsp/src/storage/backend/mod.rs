@@ -188,6 +188,15 @@ pub trait StorageBackend {
     /// Opens a file for reading.  The file `name` is relative to the base of
     /// the storage backend.
     fn open(&self, name: &Path) -> Result<Arc<dyn FileReader>, StorageError>;
+
+    /// Returns a value that tracks the space consumed within this backend, in
+    /// bytes.  The value reported might be incomplete at first because this
+    /// requires an initial traversal of the backend to count the size of
+    /// existing files.  As new files are created and old ones are deleted, the
+    /// value will be updated.
+    ///
+    /// A backend that does not support usage monitoring will return `None`.
+    fn monitor_usage(&self) -> Option<Arc<AtomicU64>> { None }
 }
 
 /// Returns a per-thread temporary directory.

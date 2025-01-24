@@ -2,6 +2,7 @@
 
 use feldera_types::config::StorageCacheConfig;
 use metrics::{counter, histogram};
+use walkdir::WalkDir;
 use std::{
     fs::{self, remove_file, File, OpenOptions},
     io::Error as IoError,
@@ -9,8 +10,8 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+        Arc, Mutex, Weak,
     },
     time::Instant,
 };
@@ -245,6 +246,9 @@ pub struct PosixBackend {
 
     /// Cache configuration.
     cache: StorageCacheConfig,
+
+    /// Current space usage in bytes.
+    usage: Arc<AtomicU64>,
 }
 
 impl PosixBackend {
@@ -258,6 +262,7 @@ impl PosixBackend {
         Self {
             base: base.as_ref().to_path_buf(),
             cache,
+            usage: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -297,6 +302,28 @@ impl StorageBackend for PosixBackend {
 
     fn open(&self, name: &Path) -> Result<Arc<dyn FileReader>, StorageError> {
         PosixReader::open(self.base.join(name), self.cache)
+    }
+
+    fn monitor_usage(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        let mut guard = self.usage.lock().unwrap();
+        if let Some(usage) = guard.upgrade() {
+            Some(usage)
+        } else {
+            let usage = Arc::new(AtomicU64::new(0));
+            *guard = Arc::downgrade(&usage);
+            drop(guard);
+
+            TOKIO.spawn_blocking({
+                let usage = usage.clone();
+                let path = self.base.clone();
+                move || {
+                    for dir_entry in WalkDir::new(&path).into_iter() {
+                        
+                    }
+                }
+            });
+            Some(usage)
+        }
     }
 }
 
