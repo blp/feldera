@@ -347,6 +347,8 @@ where
 
     /// Allows us to wait for the background worker to become idle.
     idle: Arc<Condvar>,
+
+    bg: Arc<BackgroundThread>,
 }
 
 impl<B> AsyncMerger<B>
@@ -357,7 +359,7 @@ where
         let idle = Arc::new(Condvar::new());
         let no_backpressure = Arc::new(Condvar::new());
         let state = Arc::new(Mutex::new(SharedState::new()));
-        BackgroundThread::add_worker({
+        let bg = BackgroundThread::new({
             let state = Arc::clone(&state);
             let idle = Arc::clone(&idle);
             let no_backpressure = Arc::clone(&no_backpressure);
@@ -370,6 +372,7 @@ where
             state,
             idle,
             no_backpressure,
+            bg,
         }
     }
     fn set_key_filter(&self, key_filter: &Filter<B::Key>) {
@@ -388,7 +391,7 @@ where
         debug_assert!(!batch.is_empty());
         let mut state = self.state.lock().unwrap();
         state.add_batch(batch);
-        BackgroundThread::wake();
+        self.bg.wake();
         if state.should_apply_backpressure() {
             let _r = self.no_backpressure.wait(state).unwrap();
         }
@@ -397,7 +400,7 @@ where
     /// Adds `batches` to the shared merging state and wakes up the merger.
     fn add_batches(&self, batches: impl IntoIterator<Item = Arc<B>>) {
         self.state.lock().unwrap().add_batches(batches);
-        BackgroundThread::wake();
+        self.bg.wake();
     }
 
     /// Gets the complete set of batches to include in the spine.
@@ -515,7 +518,7 @@ where
 
         for (level, m) in mergers.iter_mut().enumerate() {
             if let Some(merger) = m.as_mut() {
-                let mut fuel = 10_000;
+                let mut fuel = isize::MAX;
                 merger.work(&key_filter, &value_filter, &frontier, &mut fuel);
                 if fuel > 0 {
                     let merger = m.take().unwrap();
@@ -566,7 +569,7 @@ where
 {
     fn drop(&mut self) {
         self.state.lock().unwrap().request_exit = true;
-        BackgroundThread::wake();
+        self.bg.wake();
     }
 }
 
