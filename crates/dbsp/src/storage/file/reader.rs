@@ -16,7 +16,7 @@ use crate::storage::{
     file::item::ArchivedItem,
 };
 use crate::{
-    dynamic::{DataTrait, DeserializeDyn, Factory},
+    dynamic::{DataTrait, DeserializeDyn},
     storage::{
         backend::{BlockLocation, FileReader, InvalidBlockLocation, StorageBackend},
         buffer_cache::{AtomicCacheStats, CacheStats},
@@ -481,7 +481,6 @@ where
     inner: Arc<InnerDataBlock>,
     first_row: u64,
     factories: Factories<K, A>,
-    _phantom: PhantomData<fn(&K, &A)>,
 }
 
 impl<K, A> Clone for DataBlock<K, A>
@@ -494,7 +493,6 @@ where
             inner: self.inner.clone(),
             first_row: self.first_row,
             factories: self.factories.clone(),
-            _phantom: PhantomData,
         }
     }
 }
@@ -525,7 +523,6 @@ where
             inner,
             first_row: node.rows.start,
             factories: factories.clone(),
-            _phantom: PhantomData,
         })
     }
     fn n_values(&self) -> usize {
@@ -787,7 +784,6 @@ where
     inner: Arc<InnerIndexBlock>,
     first_row: u64,
     depth: usize,
-    key_factory: &'static dyn Factory<K>,
     factories: AnyFactories,
     _phantom: PhantomData<K>,
 }
@@ -801,7 +797,6 @@ where
             inner: self.inner.clone(),
             first_row: self.first_row,
             depth: self.depth,
-            key_factory: self.key_factory,
             factories: self.factories.clone(),
             _phantom: PhantomData,
         }
@@ -847,7 +842,6 @@ where
             first_row: node.rows.start,
             depth: node.depth,
             factories: factories.clone(),
-            key_factory: factories.key_factory(),
             _phantom: PhantomData,
         })
     }
@@ -947,7 +941,7 @@ where
         C: Fn(&K) -> Ordering,
     {
         let mut result = None;
-        self.key_factory.with(&mut |bound| {
+        self.factories.key_factory().with(&mut |bound| {
             let mut start = 0;
             let mut end = self.n_children();
             result = loop {
@@ -1067,7 +1061,7 @@ where
     {
         let mut result: Option<usize> = None;
 
-        self.key_factory.with(&mut |bound| {
+        self.factories.key_factory().with(&mut |bound| {
             let mut start = 0;
             let mut end = self.n_children() * 2;
             result = None;
@@ -1110,7 +1104,7 @@ where
         C: Fn(&K) -> Ordering,
     {
         let mut ordering = Equal;
-        self.key_factory.with(&mut |key| {
+        self.factories.key_factory().with(&mut |key| {
             self.get_bound(self.n_children() * 2 - 1, key);
             ordering = compare(key);
         });
