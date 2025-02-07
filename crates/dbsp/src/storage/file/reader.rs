@@ -292,6 +292,10 @@ pub enum CorruptionError {
         /// Snappy error.
         error: snap::Error,
     },
+
+    /// Multiple paths to block.
+    #[error("Multiple paths to block ({0}).")]
+    MultiplePaths(BlockLocation),
 }
 
 #[derive(Clone)]
@@ -803,12 +807,21 @@ impl InnerIndexBlock {
     fn new(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         let start = Instant::now();
         let cache = (file.cache)();
+        let first_row = node.rows.start;
         let (access, entry) = match cache.get(&*file.file_handle, node.location) {
-            Some(entry) => (CacheAccess::Hit, entry),
+            Some(entry) => {
+                let entry = Arc::downcast::<Self>(entry.as_any())
+                    .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(node.location)))?;
+                if entry.first_row != first_row {
+                    return Err(Error::Corruption(CorruptionError::MultiplePaths(
+                        node.location,
+                    )));
+                }
+                (CacheAccess::Hit, entry)
+            }
             None => {
                 let block = file.read_block(node.location)?;
-                let entry = Arc::new(Self::from_raw(block, node.location, node.rows.start)?)
-                    as Arc<dyn CacheEntry>;
+                let entry = Arc::new(Self::from_raw(block, node.location, first_row)?);
                 cache.insert(
                     file.file_handle.file_id(),
                     node.location.offset,
@@ -818,8 +831,7 @@ impl InnerIndexBlock {
             }
         };
         file.stats.record(access, start.elapsed(), node.location);
-        Arc::downcast(entry.as_any())
-            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(node.location)))
+        Ok(entry)
     }
 
     fn rows(&self) -> Range<u64> {
