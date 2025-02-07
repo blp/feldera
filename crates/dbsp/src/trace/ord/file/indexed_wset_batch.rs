@@ -255,10 +255,10 @@ where
         while cursor.key_valid() {
             while cursor.val_valid() {
                 let diff = cursor.diff.neg_by_ref();
-                writer.write1((cursor.val.as_ref(), diff.erase())).unwrap();
+                writer.write1((cursor.val(), diff.erase())).unwrap();
                 cursor.step_val();
             }
-            writer.write0((cursor.key.as_ref(), &())).unwrap();
+            writer.write0((cursor.key(), &())).unwrap();
             cursor.step_key();
         }
         Self {
@@ -466,7 +466,7 @@ where
         value_filter: &Option<Filter<V>>,
         fuel: &mut isize,
     ) {
-        if filter(key_filter, cursor.key.as_ref()) {
+        if filter(key_filter, cursor.key()) {
             *fuel -= cursor.val_cursor.len() as isize;
             let mut n = 0;
             while cursor.val_valid() {
@@ -480,7 +480,7 @@ where
             }
             if n > 0 {
                 self.writer
-                    .write0((cursor.key.as_ref(), ().erase()))
+                    .write0((cursor.key(), ().erase()))
                     .unwrap();
             }
         } else {
@@ -494,9 +494,9 @@ where
         cursor: &mut FileIndexedWSetCursor<K, V, R>,
         value_filter: &Option<Filter<V>>,
     ) -> u64 {
-        let retval = if filter(value_filter, cursor.val.as_ref()) {
+        let retval = if filter(value_filter, cursor.val()) {
             self.writer
-                .write1((cursor.val.as_ref(), cursor.diff.as_ref()))
+                .write1(cursor.val_cursor.item().unwrap())
                 .unwrap();
             1
         } else {
@@ -600,16 +600,16 @@ where
         let mut cursor1 = FileIndexedWSetCursor::new_from(source1, self.lower1);
         let mut cursor2 = FileIndexedWSetCursor::new_from(source2, self.lower2);
         while cursor1.key_valid() && cursor2.key_valid() && *fuel > 0 {
-            match cursor1.key.as_ref().cmp(cursor2.key.as_ref()) {
+            match cursor1.key().cmp(cursor2.key()) {
                 Ordering::Less => {
                     self.copy_values_if(&mut cursor1, key_filter, value_filter, fuel);
                 }
                 Ordering::Equal => {
-                    if filter(key_filter, cursor1.key.as_ref()) {
+                    if filter(key_filter, cursor1.key()) {
                         *fuel -= (cursor1.val_cursor.len() + cursor2.val_cursor.len()) as isize;
                         if self.merge_values(&mut cursor1, &mut cursor2, value_filter) {
                             self.writer
-                                .write0((cursor1.key.as_ref(), ().erase()))
+                                .write0((cursor1.key(), ().erase()))
                                 .unwrap();
                         }
                     } else {
@@ -658,10 +658,8 @@ where
     wset: &'s FileIndexedWSet<K, V, R>,
 
     key_cursor: KeyCursor<'s, K, V, R>,
-    key: Box<K>,
 
     val_cursor: ValCursor<'s, K, V, R>,
-    val: Box<V>,
     pub(crate) diff: Box<R>,
 }
 
@@ -675,9 +673,7 @@ where
         Self {
             wset: self.wset,
             key_cursor: self.key_cursor.clone(),
-            key: clone_box(&self.key),
             val_cursor: self.val_cursor.clone(),
-            val: clone_box(&self.val),
             diff: clone_box(&self.diff),
         }
     }
@@ -696,19 +692,13 @@ where
             .subset(lower_bound as u64..)
             .first()
             .unwrap();
-        let mut key = wset.factories.key_factory().default_box();
-        unsafe { key_cursor.key(&mut key) };
 
         let val_cursor = key_cursor.next_column().unwrap().first().unwrap();
-        let mut val = wset.factories.val_factory().default_box();
-        let mut diff = wset.factories.weight_factory().default_box();
-        unsafe { val_cursor.item((&mut val, &mut diff)) };
+        let diff = wset.factories.weight_factory().default_box();
         Self {
             wset,
             key_cursor,
-            key,
             val_cursor,
-            val,
             diff,
         }
     }
@@ -726,14 +716,12 @@ where
     }
 
     fn moved_key(&mut self) {
-        unsafe { self.key_cursor.key(&mut self.key) };
         self.val_cursor = self
             .key_cursor
             .next_column()
             .unwrap()
             .first_with_hint(&self.val_cursor)
             .unwrap();
-        unsafe { self.val_cursor.item((&mut self.val, &mut self.diff)) };
         self.moved_val();
     }
 
@@ -745,9 +733,7 @@ where
         self.moved_val();
     }
 
-    fn moved_val(&mut self) {
-        unsafe { self.val_cursor.item((&mut self.val, &mut self.diff)) };
-    }
+    fn moved_val(&mut self) {}
 }
 
 impl<K, V, R> Cursor<K, V, (), R> for FileIndexedWSetCursor<'_, K, V, R>
@@ -761,13 +747,11 @@ where
     }
 
     fn key(&self) -> &K {
-        debug_assert!(self.key_valid());
-        self.key.as_ref()
+        self.key_cursor.key().unwrap()
     }
 
     fn val(&self) -> &V {
-        debug_assert!(self.val_valid());
-        self.val.as_ref()
+        self.val_cursor.key().unwrap()
     }
 
     fn map_times(&mut self, logic: &mut dyn FnMut(&(), &R)) {
@@ -813,12 +797,11 @@ where
     }
 
     fn seek_key_exact(&mut self, key: &K) -> bool {
-        let found = self.wset.maybe_contains_key(key)
-            && unsafe { self.key_cursor.seek_exact(key) }.unwrap();
-        if found {
-            self.moved_key();
+        if !self.wset.maybe_contains_key(key) {
+            return false;
         }
-        found
+        self.seek_key(key);
+        self.key_valid() && self.key().eq(key)
     }
 
     fn seek_key_with(&mut self, predicate: &dyn Fn(&K) -> bool) {
@@ -839,17 +822,6 @@ where
 
     fn seek_val(&mut self, val: &V) {
         self.move_val(|val_cursor| unsafe { val_cursor.advance_to_value_or_larger(val) });
-    }
-
-    fn seek_val_exact(&mut self, val: &V) -> bool
-    where
-        V: PartialEq,
-    {
-        let found = unsafe { self.val_cursor.seek_exact(val) }.unwrap();
-        if found {
-            self.moved_val();
-        }
-        found
     }
 
     fn seek_val_with(&mut self, predicate: &dyn Fn(&V) -> bool) {

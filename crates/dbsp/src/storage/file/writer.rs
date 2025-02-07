@@ -299,8 +299,13 @@ impl ColumnWriter {
         block_writer.insert_cache_entry(
             location,
             Arc::new(
-                super::reader::DataBlock::<K, A>::from_raw(block, location, data_block.first_row)
-                    .unwrap(),
+                super::reader::DataBlock::<K, A>::from_raw(
+                    &self.factories.factories(),
+                    block,
+                    location,
+                    data_block.first_row,
+                )
+                .unwrap(),
             ),
         );
 
