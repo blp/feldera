@@ -219,7 +219,7 @@ impl ColumnWriter {
             parameters: parameters.clone(),
             column_index,
             rows: 0..0,
-            data_block: DataBlockBuilder::new(factories, parameters),
+            data_block: DataBlockBuilder::new(factories, parameters, 0),
             index_blocks: Vec::new(),
             factories: factories.clone(),
         }
@@ -300,7 +300,7 @@ impl ColumnWriter {
             block_writer.write_block(data_block.raw, self.parameters.compression)?;
         block_writer.insert_cache_entry(
             location,
-            Arc::new(InnerDataBlock::from_raw(block, location).unwrap()),
+            Arc::new(InnerDataBlock::from_raw(block, location, data_block.first_row).unwrap()),
         );
 
         if let Some(index_block) = self.get_index_block(0).add_entry(
@@ -407,6 +407,7 @@ struct DataBlockBuilder {
     row_groups: ContiguousRanges,
     size_target: Option<usize>,
     factories: AnyFactories,
+    first_row: u64
 }
 
 struct DataBuildSpecs {
@@ -419,10 +420,11 @@ struct DataBlock<K: ?Sized> {
     raw: FBuf,
     min_max: (Box<K>, Box<K>),
     n_values: usize,
+    first_row: u64
 }
 
 impl DataBlockBuilder {
-    fn new(factories: &AnyFactories, parameters: &Arc<Parameters>) -> Self {
+    fn new(factories: &AnyFactories, parameters: &Arc<Parameters>, first_row: u64) -> Self {
         let mut raw = FBuf::with_capacity(parameters.min_data_block);
         raw.resize(DataBlockHeader::LEN, 0);
         Self {
@@ -433,13 +435,21 @@ impl DataBlockBuilder {
             value_offset_stride: StrideBuilder::new(),
             size_target: None,
             factories: factories.clone(),
+            first_row,
         }
     }
     fn is_empty(&self) -> bool {
         self.value_offsets.is_empty()
     }
     fn take(&mut self) -> DataBlockBuilder {
-        replace(self, Self::new(&self.factories, &self.parameters))
+        replace(
+            self,
+            Self::new(
+                &self.factories,
+                &self.parameters,
+                self.first_row + self.value_offsets.len() as u64,
+            ),
+        )
     }
     fn try_add_item<K, A>(&mut self, item: (&K, &A), row_group: &Option<Range<u64>>) -> bool
     where
@@ -593,6 +603,7 @@ impl DataBlockBuilder {
             raw: self.raw,
             min_max: (min, max),
             n_values,
+            first_row: self.first_row
         }
     }
 }
