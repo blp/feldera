@@ -7,10 +7,7 @@ use crate::storage::backend::StorageBackend;
 use crate::storage::file::format::Compression;
 use crate::storage::file::writer::Parameters;
 use crate::{
-    storage::{
-        backend::StorageError, buffer_cache::BufferCache, dirlock::LockedDirectory,
-        file::cache::FileCacheEntry,
-    },
+    storage::{backend::StorageError, buffer_cache::BufferCache, dirlock::LockedDirectory},
     DetailedError,
 };
 use feldera_types::config::StorageCompression;
@@ -104,7 +101,7 @@ thread_local! {
     /// to speed-up finding the cache on a given thread.
     ///
     /// It is initialized by the first call to `Runtime::buffer_cache()`.
-    static BUFFER_CACHE: RefCell<Option<Arc<BufferCache<FileCacheEntry>>>> = const { RefCell::new(None) };
+    static BUFFER_CACHE: RefCell<Option<Arc<BufferCache>>> = const { RefCell::new(None) };
 }
 
 pub struct LocalStoreMarker;
@@ -432,7 +429,7 @@ impl Runtime {
     }
 
     /// Returns this thread's buffer cache, if storage is configured.
-    pub fn buffer_cache() -> Arc<BufferCache<FileCacheEntry>> {
+    pub fn buffer_cache() -> Arc<BufferCache> {
         if let Some(rt) = Runtime::runtime() {
             // Fast path, look up from TLS
             if let Some(buffer_cache) = BUFFER_CACHE.with(|bc| bc.borrow().clone()) {
@@ -451,7 +448,7 @@ impl Runtime {
         } else {
             // No `Runtime` means there's only a single worker, so use a single
             // global cache.
-            static NO_RUNTIME_CACHE: LazyLock<Arc<BufferCache<FileCacheEntry>>> =
+            static NO_RUNTIME_CACHE: LazyLock<Arc<BufferCache>> =
                 LazyLock::new(|| Arc::new(BufferCache::new(1024 * 1024 * 256)));
             NO_RUNTIME_CACHE.clone()
         }
@@ -459,7 +456,7 @@ impl Runtime {
 
     /// Returns the buffer caches for this thread and its background thread, if
     /// storage is configured.
-    pub fn bg_buffer_cache() -> Option<Arc<BufferCache<FileCacheEntry>>> {
+    pub fn bg_buffer_cache() -> Option<Arc<BufferCache>> {
         Self::runtime().map(|rt| {
             rt.local_store()
                 .get(&BufferCacheId(Self::worker_index() + rt.num_workers()))
@@ -757,7 +754,7 @@ impl TypedMapKey<LocalStoreMarker> for WorkerId {
 struct BufferCacheId(usize);
 
 impl TypedMapKey<LocalStoreMarker> for BufferCacheId {
-    type Value = Arc<BufferCache<FileCacheEntry>>;
+    type Value = Arc<BufferCache>;
 }
 
 #[cfg(test)]

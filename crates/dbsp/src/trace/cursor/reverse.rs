@@ -92,7 +92,8 @@ where
 
     fn seek_key_exact(&mut self, key: &K) -> bool
     where
-        K: PartialEq, {
+        K: PartialEq,
+    {
         self.cursor.seek_key_exact(key)
     }
 
@@ -122,7 +123,8 @@ where
 
     fn seek_val_exact(&mut self, val: &V) -> bool
     where
-        V: PartialEq, {
+        V: PartialEq,
+    {
         self.cursor.seek_val_exact(val)
     }
 

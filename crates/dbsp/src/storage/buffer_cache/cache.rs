@@ -2,11 +2,12 @@
 //!
 //! This is a layer over a storage backend that adds a cache of a
 //! client-provided function of the blocks.
+use std::any::Any;
 use std::borrow::Cow;
 use std::fmt::Debug;
 use std::ops::{Add, AddAssign};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{collections::BTreeMap, ops::Range};
 
@@ -47,28 +48,23 @@ impl CacheKey {
 }
 
 /// A value in the block cache.
-struct CacheValue<E>
-where
-    E: CacheEntry,
-{
+struct CacheValue {
     /// Cached interpretation of `block`.
-    aux: E,
+    aux: Arc<dyn CacheEntry>,
 
     /// Serial number for LRU purposes.  Blocks with higher serial numbers have
     /// been used more recently.
     serial: u64,
 }
 
-pub trait CacheEntry: Clone + Send {
+pub trait CacheEntry: Send + Sync {
     fn cost(&self) -> usize;
+    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 }
 
-struct CacheInner<E>
-where
-    E: CacheEntry,
-{
+struct CacheInner {
     /// Cache contents.
-    cache: BTreeMap<CacheKey, CacheValue<E>>,
+    cache: BTreeMap<CacheKey, CacheValue>,
 
     /// Map from LRU serial number to cache key.  The element with the smallest
     /// serial number was least recently used.
@@ -84,10 +80,7 @@ where
     max_cost: usize,
 }
 
-impl<E> CacheInner<E>
-where
-    E: CacheEntry,
-{
+impl CacheInner {
     fn new(max_cost: usize) -> Self {
         Self {
             cache: BTreeMap::new(),
@@ -135,13 +128,13 @@ where
         self.debug_check_invariants();
     }
 
-    fn get(&mut self, key: CacheKey) -> Option<&E> {
+    fn get(&mut self, key: CacheKey) -> Option<Arc<dyn CacheEntry>> {
         if let Some(value) = self.cache.get_mut(&key) {
             self.lru.remove(&value.serial);
             value.serial = self.next_serial;
             self.lru.insert(value.serial, key);
             self.next_serial += 1;
-            Some(&value.aux)
+            Some(value.aux.clone())
         } else {
             None
         }
@@ -156,7 +149,7 @@ where
         self.debug_check_invariants();
     }
 
-    fn insert(&mut self, key: CacheKey, aux: E) {
+    fn insert(&mut self, key: CacheKey, aux: Arc<dyn CacheEntry>) {
         let cost = aux.cost();
         self.evict_to(self.max_cost.saturating_sub(cost));
         if let Some(old_value) = self.cache.insert(
@@ -177,48 +170,43 @@ where
 }
 
 /// A cache on top of a storage [backend](crate::storage::backend).
-pub struct BufferCache<E>
-where
-    E: CacheEntry,
-{
-    inner: Mutex<CacheInner<E>>,
+pub struct BufferCache {
+    inner: Mutex<CacheInner>,
 }
 
-impl<E> Debug for BufferCache<E>
-where
-    E: CacheEntry,
-{
+impl Debug for BufferCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BufferCache").finish()
     }
 }
 
-impl<E> BufferCache<E>
-where
-    E: CacheEntry,
-{
+impl BufferCache {
     /// Creates a new cache on top of `backend`.
     ///
     /// It's best to use a single `StorageCache` for all uses of a given
     /// `backend`, because otherwise the cache will end up with duplicates.
     ///
     /// `max_cost` limits the size of the cache. It is denominated in terms of
-    /// [CacheEntry::cost] for `E`.
+    /// [CacheEntry::cost].
     pub fn new(max_cost: usize) -> Self {
         Self {
             inner: Mutex::new(CacheInner::new(max_cost)),
         }
     }
 
-    pub fn get(&self, file: &dyn FileReader, location: BlockLocation) -> Option<E> {
+    pub fn get(
+        &self,
+        file: &dyn FileReader,
+        location: BlockLocation,
+    ) -> Option<Arc<dyn CacheEntry>> {
         self.inner
             .lock()
             .unwrap()
             .get(CacheKey::new(file.file_id(), location.offset))
-            .cloned()
+            .clone()
     }
 
-    pub fn insert(&self, file_id: FileId, offset: u64, aux: E) {
+    pub fn insert(&self, file_id: FileId, offset: u64, aux: Arc<dyn CacheEntry>) {
         self.inner
             .lock()
             .unwrap()
@@ -231,7 +219,7 @@ where
 
     /// Returns `(cur_cost, max_cost)`, reporting the amount of the cache that
     /// is currently used and the maximum value, both denominated in terms of
-    /// [CacheEntry::cost] for `E`.
+    /// [CacheEntry::cost] for `CacheEntry`.
     pub fn occupancy(&self) -> (usize, usize) {
         let inner = self.inner.lock().unwrap();
         (inner.cur_cost, inner.max_cost)
