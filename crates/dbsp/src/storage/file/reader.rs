@@ -673,26 +673,21 @@ struct TreeNode {
     location: BlockLocation,
     node_type: NodeType,
     rows: Range<u64>,
-    factories: AnyFactories,
 }
 
 impl TreeNode {
-    fn read<K, A>(self, file: &ImmutableFileRef) -> Result<TreeBlock<K, A>, Error>
+    fn read<K, A>(
+        self,
+        factories: &Factories<K, A>,
+        file: &ImmutableFileRef,
+    ) -> Result<TreeBlock<K, A>, Error>
     where
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
         match self.node_type {
-            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new(
-                &self.factories.factories(),
-                file,
-                &self,
-            )?)),
-            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new(
-                &self.factories,
-                file,
-                &self,
-            )?)),
+            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new(factories, file, &self)?)),
+            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new(file, &self)?)),
         }
     }
 }
@@ -834,8 +829,6 @@ where
     K: DataTrait + ?Sized,
 {
     inner: Arc<InnerIndexBlock>,
-    key_factory: &'static dyn Factory<K>,
-    factories: AnyFactories,
     _phantom: PhantomData<K>,
 }
 
@@ -846,8 +839,6 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            key_factory: self.key_factory,
-            factories: self.factories.clone(),
             _phantom: PhantomData,
         }
     }
@@ -857,11 +848,7 @@ impl<K> IndexBlock<K>
 where
     K: DataTrait + ?Sized,
 {
-    fn new(
-        factories: &AnyFactories,
-        file: &ImmutableFileRef,
-        node: &TreeNode,
-    ) -> Result<Self, Error> {
+    fn new(file: &ImmutableFileRef, node: &TreeNode) -> Result<Self, Error> {
         let inner = InnerIndexBlock::new(file, node)?;
 
         let expected_rows = node.rows.end - node.rows.start;
@@ -877,8 +864,6 @@ where
 
         Ok(Self {
             inner,
-            factories: factories.clone(),
-            key_factory: factories.key_factory(),
             _phantom: PhantomData,
         })
     }
@@ -898,7 +883,6 @@ where
 
     fn get_child(&self, index: usize) -> Result<TreeNode, Error> {
         Ok(TreeNode {
-            factories: self.factories.clone(),
             location: self.get_child_location(index)?,
             node_type: self.inner.child_type,
             rows: self.get_rows(index),
@@ -967,12 +951,17 @@ where
         start..end
     }
 
-    unsafe fn find_exact<C>(&self, target_rows: &Range<u64>, compare: &C) -> Option<usize>
+    unsafe fn find_exact<C>(
+        &self,
+        key_factory: &dyn Factory<K>,
+        target_rows: &Range<u64>,
+        compare: &C,
+    ) -> Option<usize>
     where
         C: Fn(&K) -> Ordering,
     {
         let mut result = None;
-        self.key_factory.with(&mut |bound| {
+        key_factory.with(&mut |bound| {
             let mut start = 0;
             let mut end = self.n_children();
             result = loop {
@@ -1083,6 +1072,7 @@ where
 
     unsafe fn find_best_match<C>(
         &self,
+        key_factory: &dyn Factory<K>,
         target_rows: &Range<u64>,
         compare: &C,
         bias: Ordering,
@@ -1092,7 +1082,7 @@ where
     {
         let mut result: Option<usize> = None;
 
-        self.key_factory.with(&mut |bound| {
+        key_factory.with(&mut |bound| {
             let mut start = 0;
             let mut end = self.n_children() * 2;
             result = None;
@@ -1130,12 +1120,12 @@ where
     }
 
     /// Returns the comparison of the largest bound key` using `compare`.
-    unsafe fn compare_max<C>(&self, compare: &C) -> Ordering
+    unsafe fn compare_max<C>(&self, key_factory: &dyn Factory<K>, compare: &C) -> Ordering
     where
         C: Fn(&K) -> Ordering,
     {
         let mut ordering = Equal;
-        self.key_factory.with(&mut |key| {
+        key_factory.with(&mut |key| {
             self.get_bound(self.n_children() * 2 - 1, key);
             ordering = compare(key);
         });
@@ -1157,16 +1147,10 @@ where
             if i > 0 {
                 write!(f, ",")?;
             }
-            let mut bound1 = self.factories.key_factory::<K>().default_box();
-            let mut bound2 = self.factories.key_factory::<K>().default_box();
-            unsafe { self.get_bound(i * 2, &mut bound1) };
-            unsafe { self.get_bound(i * 2 + 1, &mut bound2) };
             write!(
                 f,
-                " [{i}] = {{ rows: {:?}, bounds: {:?}..={:?}, location: {:?} }}",
+                " [{i}] = {{ rows: {:?}, location: {:?} }}",
                 self.get_rows(i),
-                bound1,
-                bound2,
                 self.get_child_location(i),
             )?;
         }
@@ -1214,6 +1198,7 @@ impl FileTrailer {
 #[derive(Debug)]
 struct Column {
     root: Option<TreeNode>,
+    factories: AnyFactories,
     n_rows: u64,
 }
 
@@ -1236,7 +1221,6 @@ impl Column {
                 }
             };
             Some(TreeNode {
-                factories: factories.clone(),
                 location,
                 node_type,
                 rows: 0..n_rows,
@@ -1244,13 +1228,11 @@ impl Column {
         } else {
             None
         };
-        Ok(Self { root, n_rows })
-    }
-    fn empty() -> Self {
-        Self {
-            root: None,
-            n_rows: 0,
-        }
+        Ok(Self {
+            root,
+            n_rows,
+            factories: factories.clone(),
+        })
     }
 }
 
@@ -1473,30 +1455,6 @@ where
         })
     }
 
-    /// Create and returns a new `Reader` that has no rows.
-    ///
-    /// This internally creates an empty temporary file, which means that it can
-    /// fail with an I/O error.
-    pub fn empty(
-        cache: fn() -> Arc<BufferCache>,
-        storage_backend: &dyn StorageBackend,
-    ) -> Result<Self, Error> {
-        let (file_handle, path) = storage_backend.create()?.complete()?;
-        Ok(Self {
-            file: ImmutableFileRef::new(
-                cache,
-                file_handle,
-                path,
-                None,
-                AtomicCacheStats::default(),
-            ),
-            bloom_filter: BloomFilter::with_false_pos(BLOOM_FILTER_FALSE_POSITIVE_RATE)
-                .expected_items(0),
-            columns: (0..T::n_columns()).map(|_| Column::empty()).collect(),
-            _phantom: PhantomData,
-        })
-    }
-
     /// Marks the file of the reader as being part of a checkpoint.
     pub fn mark_for_checkpoint(&self) {
         self.file.file_handle.mark_for_checkpoint();
@@ -1604,17 +1562,27 @@ where
 /// for a row in column 0 and calling [`Cursor::next_column`] to get its row
 /// group in column 1, and then repeating as many times as necessary to get to
 /// the desired column.
-pub struct RowGroup<'a, K: ?Sized, A: ?Sized, N, T> {
+pub struct RowGroup<'a, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+{
     reader: &'a Reader<T>,
+    factories: Factories<K, A>,
     column: usize,
     rows: Range<u64>,
     _phantom: PhantomData<fn(&K, &A, N)>,
 }
 
-impl<K: ?Sized, A: ?Sized, N, T> Clone for RowGroup<'_, K, A, N, T> {
+impl<K, A, N, T> Clone for RowGroup<'_, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+{
     fn clone(&self) -> Self {
         Self {
             reader: self.reader,
+            factories: self.factories.clone(),
             column: self.column,
             rows: self.rows.clone(),
             _phantom: PhantomData,
@@ -1622,7 +1590,11 @@ impl<K: ?Sized, A: ?Sized, N, T> Clone for RowGroup<'_, K, A, N, T> {
     }
 }
 
-impl<K: ?Sized, A: ?Sized, N, T> Debug for RowGroup<'_, K, A, N, T> {
+impl<K, A, N, T> Debug for RowGroup<'_, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+{
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         write!(f, "RowGroup(column={}, rows={:?})", self.column, self.rows)
     }
@@ -1637,6 +1609,7 @@ where
     fn new(reader: &'a Reader<T>, column: usize, rows: Range<u64>) -> Self {
         Self {
             reader,
+            factories: reader.columns[column].factories.factories(),
             column,
             rows,
             _phantom: PhantomData,
@@ -1746,6 +1719,7 @@ where
         let end = start + (subset.end - subset.start);
         Self {
             rows: start..end,
+            factories: self.factories.clone(),
             ..*self
         }
     }
@@ -2217,7 +2191,7 @@ where
         T: ColumnSpec,
     {
         Self::for_row_from_ancestor(
-            row_group.reader,
+            row_group,
             Vec::new(),
             row_group.reader.columns[row_group.column]
                 .root
@@ -2226,14 +2200,17 @@ where
             row,
         )
     }
-    fn for_row_from_ancestor<T>(
-        reader: &Reader<T>,
+    fn for_row_from_ancestor<N, T>(
+        row_group: &RowGroup<'_, K, A, N, T>,
         mut indexes: Vec<IndexBlock<K>>,
         mut node: TreeNode,
         row: u64,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error>
+    where
+        T: ColumnSpec,
+    {
         loop {
-            let block = node.read(&reader.file)?;
+            let block = node.read(&row_group.factories, &row_group.reader.file)?;
             let next = block.lookup_row(row)?;
             match block {
                 TreeBlock::Data(data) => {
@@ -2272,7 +2249,7 @@ where
         for (idx, index_block) in hint.indexes.iter().enumerate().rev() {
             if let Some(node) = index_block.get_child_by_row(row)? {
                 return Self::for_row_from_ancestor(
-                    row_group.reader,
+                    row_group,
                     hint.indexes[0..=idx].to_vec(),
                     node,
                     row,
@@ -2326,11 +2303,14 @@ where
             return Ok(None);
         };
         loop {
-            match node.read(&row_group.reader.file)? {
+            match node.read(&row_group.factories, &row_group.reader.file)? {
                 TreeBlock::Index(index_block) => {
-                    let Some(child_idx) =
-                        index_block.find_best_match(&row_group.rows, compare, bias)
-                    else {
+                    let Some(child_idx) = index_block.find_best_match(
+                        row_group.factories.key_factory,
+                        &row_group.rows,
+                        compare,
+                        bias,
+                    ) else {
                         return Ok(None);
                     };
                     node = index_block.get_child(child_idx)?;
@@ -2364,9 +2344,13 @@ where
             return Ok(None);
         };
         loop {
-            match node.read(&row_group.reader.file)? {
+            match node.read(&row_group.factories, &row_group.reader.file)? {
                 TreeBlock::Index(index_block) => {
-                    let Some(child_idx) = index_block.find_exact(&row_group.rows, compare) else {
+                    let Some(child_idx) = index_block.find_exact(
+                        row_group.factories.key_factory,
+                        &row_group.rows,
+                        compare,
+                    ) else {
                         return Ok(None);
                     };
                     node = index_block.get_child(child_idx)?;
@@ -2446,13 +2430,19 @@ where
             // We need to go up another level if `rows.end` is beyond the end of
             // `index_block` and the greatest value under `index_block` is less
             // than the target.
-            if rows.end > index_block.rows().end && index_block.compare_max(compare) == Greater {
+            if rows.end > index_block.rows().end
+                && index_block.compare_max(row_group.factories.key_factory, compare) == Greater
+            {
                 continue;
             }
 
             // Otherwise, our target (if any) must be below `index_block`.
-            let Some(child_idx) = index_block.find_best_match(&row_group.rows, compare, Less)
-            else {
+            let Some(child_idx) = index_block.find_best_match(
+                row_group.factories.key_factory,
+                &row_group.rows,
+                compare,
+                Less,
+            ) else {
                 // `rows.end` is inside `index_block` but the largest key is
                 // less than the target.
                 return Ok(false);
@@ -2461,11 +2451,14 @@ where
             push_index_block(&mut self.indexes, index_block)?;
 
             loop {
-                match node.read::<K, A>(&row_group.reader.file)? {
+                match node.read::<K, A>(&row_group.factories, &row_group.reader.file)? {
                     TreeBlock::Index(index_block) => {
-                        let Some(child_idx) =
-                            index_block.find_best_match(&row_group.rows, compare, Less)
-                        else {
+                        let Some(child_idx) = index_block.find_best_match(
+                            row_group.factories.key_factory,
+                            &row_group.rows,
+                            compare,
+                            Less,
+                        ) else {
                             return Ok(false);
                         };
                         node = index_block.get_child(child_idx)?;
