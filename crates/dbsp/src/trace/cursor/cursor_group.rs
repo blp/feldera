@@ -132,7 +132,8 @@ where
 
     fn seek_val_exact(&mut self, _val: &DynUnit) -> bool
     where
-        DynUnit: PartialEq, {
+        DynUnit: PartialEq,
+    {
         self.val_valid = true;
         true
     }

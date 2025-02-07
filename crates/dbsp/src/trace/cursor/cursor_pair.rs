@@ -311,7 +311,7 @@ where
             (true, true) => {
                 self.update_val_order_forward();
                 Ordering::Equal
-            },
+            }
         };
         true
     }
@@ -399,7 +399,8 @@ where
 
     fn seek_val_exact(&mut self, _val: &V) -> bool
     where
-        V: PartialEq, {
+        V: PartialEq,
+    {
         todo!()
     }
 
