@@ -35,10 +35,7 @@ use crate::{
     Runtime,
 };
 
-use super::{
-    format::Compression,
-    reader::{InnerDataBlock, InnerIndexBlock},
-};
+use super::{format::Compression, reader::InnerIndexBlock};
 use super::{
     reader::Reader, AnyFactories, Factories, Serializer, BLOOM_FILTER_FALSE_POSITIVE_RATE,
 };
@@ -241,7 +238,7 @@ impl ColumnWriter {
         // Flush data.
         if !self.data_block.is_empty() {
             let data_block = self.data_block.take().build::<K, A>();
-            self.write_data_block(block_writer, data_block)?;
+            self.write_data_block::<K, A>(block_writer, data_block)?;
         }
 
         // Flush index.
@@ -288,19 +285,23 @@ impl ColumnWriter {
         &mut self.index_blocks[level]
     }
 
-    fn write_data_block<K>(
+    fn write_data_block<K, A>(
         &mut self,
         block_writer: &mut BlockWriter,
         data_block: DataBlock<K>,
     ) -> Result<(), StorageError>
     where
         K: DataTrait + ?Sized,
+        A: DataTrait + ?Sized,
     {
         let (block, location) =
             block_writer.write_block(data_block.raw, self.parameters.compression)?;
         block_writer.insert_cache_entry(
             location,
-            Arc::new(InnerDataBlock::from_raw(block, location, data_block.first_row).unwrap()),
+            Arc::new(
+                super::reader::DataBlock::<K, A>::from_raw(block, location, data_block.first_row)
+                    .unwrap(),
+            ),
         );
 
         if let Some(index_block) = self.get_index_block(0).add_entry(
@@ -355,7 +356,7 @@ impl ColumnWriter {
         A: DataTrait + ?Sized,
     {
         if let Some(data_block) = self.data_block.add_item(item, row_group) {
-            self.write_data_block(block_writer, data_block)?;
+            self.write_data_block::<K, A>(block_writer, data_block)?;
         }
         Ok(())
     }
@@ -407,7 +408,7 @@ struct DataBlockBuilder {
     row_groups: ContiguousRanges,
     size_target: Option<usize>,
     factories: AnyFactories,
-    first_row: u64
+    first_row: u64,
 }
 
 struct DataBuildSpecs {
@@ -420,7 +421,7 @@ struct DataBlock<K: ?Sized> {
     raw: FBuf,
     min_max: (Box<K>, Box<K>),
     n_values: usize,
-    first_row: u64
+    first_row: u64,
 }
 
 impl DataBlockBuilder {
@@ -603,7 +604,7 @@ impl DataBlockBuilder {
             raw: self.raw,
             min_max: (min, max),
             n_values,
-            first_row: self.first_row
+            first_row: self.first_row,
         }
     }
 }
