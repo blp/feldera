@@ -4,7 +4,7 @@
 
 use super::format::{Compression, FileTrailer};
 use super::{AnyFactories, BloomFilterState, Factories, BLOOM_FILTER_FALSE_POSITIVE_RATE};
-use crate::dynamic::DynPairs;
+use crate::dynamic::{DynPairs, DynVec};
 use crate::storage::buffer_cache::{CacheAccess, CacheEntry};
 use crate::storage::{
     backend::StorageError,
@@ -14,7 +14,7 @@ use crate::storage::{
     },
 };
 use crate::{
-    dynamic::{DataTrait, DeserializeDyn, Factory},
+    dynamic::{DataTrait, DeserializeDyn},
     storage::{
         backend::{BlockLocation, FileReader, InvalidBlockLocation, StorageBackend},
         buffer_cache::{AtomicCacheStats, CacheStats},
@@ -655,7 +655,7 @@ impl TreeNode {
     {
         match self.node_type {
             NodeType::Data => Ok(TreeBlock::Data(DataBlock::new(factories, file, &self)?)),
-            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new(file, &self)?)),
+            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new(factories, file, &self)?)),
         }
     }
 }
@@ -691,15 +691,12 @@ pub(super) struct IndexBlock<K>
 where
     K: DataTrait + ?Sized,
 {
-    location: BlockLocation,
-    raw: Arc<FBuf>,
+    bounds: Box<DynVec<K>>,
+    row_totals: Vec<u64>,
+    children: Vec<BlockLocation>,
     child_type: NodeType,
-    bounds: VarintReader,
-    row_totals: VarintReader,
-    child_offsets: VarintReader,
-    child_sizes: VarintReader,
     first_row: u64,
-    _phantom: PhantomData<K>,
+    cost: usize,
 }
 
 impl<K> CacheEntry for IndexBlock<K>
@@ -707,7 +704,7 @@ where
     K: DataTrait + ?Sized,
 {
     fn cost(&self) -> usize {
-        size_of::<Self>() + self.raw.len()
+        self.cost
     }
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
@@ -718,13 +715,18 @@ impl<K> IndexBlock<K>
 where
     K: DataTrait + ?Sized,
 {
-    pub(super) fn from_raw(
+    pub(super) fn from_raw<A>(
+        factories: &Factories<K, A>,
         raw: Arc<FBuf>,
         location: BlockLocation,
         first_row: u64,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, Error>
+    where
+        A: DataTrait + ?Sized,
+    {
         let header = IndexBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice()))?;
-        if header.n_children == 0 {
+        let n_children = header.n_children as usize;
+        if n_children == 0 {
             return Err(CorruptionError::EmptyIndex(location).into());
         }
 
@@ -732,11 +734,14 @@ where
             &raw,
             header.row_total_varint,
             header.row_totals_offset as usize,
-            header.n_children as usize,
+            n_children,
         )?;
-        for i in 1..header.n_children as usize {
-            let prev = row_totals.get(&raw, i - 1);
-            let next = row_totals.get(&raw, i);
+        let row_totals = (0..n_children)
+            .map(|index| row_totals.get(&raw, index))
+            .collect::<Vec<_>>();
+        for i in 1..n_children {
+            let prev = row_totals[i - 1];
+            let next = row_totals[i];
             if prev >= next {
                 return Err(CorruptionError::NonmonotonicIndex {
                     location,
@@ -747,35 +752,70 @@ where
             }
         }
 
+        let child_offsets = VarintReader::new(
+            &raw,
+            header.child_offset_varint,
+            header.child_offsets_offset as usize,
+            n_children,
+        )?;
+        let child_sizes = VarintReader::new(
+            &raw,
+            header.child_size_varint,
+            header.child_sizes_offset as usize,
+            n_children,
+        )?;
+        let mut children = Vec::with_capacity(n_children);
+        for index in 0..n_children {
+            let offset = child_offsets.get(&raw, index) << 9;
+            let size = child_sizes.get(&raw, index) << 9;
+            let location = BlockLocation::new(offset, size as usize).map_err(
+                |error: InvalidBlockLocation| {
+                    Error::Corruption(CorruptionError::InvalidChild {
+                        location,
+                        index,
+                        child_offset: error.offset,
+                        child_size: error.size,
+                    })
+                },
+            )?;
+            children.push(location);
+        }
+        let bounds_map = VarintReader::new(
+            &raw,
+            header.bound_map_varint,
+            header.bound_map_offset as usize,
+            n_children * 2,
+        )?;
+        let mut bounds: Box<DynVec<K>> = factories.keys_factory.default_box();
+        bounds.reserve(n_children * 2);
+        for index in 0..n_children * 2 {
+            let archived_bound = unsafe {
+                factories
+                    .key_factory
+                    .archived_value(&raw, bounds_map.get(&raw, index) as usize)
+            };
+            bounds.push_with(&mut |bound| {
+                DeserializeDyn::deserialize(archived_bound, bound);
+            });
+        }
         Ok(Self {
-            location,
             child_type: header.child_type,
-            bounds: VarintReader::new(
-                &raw,
-                header.bound_map_varint,
-                header.bound_map_offset as usize,
-                header.n_children as usize * 2,
-            )?,
+            bounds,
             row_totals,
-            child_offsets: VarintReader::new(
-                &raw,
-                header.child_offset_varint,
-                header.child_offsets_offset as usize,
-                header.n_children as usize,
-            )?,
-            child_sizes: VarintReader::new(
-                &raw,
-                header.child_size_varint,
-                header.child_sizes_offset as usize,
-                header.n_children as usize,
-            )?,
-            raw,
+            children,
+            cost: size_of::<Self>() + raw.len(),
             first_row,
-            _phantom: PhantomData,
         })
     }
 
-    fn new(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
+    fn new<A>(
+        factories: &Factories<K, A>,
+        file: &ImmutableFileRef,
+        node: &TreeNode,
+    ) -> Result<Arc<Self>, Error>
+    where
+        A: DataTrait + ?Sized,
+    {
         let start = Instant::now();
         let cache = (file.cache)();
         let first_row = node.rows.start;
@@ -792,7 +832,7 @@ where
             }
             None => {
                 let block = file.read_block(node.location)?;
-                let entry = Arc::new(Self::from_raw(block, node.location, first_row)?);
+                let entry = Arc::new(Self::from_raw(factories, block, node.location, first_row)?);
                 cache.insert(
                     file.file_handle.file_id(),
                     node.location.offset,
@@ -804,7 +844,7 @@ where
         file.stats.record(access, start.elapsed(), node.location);
 
         let expected_rows = node.rows.end - node.rows.start;
-        let n_rows = entry.row_totals.get(&entry.raw, entry.row_totals.count - 1);
+        let n_rows = *entry.row_totals.last().unwrap();
         if n_rows != expected_rows {
             return Err(CorruptionError::IndexBlockWrongNumberOfRows {
                 location: node.location,
@@ -819,25 +859,12 @@ where
 
     /// Returns the range of rows covered by this index block.
     fn rows(&self) -> Range<u64> {
-        self.first_row..self.first_row + self.row_totals.get(&self.raw, self.row_totals.count - 1)
-    }
-
-    fn get_child_location(&self, index: usize) -> Result<BlockLocation, Error> {
-        let offset = self.child_offsets.get(&self.raw, index) << 9;
-        let size = self.child_sizes.get(&self.raw, index) << 9;
-        BlockLocation::new(offset, size as usize).map_err(|error: InvalidBlockLocation| {
-            Error::Corruption(CorruptionError::InvalidChild {
-                location: self.location,
-                index,
-                child_offset: error.offset,
-                child_size: error.size,
-            })
-        })
+        self.first_row..self.first_row + *self.row_totals.last().unwrap()
     }
 
     fn get_child(&self, index: usize) -> Result<TreeNode, Error> {
         Ok(TreeNode {
-            location: self.get_child_location(index)?,
+            location: self.children[index],
             node_type: self.child_type,
             rows: self.get_rows(index),
         })
@@ -853,9 +880,9 @@ where
         let low = if index == 0 {
             0
         } else {
-            self.row_totals.get(&self.raw, index - 1)
+            self.row_totals[index - 1]
         };
-        let high = self.row_totals.get(&self.raw, index);
+        let high = self.row_totals[index];
         (self.first_row + low)..(self.first_row + high)
     }
 
@@ -863,9 +890,9 @@ where
         if index == 0 {
             0
         } else if index % 2 == 1 {
-            self.row_totals.get(&self.raw, index / 2) - 1
+            self.row_totals[index / 2] - 1
         } else {
-            self.row_totals.get(&self.raw, index / 2 - 1)
+            self.row_totals[index / 2 - 1]
         }
     }
 
@@ -885,143 +912,113 @@ where
         None
     }
 
-    unsafe fn get_bound(&self, index: usize, bound: &mut K) {
-        let offset = self.bounds.get(&self.raw, index) as usize;
-        bound.deserialize_from_bytes(&self.raw, offset)
-    }
-
     fn get_row_range(&self, child_idx: usize) -> Range<u64> {
         let start = if child_idx > 0 {
-            self.row_totals.get(&self.raw, child_idx - 1)
+            self.row_totals[child_idx - 1]
         } else {
             0
         } + self.first_row;
-        let end = self.row_totals.get(&self.raw, child_idx) + self.first_row;
+        let end = self.row_totals[child_idx] + self.first_row;
         start..end
     }
 
-    unsafe fn find_exact<C>(
-        &self,
-        key_factory: &dyn Factory<K>,
-        target_rows: &Range<u64>,
-        compare: &C,
-    ) -> Option<usize>
+    fn find_exact<C>(&self, target_rows: &Range<u64>, compare: &C) -> Option<usize>
     where
         C: Fn(&K) -> Ordering,
     {
-        let mut result = None;
-        key_factory.with(&mut |bound| {
-            let mut start = 0;
-            let mut end = self.n_children();
-            result = loop {
-                if start >= end {
-                    break None;
-                }
-                let mid = (start + end) / 2;
-                let rows = self.get_row_range(mid);
+        let mut start = 0;
+        let mut end = self.n_children();
+        while start < end {
+            let mid = (start + end) / 2;
+            let rows = self.get_row_range(mid);
 
-                /// Compares `a` to `b` and reports their relationship.
-                fn compare_ranges(a: &Range<u64>, b: &Range<u64>) -> Case {
-                    if a.end <= b.start {
-                        Case::Before
-                    } else if b.end <= a.start {
-                        Case::After
-                    } else if b.end <= a.end {
-                        if a.start <= b.start {
-                            Case::Contains
-                        } else {
-                            Case::OverlapEnd
-                        }
-                    } else if b.start <= a.start {
-                        Case::Inside
+            /// Compares `a` to `b` and reports their relationship.
+            fn compare_ranges(a: &Range<u64>, b: &Range<u64>) -> Case {
+                if a.end <= b.start {
+                    Case::Before
+                } else if b.end <= a.start {
+                    Case::After
+                } else if b.end <= a.end {
+                    if a.start <= b.start {
+                        Case::Contains
                     } else {
-                        Case::OverlapStart
+                        Case::OverlapEnd
                     }
+                } else if b.start <= a.start {
+                    Case::Inside
+                } else {
+                    Case::OverlapStart
                 }
+            }
 
-                /// The relationship between two ranges `a` and `b`.
-                ///
-                /// A visual representation of the possibilities:
-                ///
-                /// ```text
-                ///                    [-------b-------]
-                ///   [--before--]        [--inside--]      [--after--]
-                ///              [---------contains---------]
-                ///              [overlap-start]
-                ///                           [-overlap-end-]
-                /// ```
-                enum Case {
-                    /// `a` is before `b`, with no overlap.
-                    Before,
+            /// The relationship between two ranges `a` and `b`.
+            ///
+            /// A visual representation of the possibilities:
+            ///
+            /// ```text
+            ///                    [-------b-------]
+            ///   [--before--]        [--inside--]      [--after--]
+            ///              [---------contains---------]
+            ///              [overlap-start]
+            ///                           [-overlap-end-]
+            /// ```
+            enum Case {
+                /// `a` is before `b`, with no overlap.
+                Before,
 
-                    /// `a` is after `b`, with no overlap.
-                    After,
+                /// `a` is after `b`, with no overlap.
+                After,
 
-                    /// `a` contains all of `b` (and might stick out on either
-                    /// side).  This includes the case where `a` and `b` are
-                    /// equal.
-                    Contains,
+                /// `a` contains all of `b` (and might stick out on either
+                /// side).  This includes the case where `a` and `b` are
+                /// equal.
+                Contains,
 
-                    /// `a` is inside `b`.  (If `a` and `b` are equal, that is
-                    /// [Self::Contains] instead.)
-                    Inside,
+                /// `a` is inside `b`.  (If `a` and `b` are equal, that is
+                /// [Self::Contains] instead.)
+                Inside,
 
-                    /// `a` starts before `b` and overlaps its beginning (but
-                    /// not all of it: that would be [Self::Contains]).
-                    OverlapStart,
+                /// `a` starts before `b` and overlaps its beginning (but
+                /// not all of it: that would be [Self::Contains]).
+                OverlapStart,
 
-                    /// `a` starts within `b` and overlaps its end (but doesn't
-                    /// contain all of `b`: that would be [Self::Contains]).
-                    OverlapEnd,
-                }
+                /// `a` starts within `b` and overlaps its end (but doesn't
+                /// contain all of `b`: that would be [Self::Contains]).
+                OverlapEnd,
+            }
 
-                let cmp = match compare_ranges(target_rows, &rows) {
-                    Case::Before => Less,
-                    Case::After => Greater,
-                    Case::Inside => Equal,
-                    Case::Contains => {
-                        self.get_bound(mid * 2, bound);
-                        match compare(bound) {
-                            Greater => {
-                                self.get_bound(mid * 2 + 1, bound);
-                                match compare(bound) {
-                                    Less => Equal,
-                                    other => other,
-                                }
-                            }
-                            other => other,
-                        }
-                    }
-                    Case::OverlapStart => {
-                        self.get_bound(mid * 2, bound);
-                        match compare(bound) {
-                            Greater => Equal,
-                            other => other,
-                        }
-                    }
-                    Case::OverlapEnd => {
-                        self.get_bound(mid * 2 + 1, bound);
-                        match compare(bound) {
-                            Less => Equal,
-                            other => other,
-                        }
-                    }
-                };
-
-                match cmp {
-                    Less => end = mid,
-                    Greater => start = mid + 1,
-                    Equal => break Some(mid),
-                }
+            let cmp = match compare_ranges(target_rows, &rows) {
+                Case::Before => Less,
+                Case::After => Greater,
+                Case::Inside => Equal,
+                Case::Contains => match compare(&self.bounds[mid * 2]) {
+                    Greater => match compare(&self.bounds[mid * 2 + 1]) {
+                        Less => Equal,
+                        other => other,
+                    },
+                    other => other,
+                },
+                Case::OverlapStart => match compare(&self.bounds[mid * 2]) {
+                    Greater => Equal,
+                    other => other,
+                },
+                Case::OverlapEnd => match compare(&self.bounds[mid * 2 + 1]) {
+                    Less => Equal,
+                    other => other,
+                },
             };
-        });
 
-        result
+            match cmp {
+                Less => end = mid,
+                Greater => start = mid + 1,
+                Equal => return Some(mid),
+            }
+        }
+        None
     }
 
-    unsafe fn find_best_match<C>(
+    fn find_best_match<C>(
         &self,
-        key_factory: &dyn Factory<K>,
         target_rows: &Range<u64>,
         compare: &C,
         bias: Ordering,
@@ -1029,56 +1026,45 @@ where
     where
         C: Fn(&K) -> Ordering,
     {
-        let mut result: Option<usize> = None;
-
-        key_factory.with(&mut |bound| {
-            let mut start = 0;
-            let mut end = self.n_children() * 2;
-            result = None;
-            while start < end {
-                let mid = (start + end) / 2;
-                let row = self.get_row_bound(mid) + self.first_row;
-                let cmp = match range_compare(target_rows, row) {
-                    Equal => {
-                        self.get_bound(mid, bound);
-                        let cmp = compare(bound);
-                        if cmp == Equal {
-                            result = Some(mid / 2);
-                            return;
-                        }
-                        cmp
+        let mut start = 0;
+        let mut end = self.n_children() * 2;
+        let mut result = None;
+        while start < end {
+            let mid = (start + end) / 2;
+            let row = self.get_row_bound(mid) + self.first_row;
+            let cmp = match range_compare(target_rows, row) {
+                Equal => {
+                    let bound = &self.bounds[mid];
+                    let cmp = compare(bound);
+                    if cmp == Equal {
+                        return Some(mid / 2);
                     }
-                    cmp => cmp,
-                };
-                if cmp == Less {
-                    end = mid
-                } else {
-                    start = mid + 1
-                };
-                if bias == cmp {
-                    result = Some(mid / 2);
+                    cmp
                 }
+                cmp => cmp,
+            };
+            if cmp == Less {
+                end = mid
+            } else {
+                start = mid + 1
+            };
+            if bias == cmp {
+                result = Some(mid / 2);
             }
-        });
-
+        }
         result
     }
 
     fn n_children(&self) -> usize {
-        self.child_offsets.count
+        self.children.len()
     }
 
     /// Returns the comparison of the largest bound key` using `compare`.
-    unsafe fn compare_max<C>(&self, key_factory: &dyn Factory<K>, compare: &C) -> Ordering
+    fn compare_max<C>(&self, compare: &C) -> Ordering
     where
         C: Fn(&K) -> Ordering,
     {
-        let mut ordering = Equal;
-        key_factory.with(&mut |key| {
-            self.get_bound(self.n_children() * 2 - 1, key);
-            ordering = compare(key);
-        });
-        ordering
+        compare(self.bounds.last().unwrap())
     }
 }
 
@@ -1100,7 +1086,7 @@ where
                 f,
                 " [{i}] = {{ rows: {:?}, location: {:?} }}",
                 self.get_rows(i),
-                self.get_child_location(i),
+                self.children[i]
             )?;
         }
         write!(f, " }}")
@@ -1523,7 +1509,7 @@ where
     factories: Factories<K, A>,
     column: usize,
     rows: Range<u64>,
-    _phantom: PhantomData<fn(&K, &A, N)>,
+    _phantom: PhantomData<fn(N)>,
 }
 
 impl<K, A, N, T> Clone for RowGroup<'_, K, A, N, T>
@@ -1902,11 +1888,7 @@ where
     ///
     /// This function does not move the cursor if `predicate` is true for the
     /// current row or a previous row.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn seek_forward_until<P>(&mut self, predicate: P) -> Result<(), Error>
+    pub fn seek_forward_until<P>(&mut self, predicate: P) -> Result<(), Error>
     where
         P: Fn(&K) -> bool + Clone,
     {
@@ -1922,21 +1904,13 @@ where
     /// Moves the cursor forward past rows whose keys are less than `target`.
     /// This function does not move the cursor if the current row's key is
     /// greater than or equal to `target`.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn advance_to_value_or_larger(&mut self, target: &K) -> Result<(), Error> {
+    pub fn advance_to_value_or_larger(&mut self, target: &K) -> Result<(), Error> {
         self.advance_to_first_ge(&|key| target.cmp(key))
     }
 
     /// Moves the cursor to the row whose key is exactly `target`.  This
     /// function does not move the cursor if no key is exactly `target`.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn seek_exact(&mut self, target: &K) -> Result<bool, Error> {
+    pub fn seek_exact(&mut self, target: &K) -> Result<bool, Error> {
         match Position::find_exact::<N, T, _>(&self.row_group, &|key| target.cmp(key))? {
             Some(position) => {
                 self.position = position;
@@ -1957,11 +1931,7 @@ where
     ///
     /// If this returns an error, then the cursor's position might be lost. If
     /// so, then its position is advanced past the end of the row group.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn advance_to_first_ge<C>(&mut self, compare: &C) -> Result<(), Error>
+    pub fn advance_to_first_ge<C>(&mut self, compare: &C) -> Result<(), Error>
     where
         C: Fn(&K) -> Ordering,
     {
@@ -1974,11 +1944,7 @@ where
     ///
     /// This function does not move the cursor if `predicate` is true for the
     /// current row or a previous row.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn seek_backward_until<P>(&mut self, predicate: P) -> Result<(), Error>
+    pub fn seek_backward_until<P>(&mut self, predicate: P) -> Result<(), Error>
     where
         P: Fn(&K) -> bool + Clone,
     {
@@ -1994,11 +1960,7 @@ where
     /// Moves the cursor backward past rows whose keys are greater than
     /// `target`.  This function does not move the cursor if the current row's
     /// key is less than or equal to `target`.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn rewind_to_value_or_smaller(&mut self, target: &K) -> Result<(), Error>
+    pub fn rewind_to_value_or_smaller(&mut self, target: &K) -> Result<(), Error>
     where
         K: Ord,
     {
@@ -2012,11 +1974,7 @@ where
     ///
     /// This function does not move the cursor if `compare` returns [`Equal`] or
     /// [`Less`] for the current row or a previous row.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn rewind_to_last_le<C>(&mut self, compare: &C) -> Result<(), Error>
+    pub fn rewind_to_last_le<C>(&mut self, compare: &C) -> Result<(), Error>
     where
         C: Fn(&K) -> Ordering,
     {
@@ -2207,7 +2165,7 @@ where
         }
         Ok(())
     }
-    unsafe fn best_match<N, T, C>(
+    fn best_match<N, T, C>(
         row_group: &RowGroup<'_, K, A, N, T>,
         compare: &C,
         bias: Ordering,
@@ -2223,12 +2181,9 @@ where
         loop {
             match node.read(&row_group.factories, &row_group.reader.file)? {
                 TreeBlock::Index(index_block) => {
-                    let Some(child_idx) = index_block.find_best_match(
-                        row_group.factories.key_factory,
-                        &row_group.rows,
-                        compare,
-                        bias,
-                    ) else {
+                    let Some(child_idx) =
+                        index_block.find_best_match(&row_group.rows, compare, bias)
+                    else {
                         return Ok(None);
                     };
                     node = index_block.get_child(child_idx)?;
@@ -2247,7 +2202,7 @@ where
         }
     }
 
-    unsafe fn find_exact<N, T, C>(
+    fn find_exact<N, T, C>(
         row_group: &RowGroup<'_, K, A, N, T>,
         compare: &C,
     ) -> Result<Option<Self>, Error>
@@ -2262,11 +2217,7 @@ where
         loop {
             match node.read(&row_group.factories, &row_group.reader.file)? {
                 TreeBlock::Index(index_block) => {
-                    let Some(child_idx) = index_block.find_exact(
-                        row_group.factories.key_factory,
-                        &row_group.rows,
-                        compare,
-                    ) else {
+                    let Some(child_idx) = index_block.find_exact(&row_group.rows, compare) else {
                         return Ok(None);
                     };
                     node = index_block.get_child(child_idx)?;
@@ -2306,7 +2257,7 @@ where
     ///
     /// The same optimization would apply to backward seeks, but they haven't
     /// been important in practice yet.
-    unsafe fn advance_to_first_ge<N, T, C>(
+    fn advance_to_first_ge<N, T, C>(
         &mut self,
         row_group: &RowGroup<'_, K, A, N, T>,
         compare: &C,
@@ -2339,19 +2290,13 @@ where
             // We need to go up another level if `rows.end` is beyond the end of
             // `index_block` and the greatest value under `index_block` is less
             // than the target.
-            if rows.end > index_block.rows().end
-                && index_block.compare_max(row_group.factories.key_factory, compare) == Greater
-            {
+            if rows.end > index_block.rows().end && index_block.compare_max(compare) == Greater {
                 continue;
             }
 
             // Otherwise, our target (if any) must be below `index_block`.
-            let Some(child_idx) = index_block.find_best_match(
-                row_group.factories.key_factory,
-                &row_group.rows,
-                compare,
-                Less,
-            ) else {
+            let Some(child_idx) = index_block.find_best_match(&row_group.rows, compare, Less)
+            else {
                 // `rows.end` is inside `index_block` but the largest key is
                 // less than the target.
                 return Ok(false);
@@ -2362,12 +2307,9 @@ where
             loop {
                 match node.read::<K, A>(&row_group.factories, &row_group.reader.file)? {
                     TreeBlock::Index(index_block) => {
-                        let Some(child_idx) = index_block.find_best_match(
-                            row_group.factories.key_factory,
-                            &row_group.rows,
-                            compare,
-                            Less,
-                        ) else {
+                        let Some(child_idx) =
+                            index_block.find_best_match(&row_group.rows, compare, Less)
+                        else {
                             return Ok(false);
                         };
                         node = index_block.get_child(child_idx)?;
@@ -2599,7 +2541,7 @@ where
     fn has_value(&self) -> bool {
         self.path().is_some()
     }
-    unsafe fn best_match<N, T, C>(
+    fn best_match<N, T, C>(
         row_group: &RowGroup<'_, K, A, N, T>,
         compare: &C,
         bias: Ordering,
@@ -2617,7 +2559,7 @@ where
             }),
         }
     }
-    unsafe fn find_exact<N, T, C>(
+    fn find_exact<N, T, C>(
         row_group: &RowGroup<'_, K, A, N, T>,
         compare: &C,
     ) -> Result<Option<Self>, Error>
@@ -2650,7 +2592,7 @@ where
 
     /// If this returns an I/O error, then the position might be lost (and set
     /// to `Position::After`).
-    unsafe fn advance_to_first_ge<N, T, C>(
+    fn advance_to_first_ge<N, T, C>(
         &mut self,
         row_group: &RowGroup<'_, K, A, N, T>,
         compare: &C,

@@ -679,12 +679,11 @@ where
     }
 
     fn seek_key(&mut self, key: &K) {
-        self.move_key(|key_cursor| unsafe { key_cursor.advance_to_value_or_larger(key) });
+        self.move_key(|key_cursor| key_cursor.advance_to_value_or_larger(key));
     }
 
     fn seek_key_exact(&mut self, key: &K) -> bool {
-        let found =
-            self.wset.maybe_contains_key(key) && unsafe { self.cursor.seek_exact(key) }.unwrap();
+        let found = self.wset.maybe_contains_key(key) && self.cursor.seek_exact(key).unwrap();
         if found {
             self.moved_key();
         }
@@ -692,15 +691,15 @@ where
     }
 
     fn seek_key_with(&mut self, predicate: &dyn Fn(&K) -> bool) {
-        self.move_key(|key_cursor| unsafe { key_cursor.seek_forward_until(predicate) });
+        self.move_key(|key_cursor| key_cursor.seek_forward_until(predicate));
     }
 
     fn seek_key_with_reverse(&mut self, predicate: &dyn Fn(&K) -> bool) {
-        self.move_key(|key_cursor| unsafe { key_cursor.seek_backward_until(predicate) });
+        self.move_key(|key_cursor| key_cursor.seek_backward_until(predicate));
     }
 
     fn seek_key_reverse(&mut self, key: &K) {
-        self.move_key(|key_cursor| unsafe { key_cursor.rewind_to_value_or_smaller(key) });
+        self.move_key(|key_cursor| key_cursor.rewind_to_value_or_smaller(key));
     }
 
     fn step_val(&mut self) {

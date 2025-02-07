@@ -70,7 +70,7 @@
 // Warn about missing docs, but not for item declared with `#[cfg(test)]`.
 #![cfg_attr(not(test), warn(missing_docs))]
 
-use crate::dynamic::{DynPairs, LeanVec};
+use crate::dynamic::{DynPairs, DynVec, LeanVec};
 use crate::storage::buffer_cache::{FBuf, FBufSerializer};
 use crate::utils::Tup2;
 use binrw::binrw;
@@ -167,8 +167,12 @@ where
     /// Factory for creating instances of `K`.
     pub key_factory: &'static dyn Factory<K>,
 
+    /// Factory for creating instances of `DynVec<K>`.
+    pub keys_factory: &'static dyn Factory<DynVec<K>>,
+
     /// Factory for creating instances of `Item<K, A>`.
     pub item_factory: &'static dyn ItemFactory<K, A>,
+
     /// Factory for creating instances of `DynPairs<K, A>`.
     pub pairs_factory: &'static dyn Factory<DynPairs<K, A>>,
 }
@@ -181,6 +185,7 @@ where
     fn clone(&self) -> Self {
         Self {
             key_factory: self.key_factory,
+            keys_factory: self.keys_factory,
             item_factory: self.item_factory,
             pairs_factory: self.pairs_factory,
         }
@@ -201,6 +206,7 @@ where
     {
         Self {
             key_factory: WithFactory::<KType>::FACTORY,
+            keys_factory: WithFactory::<LeanVec<KType>>::FACTORY,
             item_factory: <RefTup2Factory<KType, AType> as WithItemFactory<K, A>>::ITEM_FACTORY,
             pairs_factory: WithFactory::<LeanVec<Tup2<KType, AType>>>::FACTORY,
         }
@@ -214,6 +220,7 @@ where
     pub(crate) fn any_factories(&self) -> AnyFactories {
         AnyFactories {
             key_factory: Arc::new(self.key_factory),
+            keys_factory: Arc::new(self.keys_factory),
             item_factory: Arc::new(self.item_factory),
             pairs_factory: Arc::new(self.pairs_factory),
         }
@@ -231,6 +238,7 @@ where
 #[derive(Clone)]
 pub struct AnyFactories {
     key_factory: Arc<(dyn Any + Send + Sync + 'static)>,
+    keys_factory: Arc<(dyn Any + Send + Sync + 'static)>,
     item_factory: Arc<(dyn Any + Send + Sync + 'static)>,
     pairs_factory: Arc<(dyn Any + Send + Sync + 'static)>,
 }
@@ -250,6 +258,17 @@ impl AnyFactories {
             .key_factory
             .as_ref()
             .downcast_ref::<&'static dyn Factory<K>>()
+            .unwrap()
+    }
+
+    fn keys_factory<K>(&self) -> &'static dyn Factory<DynVec<K>>
+    where
+        K: DataTrait + ?Sized,
+    {
+        *self
+            .keys_factory
+            .as_ref()
+            .downcast_ref::<&'static dyn Factory<DynVec<K>>>()
             .unwrap()
     }
 
@@ -284,6 +303,7 @@ impl AnyFactories {
     {
         Factories {
             key_factory: self.key_factory(),
+            keys_factory: self.keys_factory(),
             item_factory: self.item_factory(),
             pairs_factory: self.pairs_factory(),
         }
@@ -391,35 +411,35 @@ mod test {
         T: ColumnSpec,
     {
         let mut cursor = row_group.first().unwrap();
-        unsafe { cursor.advance_to_value_or_larger(key.erase()) }.unwrap();
+         cursor.advance_to_value_or_larger(key.erase()) .unwrap();
         assert_eq!(cursor.item(), Some((key.erase(), aux.erase())));
 
         let mut cursor = row_group.first().unwrap();
-        unsafe { cursor.advance_to_value_or_larger(before.erase()) }.unwrap();
+         cursor.advance_to_value_or_larger(before.erase()) .unwrap();
         assert_eq!(cursor.item(), Some((key.erase(), aux.erase())));
 
         let mut cursor = row_group.first().unwrap();
-        unsafe { cursor.seek_forward_until(|k| k >= key.erase()) }.unwrap();
+         cursor.seek_forward_until(|k| k >= key.erase()) .unwrap();
         assert_eq!(cursor.item(), Some((key.erase(), aux.erase())));
 
         let mut cursor = row_group.first().unwrap();
-        unsafe { cursor.seek_forward_until(|k| k >= before.erase()) }.unwrap();
+         cursor.seek_forward_until(|k| k >= before.erase()) .unwrap();
         assert_eq!(cursor.item(), Some((key.erase(), aux.erase())));
 
         let mut cursor = row_group.last().unwrap();
-        unsafe { cursor.rewind_to_value_or_smaller(key.erase()) }.unwrap();
+         cursor.rewind_to_value_or_smaller(key.erase()) .unwrap();
         assert_eq!(cursor.item(), Some((key.erase(), aux.erase())));
 
         let mut cursor = row_group.last().unwrap();
-        unsafe { cursor.rewind_to_value_or_smaller(after.erase()) }.unwrap();
+         cursor.rewind_to_value_or_smaller(after.erase()) .unwrap();
         assert_eq!(cursor.item(), Some((key.erase(), aux.erase())));
 
         let mut cursor = row_group.last().unwrap();
-        unsafe { cursor.seek_backward_until(|k| k <= key.erase()) }.unwrap();
+         cursor.seek_backward_until(|k| k <= key.erase()) .unwrap();
         assert_eq!(cursor.item(), Some((key.erase(), aux.erase())));
 
         let mut cursor = row_group.last().unwrap();
-        unsafe { cursor.seek_backward_until(|k| k <= after.erase()) }.unwrap();
+         cursor.seek_backward_until(|k| k <= after.erase()) .unwrap();
         assert_eq!(cursor.item(), Some((key.erase(), aux.erase())));
     }
 
@@ -433,19 +453,19 @@ mod test {
         T: ColumnSpec,
     {
         let mut cursor = row_group.first().unwrap();
-        unsafe { cursor.advance_to_value_or_larger(after.erase()) }.unwrap();
+         cursor.advance_to_value_or_larger(after.erase()) .unwrap();
         assert_eq!(cursor.item(), None);
 
         cursor.move_first().unwrap();
-        unsafe { cursor.seek_forward_until(|k| k >= after.erase()) }.unwrap();
+         cursor.seek_forward_until(|k| k >= after.erase()) .unwrap();
         assert_eq!(cursor.item(), None);
 
         let mut cursor = row_group.last().unwrap();
-        unsafe { cursor.rewind_to_value_or_smaller(before.erase()) }.unwrap();
+         cursor.rewind_to_value_or_smaller(before.erase()) .unwrap();
         assert_eq!(cursor.item(), None);
 
         cursor.move_last().unwrap();
-        unsafe { cursor.seek_backward_until(|k| k <= before.erase()) }.unwrap();
+         cursor.seek_backward_until(|k| k <= before.erase()) .unwrap();
         assert_eq!(cursor.item(), None);
     }
 

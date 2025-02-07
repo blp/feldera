@@ -410,8 +410,7 @@ where
     A: DataTrait + ?Sized,
     T: ColumnSpec,
 {
-    while cursor.has_value() {
-        let key = cursor.key().unwrap();
+    while let Some(key) = cursor.key() {
         if include(key, filter) {
             return true;
         }
@@ -496,18 +495,19 @@ where
         value_filter: &Option<Filter<V>>,
         map_func: Option<&dyn Fn(&mut DynDataTyped<T>)>,
     ) {
-        let key = key_cursor.key().unwrap();
         let mut value_cursor = key_cursor.next_column().unwrap().first().unwrap();
         let mut n = 0;
         while value_cursor.has_value() {
             let value = value_cursor.key().unwrap();
             if include(value, value_filter) {
-                n += self.copy_value(output, &value_cursor, map_func);
+                n += self.copy_value(output, &mut value_cursor, map_func);
             }
             value_cursor.move_next().unwrap();
         }
         if n > 0 {
-            output.write0((key, ().erase())).unwrap();
+            output
+                .write0((key_cursor.key().unwrap(), ().erase()))
+                .unwrap();
         }
         key_cursor.move_next().unwrap();
     }
@@ -518,12 +518,22 @@ where
         cursor: &RawValCursor<'_, K, V, T, R>,
         map_func: Option<&dyn Fn(&mut DynDataTyped<T>)>,
     ) -> usize {
-        let td = cursor.aux().unwrap();
-        let value = cursor.key().unwrap();
         if let Some(map_func) = map_func {
-            todo!();
+            let mut n = 0;
+            self.factories.timediff_factory.with(&mut |td| {
+                td.extend(cursor.aux().unwrap().as_vec());
+                for i in 0..td.len() {
+                    map_func(td[i].fst_mut());
+                }
+                td.consolidate();
+                if !td.is_empty() {
+                    output.write1((cursor.key().unwrap(), td)).unwrap();
+                    n = 1;
+                }
+            });
+            n
         } else {
-            output.write1((value, td)).unwrap();
+            output.write1(cursor.item().unwrap()).unwrap();
             1
         }
     }
@@ -574,10 +584,10 @@ where
                         }
                         if !td.is_empty() {
                             output.write1((value1, td)).unwrap();
-                            n += 1;
                         }
                         cursor1.move_next().unwrap();
                         cursor2.move_next().unwrap();
+                        n += 1;
                     }
                     Ordering::Greater => {
                         n += self.copy_value(output, cursor2, map_func);
@@ -654,7 +664,7 @@ where
                     self.copy_values_if(&mut output, &mut cursor2, value_filter, time_map_func);
                 }
             }
-        }
+        };
         Arc::new(output.into_reader().unwrap())
     }
 }
@@ -880,12 +890,11 @@ where
     }
 
     fn seek_key(&mut self, key: &K) {
-        self.move_key(|key_cursor| unsafe { key_cursor.advance_to_value_or_larger(key) }.unwrap());
+        self.move_key(|key_cursor| key_cursor.advance_to_value_or_larger(key).unwrap());
     }
 
     fn seek_key_exact(&mut self, key: &K) -> bool {
-        let found = self.batch.maybe_contains_key(key)
-            && unsafe { self.key_cursor.seek_exact(key) }.unwrap();
+        let found = self.batch.maybe_contains_key(key) && self.key_cursor.seek_exact(key).unwrap();
         if found {
             self.moved_key();
         }
@@ -893,30 +902,30 @@ where
     }
 
     fn seek_key_with(&mut self, predicate: &dyn Fn(&K) -> bool) {
-        self.move_key(|key_cursor| unsafe { key_cursor.seek_forward_until(predicate) }.unwrap());
+        self.move_key(|key_cursor| key_cursor.seek_forward_until(predicate).unwrap());
     }
 
     fn seek_key_with_reverse(&mut self, predicate: &dyn Fn(&K) -> bool) {
-        self.move_key(|key_cursor| unsafe { key_cursor.seek_backward_until(predicate) }.unwrap());
+        self.move_key(|key_cursor| key_cursor.seek_backward_until(predicate).unwrap());
     }
 
     fn seek_key_reverse(&mut self, key: &K) {
-        self.move_key(|key_cursor| unsafe { key_cursor.rewind_to_value_or_smaller(key) }.unwrap());
+        self.move_key(|key_cursor| key_cursor.rewind_to_value_or_smaller(key).unwrap());
     }
     fn step_val(&mut self) {
         self.move_val(|val_cursor| val_cursor.move_next().unwrap());
     }
     fn seek_val(&mut self, val: &V) {
-        self.move_val(|val_cursor| unsafe { val_cursor.advance_to_value_or_larger(val) }.unwrap());
+        self.move_val(|val_cursor| val_cursor.advance_to_value_or_larger(val).unwrap());
     }
     fn seek_val_exact(&mut self, val: &V) -> bool
     where
         V: PartialEq,
     {
-        unsafe { self.val_cursor.seek_exact(val) }.unwrap()
+        self.val_cursor.seek_exact(val).unwrap()
     }
     fn seek_val_with(&mut self, predicate: &dyn Fn(&V) -> bool) {
-        self.move_val(|val_cursor| unsafe { val_cursor.seek_forward_until(&predicate) }.unwrap());
+        self.move_val(|val_cursor| val_cursor.seek_forward_until(&predicate).unwrap());
     }
     fn rewind_keys(&mut self) {
         self.move_key(|key_cursor| key_cursor.move_first().unwrap());
@@ -933,11 +942,11 @@ where
     }
 
     fn seek_val_reverse(&mut self, val: &V) {
-        self.move_val(|val_cursor| unsafe { val_cursor.rewind_to_value_or_smaller(val) }.unwrap());
+        self.move_val(|val_cursor| val_cursor.rewind_to_value_or_smaller(val).unwrap());
     }
 
     fn seek_val_with_reverse(&mut self, predicate: &dyn Fn(&V) -> bool) {
-        self.move_val(|val_cursor| unsafe { val_cursor.seek_backward_until(&predicate) }.unwrap());
+        self.move_val(|val_cursor| val_cursor.seek_backward_until(&predicate).unwrap());
     }
 
     fn fast_forward_vals(&mut self) {
