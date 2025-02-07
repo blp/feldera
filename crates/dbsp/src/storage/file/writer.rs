@@ -35,7 +35,7 @@ use crate::{
     Runtime,
 };
 
-use super::{format::Compression, reader::InnerIndexBlock};
+use super::format::Compression;
 use super::{
     reader::Reader, AnyFactories, Factories, Serializer, BLOOM_FILTER_FALSE_POSITIVE_RATE,
 };
@@ -330,7 +330,8 @@ impl ColumnWriter {
             block_writer.insert_cache_entry(
                 location,
                 Arc::new(
-                    InnerIndexBlock::from_raw(block, location, index_block.rows.start).unwrap(),
+                    super::reader::IndexBlock::<K>::from_raw(block, location, index_block.rows.start)
+                        .unwrap(),
                 ),
             );
 
