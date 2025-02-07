@@ -2127,7 +2127,6 @@ struct Path<K: DataTrait + ?Sized, A: DataTrait + ?Sized> {
     row: u64,
     indexes: Vec<IndexBlock<K>>,
     data: DataBlock<K, A>,
-    factories: Factories<K, A>,
 }
 
 impl<K: DataTrait + ?Sized, A: DataTrait + ?Sized> PartialEq for Path<K, A> {
@@ -2156,7 +2155,6 @@ impl<K: DataTrait + ?Sized, A: DataTrait + ?Sized> Clone for Path<K, A> {
             row: self.row,
             indexes: self.indexes.clone(),
             data: self.data.clone(),
-            factories: self.factories.clone(),
         }
     }
 }
@@ -2217,13 +2215,7 @@ where
             let next = block.lookup_row(row)?;
             match block {
                 TreeBlock::Data(data) => {
-                    let factories = row_group.factories.clone();
-                    return Ok(Self {
-                        row,
-                        indexes,
-                        data,
-                        factories,
-                    });
+                    return Ok(Self { row, indexes, data });
                 }
                 TreeBlock::Index(index) => {
                     push_index_block(&mut indexes, index)?;
@@ -2326,7 +2318,6 @@ where
                             row: data_block.first_row + child_idx as u64,
                             indexes,
                             data: data_block,
-                            factories: row_group.factories.clone(),
                         }));
                 }
             }
@@ -2365,7 +2356,6 @@ where
                             row: data_block.first_row + child_idx as u64,
                             indexes,
                             data: data_block,
-                            factories: row_group.factories.clone(),
                         }));
                 }
             }
@@ -2497,22 +2487,14 @@ where
     A: DataTrait + ?Sized,
 {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
-        let mut min = self.factories.key_factory.default_box();
-        let mut max = self.factories.key_factory.default_box();
-
         write!(f, "Path {{ row: {}, indexes:", self.row)?;
         for index in &self.indexes {
             let n = index.n_children();
             match index.find_row(self.row) {
                 Some(i) => {
-                    unsafe { index.get_bound(i * 2, &mut min) };
-                    unsafe { index.get_bound(i * 2 + 1, &mut max) };
                     let min_row = index.get_row_bound(i * 2);
                     let max_row = index.get_row_bound(i * 2 + 1);
-                    write!(
-                        f,
-                        "\n[child {i} of {n}: keys {min:?}..={max:?}, rows {min_row}..={max_row}]",
-                    )?;
+                    write!(f, "\n[child {i} of {n}: rows {min_row}..={max_row}]",)?;
                 }
                 None => {
                     // This should not be possible because it indicates an
