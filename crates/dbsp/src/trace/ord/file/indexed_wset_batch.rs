@@ -793,11 +793,11 @@ where
     }
 
     fn seek_key_exact(&mut self, key: &K) -> bool {
-        let found = self.wset.maybe_contains_key(key) && self.key_cursor.seek_exact(key).unwrap();
-        if found {
-            self.moved_key();
+        if !self.wset.maybe_contains_key(key) {
+            return false;
         }
-        found
+        self.seek_key(key);
+        self.key_valid() && self.key().eq(key)
     }
 
     fn seek_key_with(&mut self, predicate: &dyn Fn(&K) -> bool) {
@@ -818,17 +818,6 @@ where
 
     fn seek_val(&mut self, val: &V) {
         self.move_val(|val_cursor| val_cursor.advance_to_value_or_larger(val));
-    }
-
-    fn seek_val_exact(&mut self, val: &V) -> bool
-    where
-        V: PartialEq,
-    {
-        let found = self.val_cursor.seek_exact(val).unwrap();
-        if found {
-            self.moved_val();
-        }
-        found
     }
 
     fn seek_val_with(&mut self, predicate: &dyn Fn(&V) -> bool) {
