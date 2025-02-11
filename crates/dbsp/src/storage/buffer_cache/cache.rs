@@ -24,7 +24,6 @@ use tokio::sync::{oneshot, watch};
 use crate::circuit::metadata::{MetaItem, OperatorMeta};
 use crate::circuit::runtime::ThreadType;
 use crate::storage::backend::{BlockLocation, FileId, FileReader};
-use crate::storage::file::format::Compression;
 use crate::storage::file::reader::Error;
 
 use super::FBuf;
@@ -70,7 +69,7 @@ struct CacheValue {
     serial: u64,
 }
 
-pub trait CacheEntry: Send + Sync {
+pub trait CacheEntry: Send + Sync + Debug {
     fn cost(&self) -> usize;
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 }
@@ -421,8 +420,20 @@ pub struct AsyncCacheContext {
 }
 
 struct AsyncCacheTask {
-    parse: Box<dyn FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error>>,
+    parse: Box<dyn FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error> + 'static>,
     send_replies: Vec<oneshot::Sender<Result<Arc<dyn CacheEntry>, Error>>>,
+}
+
+impl AsyncCacheTask {
+    fn new<F>(parse: F) -> Self
+    where
+        F: FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error> + 'static,
+    {
+        Self {
+            parse: Box::new(parse),
+            send_replies: Vec::new(),
+        }
+    }
 }
 
 impl AsyncCacheContext {
@@ -441,9 +452,10 @@ impl AsyncCacheContext {
     pub async fn read<F>(
         &self,
         location: BlockLocation,
-        parse: F
+        parse: F,
     ) -> Result<Arc<dyn CacheEntry>, Error>
-        where F: FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error>
+    where
+        F: FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error> + 'static,
     {
         let key = CacheKey::new(self.file_id, location.offset);
         if let Some(aux) = self.cache.inner.lock().unwrap().get(key) {
@@ -456,8 +468,8 @@ impl AsyncCacheContext {
             .lock()
             .unwrap()
             .entry(location)
-            .or_insert_with(|| AsyncCacheTask::new())
-            .1
+            .or_insert_with(|| AsyncCacheTask::new(parse))
+            .send_replies
             .push(sender);
 
         self.n_requests.send_modify(|n| *n += 1);
@@ -473,7 +485,6 @@ impl AsyncCacheContext {
             .unwrap();
     }
 
-    /*
     /// Runs all of the pending I/O and wakes up threads blocked in [Self::read].
     pub async fn run_io_batch<R>(&self, file: &R)
     where
@@ -482,7 +493,7 @@ impl AsyncCacheContext {
         let requests = std::mem::take(&mut *self.requests.lock().unwrap());
         let n_requests = requests
             .values()
-            .map(|(_compression, senders)| senders.len())
+            .map(|task| task.send_replies.len())
             .sum::<usize>();
         self.n_requests.send_modify(|n| *n -= n_requests);
         let blocks = requests.keys().cloned().collect::<Vec<_>>();
@@ -494,21 +505,16 @@ impl AsyncCacheContext {
             ),
         );
         let result = receiver.await.unwrap(); // XXX unwrap
-        for (result, (location, (compression, result_senders))) in
-            result.into_iter().zip(requests.into_iter())
-        {
-            let result = result.map_or_else(
-                |error| Err(error.into()),
-                |block| FileCacheEntry::from_read(block, location, compression),
-            );
+        for (result, (location, task)) in result.into_iter().zip(requests.into_iter()) {
+            let result = result.map_or_else(|error| Err(error.into()), |block| (task.parse)(block));
             if let Ok(cache_entry) = result.as_ref() {
                 self.cache.inner.lock().unwrap().insert(
                     CacheKey::new(self.file_id, location.offset),
                     cache_entry.clone(),
                 );
             }
-            for result_sender in result_senders {
-                result_sender.send(result.clone()).unwrap(); // XXX unwrap
+            for send_reply in task.send_replies {
+                send_reply.send(result.clone()).unwrap(); // XXX unwrap
             }
         }
     }
@@ -558,5 +564,5 @@ impl AsyncCacheContext {
             }
         }
         outputs.into_iter().map(|output| output.unwrap()).collect()
-    }*/
+    }
 }
