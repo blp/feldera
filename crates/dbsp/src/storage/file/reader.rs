@@ -428,6 +428,7 @@ impl ValueMapReader {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct DataBlock<K, A>
 where
     K: DataTrait + ?Sized,
@@ -476,11 +477,7 @@ impl<'a> DataBlockReader<'a> {
         let cache = (file.cache)();
         #[allow(clippy::borrow_deref_ref)]
         let (access, entry) = match cache.get(&*file.file_handle, node.location) {
-            Some(entry) => {
-                let entry = Arc::downcast::<DataBlock<K, A>>(entry.as_any())
-                    .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(node.location)))?;
-                (CacheAccess::Hit, Some(entry))
-            }
+            Some(entry) => (CacheAccess::Hit, Some(entry)),
             None => (CacheAccess::Miss, None),
         };
         let this = Self {
@@ -491,32 +488,18 @@ impl<'a> DataBlockReader<'a> {
             access,
         };
         match entry {
-            Some(entry) => Ok(Either::Right(this.tail(entry)?)),
+            Some(entry) => Ok(Either::Right(this.complete(entry)?)),
             None => Ok(Either::Left(this)),
         }
     }
-    fn with_raw<K, A>(self, raw: Arc<FBuf>) -> Result<Arc<DataBlock<K, A>>, Error>
+    fn complete<K, A>(self, cache_entry: Arc<dyn CacheEntry>) -> Result<Arc<DataBlock<K, A>>, Error>
     where
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
-        let entry = Arc::new(DataBlock::from_raw(
-            raw,
-            self.node.location,
-            self.node.rows.start,
-        )?);
-        self.cache.insert(
-            self.file.file_handle.file_id(),
-            self.node.location.offset,
-            entry.clone(),
-        );
-        self.tail(entry)
-    }
-    fn tail<K, A>(self, data_block: Arc<DataBlock<K, A>>) -> Result<Arc<DataBlock<K, A>>, Error>
-    where
-        K: DataTrait + ?Sized,
-        A: DataTrait + ?Sized,
-    {
+        let data_block = Arc::downcast::<DataBlock<K, A>>(cache_entry.as_any())
+            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(self.node.location)))?;
+
         self.file
             .stats
             .record(self.access, self.start.elapsed(), self.node.location);
@@ -568,7 +551,14 @@ where
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         match DataBlockReader::new(file, node)? {
             Either::Left(data_block_reader) => {
-                data_block_reader.with_raw(file.read_blocking(node.location)?)
+                let raw = file.read_blocking(node.location)?;
+                let entry = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
+                data_block_reader.cache.insert(
+                    file.file_handle.file_id(),
+                    node.location.offset,
+                    entry.clone(),
+                );
+                data_block_reader.complete(entry)
             }
             Either::Right(data_block) => Ok(data_block),
         }
@@ -576,11 +566,21 @@ where
     async fn new_async(
         file: &ImmutableFileRef,
         context: &AsyncCacheContext,
-        node: &TreeNode,
+        node: TreeNode,
     ) -> Result<Arc<Self>, Error> {
-        match DataBlockReader::new(file, node)? {
+        match DataBlockReader::new(file, &node)? {
             Either::Left(data_block_reader) => {
-                data_block_reader.with_raw(context.read_async(node.location).await?)
+                let compression = file.compression;
+                let entry = context
+                    .read(node.location, move |raw| {
+                        Ok(Arc::new(Self::from_raw(
+                            decompress(compression, node.location, raw)?,
+                            node.location,
+                            node.rows.start,
+                        )?))
+                    })
+                    .await?;
+                data_block_reader.complete(entry)
             }
             Either::Right(data_block) => Ok(data_block),
         }
@@ -755,8 +755,12 @@ impl TreeNode {
         A: DataTrait + ?Sized,
     {
         match self.node_type {
-            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new_async(file, context, &self).await?)),
-            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new_async(file, context, &self).await?)),
+            NodeType::Data => Ok(TreeBlock::Data(
+                DataBlock::new_async(file, context, self).await?,
+            )),
+            NodeType::Index => Ok(TreeBlock::Index(
+                IndexBlock::new_async(file, context, self).await?,
+            )),
         }
     }
 }
@@ -842,16 +846,7 @@ impl<'a> IndexBlockReader<'a> {
         let cache = (file.cache)();
         #[allow(clippy::borrow_deref_ref)]
         let (access, entry) = match cache.get(&*file.file_handle, node.location) {
-            Some(entry) => {
-                let entry = Arc::downcast::<IndexBlock<K>>(entry.as_any())
-                    .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(node.location)))?;
-                if entry.first_row != node.rows.start {
-                    return Err(Error::Corruption(CorruptionError::MultiplePaths(
-                        node.location,
-                    )));
-                }
-                (CacheAccess::Hit, Some(entry))
-            }
+            Some(entry) => (CacheAccess::Hit, Some(entry)),
             None => (CacheAccess::Miss, None),
         };
         let this = Self {
@@ -862,30 +857,21 @@ impl<'a> IndexBlockReader<'a> {
             access,
         };
         match entry {
-            Some(entry) => Ok(Either::Right(this.tail(entry)?)),
+            Some(entry) => Ok(Either::Right(this.complete(entry)?)),
             None => Ok(Either::Left(this)),
         }
     }
-    fn with_raw<K>(self, raw: Arc<FBuf>) -> Result<Arc<IndexBlock<K>>, Error>
+    fn complete<K>(self, cache_entry: Arc<dyn CacheEntry>) -> Result<Arc<IndexBlock<K>>, Error>
     where
         K: DataTrait + ?Sized,
     {
-        let entry = Arc::new(IndexBlock::from_raw(
-            raw,
-            self.node.location,
-            self.node.rows.start,
-        )?);
-        self.cache.insert(
-            self.file.file_handle.file_id(),
-            self.node.location.offset,
-            entry.clone(),
-        );
-        self.tail(entry)
-    }
-    fn tail<K>(self, index_block: Arc<IndexBlock<K>>) -> Result<Arc<IndexBlock<K>>, Error>
-    where
-        K: DataTrait + ?Sized,
-    {
+        let index_block = Arc::downcast::<IndexBlock<K>>(cache_entry.as_any())
+            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(self.node.location)))?;
+        if index_block.first_row != self.node.rows.start {
+            return Err(Error::Corruption(CorruptionError::MultiplePaths(
+                self.node.location,
+            )));
+        }
         self.file
             .stats
             .record(self.access, self.start.elapsed(), self.node.location);
@@ -970,7 +956,14 @@ where
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         match IndexBlockReader::new(file, node)? {
             Either::Left(index_block_reader) => {
-                index_block_reader.with_raw(file.read_blocking(node.location)?)
+                let raw = file.read_blocking(node.location)?;
+                let entry = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
+                index_block_reader.cache.insert(
+                    file.file_handle.file_id(),
+                    node.location.offset,
+                    entry.clone(),
+                );
+                index_block_reader.complete(entry)
             }
             Either::Right(index_block) => Ok(index_block),
         }
@@ -978,11 +971,21 @@ where
     async fn new_async(
         file: &ImmutableFileRef,
         context: &AsyncCacheContext,
-        node: &TreeNode,
+        node: TreeNode,
     ) -> Result<Arc<Self>, Error> {
-        match IndexBlockReader::new(file, node)? {
+        match IndexBlockReader::new(file, &node)? {
             Either::Left(index_block_reader) => {
-                index_block_reader.with_raw(context.read_async(node.location).await?)
+                let compression = file.compression;
+                let entry = context
+                    .read(node.location, move |raw| {
+                        Ok(Arc::new(Self::from_raw(
+                            decompress(compression, node.location, raw)?,
+                            node.location,
+                            node.rows.start,
+                        )?))
+                    })
+                    .await?;
+                index_block_reader.complete(entry)
             }
             Either::Right(index_block) => Ok(index_block),
         }
@@ -1284,57 +1287,66 @@ impl ImmutableFileRef {
     }
 
     pub fn read_blocking(&self, location: BlockLocation) -> Result<Arc<FBuf>, Error> {
-        let raw = self.file_handle.read_block(location)?;
-        let raw = if let Some(compression) = self.compression {
-            let compressed_len = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
-            let Some(compressed) = raw[4..].get(..compressed_len) else {
-                return Err(CorruptionError::BadCompressedLen {
-                    location,
-                    compressed_len,
-                    max_compressed_len: raw.len() - 4,
-                }
-                .into());
-            };
-            match compression {
-                Compression::Snappy => {
-                    let decompressed_len = decompress_len(compressed).map_err(|error| {
-                        Error::Corruption(CorruptionError::Snappy { location, error })
-                    })?;
-                    let mut decompressed = FBuf::with_capacity(decompressed_len);
-                    decompressed.resize(decompressed_len, 0);
-                    match Decoder::new().decompress(compressed, decompressed.as_mut_slice()) {
-                        Ok(n) if n == decompressed_len => {}
-                        Ok(n) => {
-                            return Err(CorruptionError::UnexpectedDecompressionLength {
-                                location,
-                                length: n,
-                                expected_length: decompressed_len,
-                            }
-                            .into())
-                        }
-                        Err(error) => {
-                            return Err(CorruptionError::Snappy { location, error }.into())
-                        }
-                    }
-                    Arc::new(decompressed)
-                }
-            }
-        } else {
-            raw
-        };
-        let computed_checksum = crc32c(&raw[4..]);
-        let checksum = u32::from_le_bytes(raw[..4].try_into().unwrap());
-        if checksum != computed_checksum {
-            return Err(CorruptionError::InvalidChecksum {
+        decompress(
+            self.compression,
+            location,
+            self.file_handle.read_block(location)?,
+        )
+    }
+}
+
+pub fn decompress(
+    compression: Option<Compression>,
+    location: BlockLocation,
+    raw: Arc<FBuf>,
+) -> Result<Arc<FBuf>, Error> {
+    let raw = if let Some(compression) = compression {
+        let compressed_len = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+        let Some(compressed) = raw[4..].get(..compressed_len) else {
+            return Err(CorruptionError::BadCompressedLen {
                 location,
-                magic: raw[4..8].try_into().unwrap(),
-                checksum,
-                computed_checksum,
+                compressed_len,
+                max_compressed_len: raw.len() - 4,
             }
             .into());
+        };
+        match compression {
+            Compression::Snappy => {
+                let decompressed_len = decompress_len(compressed).map_err(|error| {
+                    Error::Corruption(CorruptionError::Snappy { location, error })
+                })?;
+                let mut decompressed = FBuf::with_capacity(decompressed_len);
+                decompressed.resize(decompressed_len, 0);
+                match Decoder::new().decompress(compressed, decompressed.as_mut_slice()) {
+                    Ok(n) if n == decompressed_len => {}
+                    Ok(n) => {
+                        return Err(CorruptionError::UnexpectedDecompressionLength {
+                            location,
+                            length: n,
+                            expected_length: decompressed_len,
+                        }
+                        .into())
+                    }
+                    Err(error) => return Err(CorruptionError::Snappy { location, error }.into()),
+                }
+                Arc::new(decompressed)
+            }
         }
-        Ok(raw)
+    } else {
+        raw
+    };
+    let computed_checksum = crc32c(&raw[4..]);
+    let checksum = u32::from_le_bytes(raw[..4].try_into().unwrap());
+    if checksum != computed_checksum {
+        return Err(CorruptionError::InvalidChecksum {
+            location,
+            magic: raw[4..8].try_into().unwrap(),
+            checksum,
+            computed_checksum,
+        }
+        .into());
     }
+    Ok(raw)
 }
 
 /// Layer file column specification.
