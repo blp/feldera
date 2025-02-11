@@ -27,6 +27,8 @@ use crate::storage::backend::{BlockLocation, FileId, FileReader};
 use crate::storage::file::format::Compression;
 use crate::storage::file::reader::Error;
 
+use super::FBuf;
+
 /// A key for the block cache.
 ///
 /// The block size could be part of the key, but we'll never read a given offset
@@ -413,17 +415,14 @@ pub struct AsyncCacheContext {
 
     /// [BTreeMap] is a better choice than `HashMap` for this because issuing
     /// I/O in sorted order is usually a good idea.
-    requests: Mutex<
-        BTreeMap<
-            BlockLocation,
-            (
-                Option<Compression>,
-                Vec<oneshot::Sender<Result<Arc<dyn CacheEntry>, Error>>>,
-            ),
-        >,
-    >,
+    requests: Mutex<BTreeMap<BlockLocation, AsyncCacheTask>>,
 
     n_requests: watch::Sender<usize>,
+}
+
+struct AsyncCacheTask {
+    parse: Box<dyn FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error>>,
+    send_replies: Vec<oneshot::Sender<Result<Arc<dyn CacheEntry>, Error>>>,
 }
 
 impl AsyncCacheContext {
@@ -436,15 +435,16 @@ impl AsyncCacheContext {
         }
     }
 
-/*
     /// Reads the bytes at `location` from the file.  If the read can be
     /// satisfied from cache, this completes quickly. Otherwise, it blocks until
     /// [Self::execute_tasks] runs I/O for all of the blocking tasks in a batch.
-    pub async fn read(
+    pub async fn read<F>(
         &self,
         location: BlockLocation,
-        compression: Option<Compression>,
-    ) -> Result<Arc<dyn CacheEntry>, Error> {
+        parse: F
+    ) -> Result<Arc<dyn CacheEntry>, Error>
+        where F: FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error>
+    {
         let key = CacheKey::new(self.file_id, location.offset);
         if let Some(aux) = self.cache.inner.lock().unwrap().get(key) {
             return Ok(aux.clone());
@@ -456,13 +456,13 @@ impl AsyncCacheContext {
             .lock()
             .unwrap()
             .entry(location)
-            .or_insert((compression, Vec::new()))
+            .or_insert_with(|| AsyncCacheTask::new())
             .1
             .push(sender);
 
         self.n_requests.send_modify(|n| *n += 1);
         receiver.await.unwrap().map_err(|error| error.into()) // XXX unwrap
-    }*/
+    }
 
     /// Waits until `goal` threads have blocked on I/O in [Self::read].
     pub async fn wait(&self, goal: usize) {
@@ -473,7 +473,7 @@ impl AsyncCacheContext {
             .unwrap();
     }
 
-/*
+    /*
     /// Runs all of the pending I/O and wakes up threads blocked in [Self::read].
     pub async fn run_io_batch<R>(&self, file: &R)
     where
