@@ -495,7 +495,7 @@ impl<'a> DataBlockReader<'a> {
             None => Ok(Either::Left(this)),
         }
     }
-    fn with_data<K, A>(self, raw: Arc<FBuf>) -> Result<Arc<DataBlock<K, A>>, Error>
+    fn with_raw<K, A>(self, raw: Arc<FBuf>) -> Result<Arc<DataBlock<K, A>>, Error>
     where
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
@@ -533,6 +533,7 @@ impl<'a> DataBlockReader<'a> {
         Ok(data_block)
     }
 }
+
 impl<K, A> DataBlock<K, A>
 where
     K: DataTrait + ?Sized,
@@ -567,7 +568,7 @@ where
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         match DataBlockReader::new(file, node)? {
             Either::Left(data_block_reader) => {
-                data_block_reader.with_data(file.read_blocking(node.location)?)
+                data_block_reader.with_raw(file.read_blocking(node.location)?)
             }
             Either::Right(data_block) => Ok(data_block),
         }
@@ -579,11 +580,12 @@ where
     ) -> Result<Arc<Self>, Error> {
         match DataBlockReader::new(file, node)? {
             Either::Left(data_block_reader) => {
-                data_block_reader.with_data(context.read_async(node.location).await?)
+                data_block_reader.with_raw(context.read_async(node.location).await?)
             }
             Either::Right(data_block) => Ok(data_block),
         }
     }
+
     fn n_values(&self) -> usize {
         self.value_map.len()
     }
@@ -832,6 +834,90 @@ where
     }
 }
 
+struct IndexBlockReader<'a> {
+    file: &'a ImmutableFileRef,
+    node: &'a TreeNode,
+    start: Instant,
+    cache: Arc<BufferCache>,
+    access: CacheAccess,
+}
+
+impl<'a> IndexBlockReader<'a> {
+    fn new<K>(
+        file: &'a ImmutableFileRef,
+        node: &'a TreeNode,
+    ) -> Result<Either<Self, Arc<IndexBlock<K>>>, Error>
+    where
+        K: DataTrait + ?Sized,
+    {
+        let start = Instant::now();
+        let cache = (file.cache)();
+        #[allow(clippy::borrow_deref_ref)]
+        let (access, entry) = match cache.get(&*file.file_handle, node.location) {
+            Some(entry) => {
+                let entry = Arc::downcast::<IndexBlock<K>>(entry.as_any())
+                    .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(node.location)))?;
+                if entry.first_row != node.rows.start {
+                    return Err(Error::Corruption(CorruptionError::MultiplePaths(
+                        node.location,
+                    )));
+                }
+                (CacheAccess::Hit, Some(entry))
+            }
+            None => (CacheAccess::Miss, None),
+        };
+        let this = Self {
+            file,
+            node,
+            start,
+            cache,
+            access,
+        };
+        match entry {
+            Some(entry) => Ok(Either::Right(this.tail(entry)?)),
+            None => Ok(Either::Left(this)),
+        }
+    }
+    fn with_raw<K>(self, raw: Arc<FBuf>) -> Result<Arc<IndexBlock<K>>, Error>
+    where
+        K: DataTrait + ?Sized,
+    {
+        let entry = Arc::new(IndexBlock::from_raw(
+            raw,
+            self.node.location,
+            self.node.rows.start,
+        )?);
+        self.cache.insert(
+            self.file.file_handle.file_id(),
+            self.node.location.offset,
+            entry.clone(),
+        );
+        self.tail(entry)
+    }
+    fn tail<K>(self, index_block: Arc<IndexBlock<K>>) -> Result<Arc<IndexBlock<K>>, Error>
+    where
+        K: DataTrait + ?Sized,
+    {
+        self.file
+            .stats
+            .record(self.access, self.start.elapsed(), self.node.location);
+
+        let expected_rows = self.node.rows.end - self.node.rows.start;
+        let n_rows = index_block
+            .row_totals
+            .get(&index_block.raw, index_block.row_totals.count - 1);
+        if n_rows != expected_rows {
+            return Err(CorruptionError::IndexBlockWrongNumberOfRows {
+                location: self.node.location,
+                n_rows,
+                expected_rows,
+            }
+            .into());
+        }
+        Ok(index_block)
+    }
+}
+
 impl<K> IndexBlock<K>
 where
     K: DataTrait + ?Sized,
@@ -893,47 +979,25 @@ where
         })
     }
 
-    fn new(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
-        let start = Instant::now();
-        let cache = (file.cache)();
-        let first_row = node.rows.start;
-        #[allow(clippy::borrow_deref_ref)]
-        let (access, entry) = match cache.get(&*file.file_handle, node.location) {
-            Some(entry) => {
-                let entry = Arc::downcast::<Self>(entry.as_any())
-                    .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(node.location)))?;
-                if entry.first_row != first_row {
-                    return Err(Error::Corruption(CorruptionError::MultiplePaths(
-                        node.location,
-                    )));
-                }
-                (CacheAccess::Hit, entry)
+    fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
+        match IndexBlockReader::new(file, node)? {
+            Either::Left(index_block_reader) => {
+                index_block_reader.with_raw(file.read_blocking(node.location)?)
             }
-            None => {
-                let block = file.read_blocking(node.location)?;
-                let entry = Arc::new(Self::from_raw(block, node.location, first_row)?);
-                cache.insert(
-                    file.file_handle.file_id(),
-                    node.location.offset,
-                    entry.clone(),
-                );
-                (CacheAccess::Miss, entry)
-            }
-        };
-        file.stats.record(access, start.elapsed(), node.location);
-
-        let expected_rows = node.rows.end - node.rows.start;
-        let n_rows = entry.row_totals.get(&entry.raw, entry.row_totals.count - 1);
-        if n_rows != expected_rows {
-            return Err(CorruptionError::IndexBlockWrongNumberOfRows {
-                location: node.location,
-                n_rows,
-                expected_rows,
-            }
-            .into());
+            Either::Right(index_block) => Ok(index_block),
         }
-
-        Ok(entry)
+    }
+    async fn new_async(
+        file: &ImmutableFileRef,
+        context: &AsyncCacheContext,
+        node: &TreeNode,
+    ) -> Result<Arc<Self>, Error> {
+        match IndexBlockReader::new(file, node)? {
+            Either::Left(index_block_reader) => {
+                index_block_reader.with_raw(context.read_async(node.location).await?)
+            }
+            Either::Right(index_block) => Ok(index_block),
+        }
     }
 
     /// Returns the range of rows covered by this index block.
