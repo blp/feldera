@@ -734,20 +734,16 @@ struct TreeNode {
     rows: Range<u64>,
 }
 
-/*
 impl TreeNode {
     fn read_blocking<K, A>(self, file: &ImmutableFileRef) -> Result<TreeBlock<K, A>, Error>
     where
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
-        let cache_entry = (file.cache)().read_blocking(
-            &*file.file_handle,
-            self.location,
-            file.compression,
-            &file.stats,
-        )?;
-        self.read_tail(cache_entry)
+        match self.node_type {
+            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new_blocking(file, &self)?)),
+            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new_blocking(file, &self)?)),
+        }
     }
     async fn read_async<K, A>(
         self,
@@ -758,20 +754,12 @@ impl TreeNode {
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
-        let cache_entry = context.read(self.location, file.compression).await?;
-        self.read_tail(cache_entry)
-    }
-    fn read_tail<K, A>(self, cache_entry: FileCacheEntry) -> Result<TreeBlock<K, A>, Error>
-    where
-        K: DataTrait + ?Sized,
-        A: DataTrait + ?Sized,
-    {
         match self.node_type {
-            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new(file, &self)?)),
-            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new(file, &self)?)),
+            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new_async(file, context, &self).await?)),
+            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new_async(file, context, &self).await?)),
         }
     }
-}*/
+}
 
 enum TreeBlock<K: DataTrait + ?Sized, A: DataTrait + ?Sized> {
     Data(Arc<DataBlock<K, A>>),
