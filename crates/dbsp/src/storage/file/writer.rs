@@ -12,7 +12,7 @@ use crate::storage::{
             BlockHeader, DataBlockHeader, FileTrailer, FileTrailerColumn, FixedLen,
             IndexBlockHeader, NodeType, Varint, VERSION_NUMBER,
         },
-        with_serializer,
+        with_serializer, BLOOM_FILTER_SEED,
     },
 };
 use binrw::{
@@ -1095,6 +1095,7 @@ impl Writer {
             // It would be good to know the expected number of items in the bloom filter
             // but don't have that information here.
             bloom_filter: BloomFilter::with_false_pos(BLOOM_FILTER_FALSE_POSITIVE_RATE)
+                .seed(&BLOOM_FILTER_SEED)
                 .expected_items(estimated_keys),
             cws,
             finished_columns,
@@ -1115,9 +1116,12 @@ impl Writer {
             None
         };
 
-        // Add `key` to bloom filter.
-        self.bloom_filter
-            .insert(&item.0.default_hash().to_le_bytes());
+        if column == 0 {
+            // Add `key` to bloom filter.
+            self.bloom_filter
+                .insert(&item.0.default_hash().to_le_bytes());
+        }
+
         // Add `value` to row group for column.
         self.cws[column].rows.end += 1;
         self.cws[column].add_item(&mut self.writer, item, &row_group)
