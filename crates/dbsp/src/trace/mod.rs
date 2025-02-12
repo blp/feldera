@@ -372,14 +372,12 @@ where
     where
         Self: 's;
 
-    // type Consumer: Consumer<Self::Key, Self::Val, Self::R, Self::Time>;
+    type MergeReader: MergeReader<Self::Key, Self::Val, Self::Time, Self::R>;
 
     fn factories(&self) -> Self::Factories;
 
     /// Acquires a cursor to the batch's contents.
     fn cursor(&self) -> Self::Cursor<'_>;
-
-    //fn consumer(self) -> Self::Consumer;
 
     /// The number of keys in the batch.
     // TODO: return `(usize, Option<usize>)`, similar to
@@ -469,6 +467,16 @@ where
     where
         Self::Time: PartialEq<()>,
         RG: Rng;
+}
+
+pub trait MergeReader<K, V, T, R>
+where
+    K: ?Sized,
+    V: ?Sized,
+    R: ?Sized,
+{
+    fn read_key(&self) -> &K;
+    
 }
 
 /// A [`BatchReader`] plus features for constructing new batches.
