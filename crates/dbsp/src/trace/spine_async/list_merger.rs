@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    fmt::Debug,
     ops::{BitOr, BitOrAssign},
     sync::Arc,
 };
@@ -94,11 +95,24 @@ where
         builder.done()
     }
 
+    fn heap_compare(&self) -> impl Fn(usize, usize) -> Ordering + use<'_, C, B> {
+        |a, b| {
+            let a = self.cursors[a].key();
+            let b = self.cursors[b].key();
+            Ord::cmp(a, b)
+        }
+    }
+
+    fn new_loser_tree(&self) -> LoserTree {
+        LoserTree::new(self.cursors.len(), &self.heap_compare())
+    }
+
     /// Creates a new merger for `batches`, using `key_filter` and
     /// `value_filter` to remove tuples.
-    pub fn new(factories: &B::Factories, cursors: Vec<C>) -> Self {
+    pub fn new(factories: &B::Factories, mut cursors: Vec<C>) -> Self {
         // [IndexSet] supports a maximum of 64 batches.
         assert!(cursors.len() <= 64);
+        cursors.retain(|cursor| cursor.key_valid());
 
         let time_diffs = factories.time_diffs_factory().map(|f| f.default_box());
         ListMerger {
@@ -113,13 +127,7 @@ where
     /// When the function returns and fuel > 0, the batches should be guaranteed to be fully merged.
     pub fn work(&mut self, builder: &mut B::Builder, frontier: &B::Time, fuel: &mut isize) {
         assert!(self.cursors.len() <= 64);
-        let mut remaining_cursors = self
-            .cursors
-            .iter()
-            .enumerate()
-            .filter_map(|(index, cursor)| cursor.key_valid().then_some(index))
-            .collect::<IndexSet>();
-        if remaining_cursors.is_empty() {
+        if self.cursors.is_empty() {
             return;
         }
 
@@ -134,14 +142,90 @@ where
         let has_mut = self.cursors[0].has_mut();
 
         // As long as there are multiple cursors...
-        while remaining_cursors.is_long() && *fuel > 0 {
+        if self.cursors.len() >= 8 {
+            let mut heap: LoserTree = self.new_loser_tree();
+            while *fuel > 0 {
+                // Find the indexes of the cursors with minimum keys, among the
+                // remaining cursors.
+                let orig_min_keys = heap.peek();
+
+                // As long as there is more than one cursor with minimum keys...
+                let mut any_values = false;
+                let mut min_keys = orig_min_keys;
+                while min_keys.is_long() {
+                    // ...Find the indexes of the cursors with minimum values, among
+                    // those with minimum keys, and copy their time-diff pairs and
+                    // value into the output.
+                    let min_vals = find_min_indexes(
+                        min_keys
+                            .into_iter()
+                            .map(|index| (index, self.cursors[index].val())),
+                    );
+                    any_values = self.copy_times(builder, time_map_func, min_vals, fuel, has_mut)
+                        || any_values;
+
+                    // Then go on to the next value in each cursor, dropping the keys
+                    // for which we've exhausted the values.
+                    for index in min_vals {
+                        self.cursors[index].step_val();
+                        if !self.cursors[index].val_valid() {
+                            min_keys.remove(index);
+                        }
+                    }
+                }
+
+                // If there's exactly one cursor left with minimum key, copy its
+                // values into the output.
+                if let Some(index) = min_keys.first() {
+                    loop {
+                        any_values =
+                            self.copy_times(builder, time_map_func, min_keys, fuel, has_mut)
+                                || any_values;
+                        self.cursors[index].step_val();
+                        if !self.cursors[index].val_valid() {
+                            break;
+                        }
+                    }
+                }
+
+                // If we wrote any values for these minimum keys, write the key.
+                if any_values {
+                    if has_mut {
+                        builder
+                            .push_key_mut(self.cursors[orig_min_keys.first().unwrap()].key_mut());
+                    } else {
+                        builder.push_key(self.cursors[orig_min_keys.first().unwrap()].key());
+                    }
+                }
+
+                // Advance each minimum-key cursor, dropping the cursors for which
+                // we've exhausted the data.
+                let mut deleted = 0;
+                for index in orig_min_keys {
+                    let index = index - deleted;
+                    self.cursors[index].step_key();
+                    if !self.cursors[index].key_valid() {
+                        self.cursors.remove(index);
+                        deleted += 1;
+                    }
+                }
+                if deleted > 0 {
+                    if self.cursors.len() < 8 {
+                        break;
+                    }
+                    heap = self.new_loser_tree();
+                } else {
+                    heap.pop(&self.heap_compare());
+                }
+            }
+        }
+
+        // As long as there are multiple cursors...
+        while self.cursors.len() >= 2 && *fuel > 0 {
             // Find the indexes of the cursors with minimum keys, among the
             // remaining cursors.
-            let orig_min_keys = find_min_indexes(
-                remaining_cursors
-                    .into_iter()
-                    .map(|index| (index, self.cursors[index].key())),
-            );
+            let orig_min_keys =
+                find_min_indexes(self.cursors.iter().map(|cursor| cursor.key()).enumerate());
 
             // As long as there is more than one cursor with minimum keys...
             let mut any_values = false;
@@ -192,36 +276,44 @@ where
 
             // Advance each minimum-key cursor, dropping the cursors for which
             // we've exhausted the data.
+            let mut deleted = 0;
             for index in orig_min_keys {
+                let index = index - deleted;
                 self.cursors[index].step_key();
                 if !self.cursors[index].key_valid() {
-                    remaining_cursors.remove(index);
+                    self.cursors.remove(index);
+                    deleted += 1;
                 }
             }
         }
 
         // If there is a cursor left (there's either one or none), copy it
         // directly to the output.
-        if let Some(index) = remaining_cursors.first() {
+        if !self.cursors.is_empty() {
             while *fuel > 0 {
                 let mut any_values = false;
                 loop {
-                    any_values =
-                        self.copy_times(builder, time_map_func, remaining_cursors, fuel, has_mut)
-                            || any_values;
-                    self.cursors[index].step_val();
-                    if !self.cursors[index].val_valid() {
+                    any_values = self.copy_times(
+                        builder,
+                        time_map_func,
+                        IndexSet::for_index(0),
+                        fuel,
+                        has_mut,
+                    ) || any_values;
+                    self.cursors[0].step_val();
+                    if !self.cursors[0].val_valid() {
                         break;
                     }
                 }
                 debug_assert!(any_values, "This assertion should fail only if B::Cursor is a spine or a CursorList, but we shouldn't be merging those");
                 if has_mut {
-                    builder.push_key_mut(self.cursors[index].key_mut());
+                    builder.push_key_mut(self.cursors[0].key_mut());
                 } else {
-                    builder.push_key(self.cursors[index].key());
+                    builder.push_key(self.cursors[0].key());
                 }
-                self.cursors[index].step_key();
-                if !self.cursors[index].key_valid() {
+                self.cursors[0].step_key();
+                if !self.cursors[0].key_valid() {
+                    self.cursors.remove(0);
                     break;
                 }
             }
@@ -374,6 +466,15 @@ impl IndexSet {
         }
     }
 
+    /// Returns the largest index in the set.
+    fn last(&self) -> Option<usize> {
+        if self.0 == 0 {
+            None
+        } else {
+            Some(63 - self.0.leading_zeros() as usize)
+        }
+    }
+
     // Returns the set with the first index removed. If this set is empty,
     // returns an empty set.
     fn without_first(&self) -> Self {
@@ -388,6 +489,19 @@ impl IndexSet {
     /// Removes `index` from the set.
     fn remove(&mut self, index: usize) {
         self.0 &= !(1 << index);
+    }
+}
+
+impl Debug for IndexSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IndexSet {{")?;
+        for (i, index) in self.into_iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{index}")?;
+        }
+        write!(f, "}}")
     }
 }
 
@@ -435,5 +549,169 @@ impl IntoIterator for IndexSet {
     type IntoIter = IndexSetIter;
     fn into_iter(self) -> Self::IntoIter {
         IndexSetIter(self)
+    }
+}
+
+#[derive(Clone)]
+struct LoserTree {
+    tree: Vec<IndexSet>,
+}
+
+impl LoserTree {
+    fn new<F>(n: usize, compare: &F) -> Self
+    where
+        F: Fn(usize, usize) -> Ordering,
+    {
+        assert!((2..=64).contains(&n));
+        let mut this = Self {
+            tree: vec![IndexSet::empty(); n],
+        };
+        for node in (1..n).rev() {
+            this.tree[node] = this.calculate_node(node, compare);
+        }
+        this
+    }
+
+    /// Returns the indexes of the minimum batches.
+    fn peek(&self) -> IndexSet {
+        self.tree[1]
+    }
+
+    /// Updates the loser tree after the caller has replaced the value in the
+    /// minimum batches by a new value, each of which must be larger than the
+    /// previous value.
+    fn pop<F>(&mut self, compare: &F)
+    where
+        F: Fn(usize, usize) -> Ordering,
+    {
+        let mut updates = self
+            .peek()
+            .into_iter()
+            .map(|index| (index + self.tree.len()) / 2)
+            .collect::<IndexSet>();
+        while let Some(node) = updates.last() {
+            if node == 0 {
+                break;
+            }
+            updates.remove(node);
+            updates.add(node / 2);
+            self.tree[node] = self.calculate_node(node, compare);
+        }
+    }
+
+    fn calculate_node<F>(&self, node: usize, compare: F) -> IndexSet
+    where
+        F: Fn(usize, usize) -> Ordering,
+    {
+        let left_min = self.min_node(node * 2);
+        let right_min = self.min_node(node * 2 + 1);
+        match compare(left_min.first().unwrap(), right_min.first().unwrap()) {
+            Ordering::Less => left_min,
+            Ordering::Equal => left_min | right_min,
+            Ordering::Greater => right_min,
+        }
+    }
+
+    fn min_node(&self, node: usize) -> IndexSet {
+        if node < self.tree.len() {
+            self.tree[node]
+        } else {
+            IndexSet::for_index(node - self.tree.len())
+        }
+    }
+
+    #[cfg(test)]
+    fn check_invariant<F>(&self, compare: &F)
+    where
+        F: Fn(usize, usize) -> Ordering,
+    {
+        for i in 1..self.tree.len() {
+            assert_eq!(self.tree[i], self.calculate_node(i, compare));
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::cmp::Ordering;
+
+    use super::{IndexSet, LoserTree};
+    use itertools::Itertools;
+
+    fn compare(values: &[usize], a: usize, b: usize) -> Ordering {
+        Ord::cmp(&values[a], &values[b])
+    }
+
+    fn check_min(tree: &LoserTree, values: &[usize]) -> IndexSet {
+        // Get the smallest value in `values`.
+        let min = *values.iter().min().unwrap();
+
+        // Get all of the indexes of the smallest value in `values` (since there
+        // might be duplicates).
+        let min_indexes = values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (*value == min).then_some(index))
+            .collect::<IndexSet>();
+
+        // Check that `tree` agrees with `min_indexes`.
+        assert_eq!(min_indexes, tree.peek());
+
+        min_indexes
+    }
+
+    // Exhaustive testing of [LoserTree] with `n` elements.
+    fn test_exhaustive(n: usize) {
+        // For all possible combinations of `n` elements in the range `0..n`...
+        for values in (0..n).combinations_with_replacement(n) {
+            // Form a [LoserTree] from the elements and check that it has the
+            // correct minimum.
+            let tree = LoserTree::new(n, &|a: usize, b: usize| compare(&values, a, b));
+            let min_indexes = check_min(&tree, &values);
+
+            // Add all the possible and relevant combinations of values to the
+            // minimum elements, and check that the result is still correct.
+            for increment in (1..=n).combinations_with_replacement(min_indexes.len()) {
+                let mut values = values.clone();
+                for (i, index) in min_indexes.into_iter().enumerate() {
+                    values[index] += increment[i];
+                }
+
+                let mut tree = tree.clone();
+                tree.pop(&|a: usize, b: usize| compare(&values, a, b));
+                tree.check_invariant(&|a, b| compare(&values, a, b));
+                check_min(&tree, &values);
+            }
+        }
+    }
+
+    #[test]
+    fn exhaustive_2() {
+        test_exhaustive(2);
+    }
+
+    #[test]
+    fn exhaustive_3() {
+        test_exhaustive(3);
+    }
+
+    #[test]
+    fn exhaustive_4() {
+        test_exhaustive(4);
+    }
+
+    #[test]
+    fn exhaustive_5() {
+        test_exhaustive(5);
+    }
+
+    #[test]
+    fn exhaustive_6() {
+        test_exhaustive(6);
+    }
+
+    #[test]
+    fn exhaustive_7() {
+        test_exhaustive(7);
     }
 }
