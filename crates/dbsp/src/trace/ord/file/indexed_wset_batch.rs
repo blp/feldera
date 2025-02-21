@@ -405,7 +405,8 @@ where
                 let key = key; // Force moving `key`.
                 let mut output = self.factories.weighted_items_factory().default_box();
 
-                let key_rows = self.file.rows_async(&context);
+                let key_cursor = self.file.rows_async(&context).first().await.unwrap();
+                key_cursor.advance_to_value_or_larger
                 if let Some(key_cursor) = unsafe { key_rows.find_exact(&key) }.await.unwrap() {
                     let value_rows = key_cursor.next_column().await.unwrap();
                     output.reserve(value_rows.len() as usize);
@@ -431,7 +432,6 @@ where
         let mut builder =
             <VecIndexedWSet<Self::Key, Self::Val, Self::R> as Batch>::Builder::with_capacity(
                 &self.factories.vec_indexed_wset_factory,
-                (),
                 outputs.len(),
             );
         for mut output in outputs {
