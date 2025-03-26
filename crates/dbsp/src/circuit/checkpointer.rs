@@ -152,7 +152,7 @@ impl Checkpointer {
     }
 
     pub(super) fn checkpoint_dir(&self, uuid: Uuid) -> PathBuf {
-        self.storage_path.join(uuid.to_string())
+        uuid.to_string().into()
     }
 
     pub(super) fn commit(
