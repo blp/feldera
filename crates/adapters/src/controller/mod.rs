@@ -599,7 +599,7 @@ impl CircuitThread {
             let ft = if input_metadata.is_some() {
                 FtState::open(step, controller.clone())
             } else {
-                FtState::create(storage.clone().unwrap(), controller.clone())
+                FtState::create(&*storage.as_ref().unwrap(), controller.clone())
             };
             Some(ft?)
         } else {
@@ -1079,13 +1079,12 @@ impl FtState {
 
     /// Creates new fault tolerance state on storage.
     fn create(
-        storage: Arc<dyn StorageBackend>,
+        storage: &dyn StorageBackend,
         controller: Arc<ControllerInner>,
     ) -> Result<Self, ControllerError> {
         let config = controller.status.pipeline_config.clone();
-        let path = storage_path(&config).unwrap();
-        let state_path = state_path(&config).unwrap();
-        let steps_path = steps_path(&config).unwrap();
+        storage.delete_if_exists(STATE_FILE)?;
+        storage.delete_if_exists(STEPS_FILE)?;
 
         fs::create_dir_all(path).map_err(|error| {
             ControllerError::io_error(String::from("controller startup"), error)
