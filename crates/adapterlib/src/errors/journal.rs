@@ -31,7 +31,6 @@ pub enum StepError {
         path: PathBuf,
         #[serde(serialize_with = "serialize_as_string")]
         error: rmp_serde::decode::Error,
-        offset: u64,
     },
 
     MissingStep {
@@ -89,15 +88,9 @@ impl Display for StepError {
             StepError::EncodeError { path, error } => {
                 write!(f, "{}: error writing step ({error})", path.display())
             }
-            StepError::DecodeError {
-                path,
-                error,
-                offset,
-            } => write!(
-                f,
-                "error parsing step starting at offset {offset} in {} ({error})",
-                path.display()
-            ),
+            StepError::DecodeError { path, error } => {
+                write!(f, "{}: error parsing step ({error})", path.display())
+            }
             StepError::MissingStep { path, step } => write!(
                 f,
                 "{} should contain step {step} but it is not present",
