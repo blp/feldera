@@ -1385,12 +1385,14 @@ fn storage_path(config: &PipelineConfig) -> Option<&Path> {
     config.storage_config.as_ref().map(|storage| storage.path())
 }
 
+pub const STATE_FILE: &str = "state.json";
 fn state_path(config: &PipelineConfig) -> Option<PathBuf> {
-    storage_path(config).map(|path| path.join("state.json"))
+    storage_path(config).map(|path| path.join(STATE_FILE))
 }
 
+pub const STEPS_FILE: &str = "steps.bin";
 fn steps_path(config: &PipelineConfig) -> Option<PathBuf> {
-    storage_path(config).map(|path| path.join("steps.bin"))
+    storage_path(config).map(|path| path.join(STEPS_FILE))
 }
 
 impl ControllerInit {
@@ -1415,9 +1417,7 @@ impl ControllerInit {
             .map_or_else(|| "unnamed".to_string(), |n| n.clone());
         metrics_recorder::init(pipeline_name);
 
-        let (Some((storage_config, storage_options)), Some(state_path)) =
-            (config.storage(), state_path(&config))
-        else {
+        let Some((storage_config, storage_options)) = config.storage() else {
             if config.global.fault_tolerance.is_none() {
                 info!("storage not configured, so suspend-and-resume and fault tolerance will not be available");
                 return Self::without_resume(config, None);
@@ -1437,7 +1437,7 @@ impl ControllerInit {
                 })?;
 
         // Try to read a checkpoint.
-        let checkpoint = match Checkpoint::read(&*storage.backend, &state_path) {
+        let checkpoint = match Checkpoint::read(&*storage.backend, STATE_FILE) {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 info!("no checkpoint found for resume ({error})",);
                 return Self::without_resume(config, Some(storage));

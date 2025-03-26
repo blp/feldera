@@ -65,6 +65,12 @@ pub trait StorageBackend: Send + Sync {
     /// the storage backend.
     fn open(&self, name: &Path) -> Result<Arc<dyn FileReader>, StorageError>;
 
+    /*
+        /// Calls `cb` with the name of each of the files under `parent`. This is a
+        /// non-recursive list: it does not include files under sub-directories of
+        /// `parent`.
+        fn list(&self, parent: &Path, cb: Box<dyn Fn(&Path)>) -> Result<(), StorageError>;
+    */
     /// Reads `name` and returns its contents.  The file `name` is relative to
     /// the base of the storage backend.
     fn read(&self, name: &Path) -> Result<Arc<FBuf>, StorageError> {
