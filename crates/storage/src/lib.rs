@@ -1,5 +1,6 @@
 //! Common Types and Trait Definition for Storage in Feldera.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -78,7 +79,7 @@ pub trait StorageBackend: Send + Sync {
 
     fn delete_if_exists(&self, name: &Path) -> Result<(), StorageError> {
         match self.delete(name) {
-            Err(error) if error.is_not_found() => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             rest => rest,
         }
     }
