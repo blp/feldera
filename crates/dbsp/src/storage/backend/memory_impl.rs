@@ -140,4 +140,12 @@ impl StorageBackend for MemoryBackend {
             None => Err(StorageError::StdIo(ErrorKind::NotFound)),
         }
     }
+
+    fn delete_recursive(&self, parent: &Path) -> Result<(), StorageError> {
+        self.files
+            .write()
+            .unwrap()
+            .retain(|name, _content| name.starts_with(parent));
+        Ok(())
+    }
 }

@@ -13,6 +13,7 @@ use feldera_types::config::{StorageBackendConfig, StorageCacheConfig, StorageCon
 use metrics::{counter, histogram};
 use std::fs::create_dir_all;
 use std::io::ErrorKind;
+use std::path::Component;
 use std::{
     fs::{self, remove_file, File, OpenOptions},
     io::Error as IoError,
@@ -282,6 +283,25 @@ impl PosixBackend {
         }
         DEFAULT_BACKEND.with(|rc| rc.clone())
     }
+
+    /// Returns the filesystem path to `name` in this storage.
+    ///
+    /// We reject any `name` that is absolute, starts with a drive letter (on
+    /// Windows), and or contains `.` or `..` components. Any such name is a
+    /// risk to the file system because joining it with our base could end up
+    /// above the storage directory (if `name` is "/", for example, it would end
+    /// up as the root directory) and because we have a `delete_recursive`
+    /// method. Plus, other kinds of storage just treat names as strings, so
+    /// `foo/../bar` isn't going to work reasonably on those.
+    fn fs_path(&self, name: &Path) -> Result<PathBuf, StorageError> {
+        for component in name.components() {
+            match component {
+                Component::Normal(_) => (),
+                _ => return Err(StorageError::InvalidPath(name.to_path_buf())),
+            }
+        }
+        Ok(self.base.join(name))
+    }
 }
 
 impl StorageBackend for PosixBackend {
@@ -295,7 +315,7 @@ impl StorageBackend for PosixBackend {
                 .open(&path)
         }
 
-        let path = append_to_path(self.base.join(name), MUTABLE_EXTENSION);
+        let path = append_to_path(self.fs_path(name)?, MUTABLE_EXTENSION);
         let file = match try_create_named(self, &path) {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 if let Some(parent) = path.parent() {
@@ -310,24 +330,34 @@ impl StorageBackend for PosixBackend {
     }
 
     fn open(&self, name: &Path) -> Result<Arc<dyn FileReader>, StorageError> {
-        PosixReader::open(self.base.join(name), self.cache)
+        PosixReader::open(self.fs_path(name)?, self.cache)
     }
 
     fn list(&self, parent: &Path, cb: &mut dyn FnMut(&Path)) -> Result<(), StorageError> {
         let mut result = Ok(());
-        for entry in self.base.join(parent).read_dir()? {
-            match entry {
+        for entry in self.fs_path(parent)?.read_dir()? {
+            match entry.and_then(|entry| {
+                entry
+                    .file_type()
+                    .map(|file_type| (entry.file_name(), file_type))
+            }) {
                 Err(e) => {
                     result = Err(e.into());
                 }
-                Ok(entry) => cb(&parent.join(entry.file_name())),
+                Ok((_, file_type)) if file_type.is_dir() => (),
+                Ok((name, _)) => cb(&parent.join(name)),
             }
         }
         result
     }
 
     fn delete(&self, name: &Path) -> Result<(), StorageError> {
-        fs::remove_file(self.base.join(name))?;
+        fs::remove_file(self.fs_path(name)?)?;
+        Ok(())
+    }
+
+    fn delete_recursive(&self, name: &Path) -> Result<(), StorageError> {
+        fs::remove_dir_all(self.fs_path(name)?)?;
         Ok(())
     }
 }

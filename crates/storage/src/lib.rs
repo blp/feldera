@@ -71,12 +71,27 @@ pub trait StorageBackend: Send + Sync {
     /// `parent`.
     fn list(&self, parent: &Path, cb: &mut dyn FnMut(&Path)) -> Result<(), StorageError>;
 
+    fn list_recursive(&self, parent: &Path, cb: &mut dyn FnMut(&Path)) -> Result<(), StorageError> {
+        // XXX
+        self.list(parent, cb)
+    }
+
     fn delete(&self, name: &Path) -> Result<(), StorageError>;
+
+    fn delete_recursive(&self, name: &Path) -> Result<(), StorageError>;
 
     fn delete_if_exists(&self, name: &Path) -> Result<(), StorageError> {
         match self.delete(name) {
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             other => other,
+        }
+    }
+
+    fn exists(&self, name: &Path) -> Result<bool, StorageError> {
+        match self.open(name) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
         }
     }
 

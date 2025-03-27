@@ -493,11 +493,19 @@ impl Runtime {
             Ok(result) => result,
         };
 
-        let mut dbsp = DBSPHandle::new(runtime, command_senders, status_receivers, fingerprint)?;
-        if let Some(storage) = &config.storage {
-            if let Some(init_checkpoint) = storage.init_checkpoint {
-                dbsp.send_restore(storage.config.path().join(init_checkpoint.to_string()))?;
-            }
+        let (backend, init_checkpoint) = config
+            .storage
+            .map(|storage| (storage.backend.clone(), storage.init_checkpoint))
+            .unzip();
+        let mut dbsp = DBSPHandle::new(
+            backend,
+            runtime,
+            command_senders,
+            status_receivers,
+            fingerprint,
+        )?;
+        if let Some(init_checkpoint) = init_checkpoint.flatten() {
+            dbsp.send_restore(PathBuf::from(init_checkpoint.to_string()))?;
         }
 
         Ok((dbsp, ret))
@@ -551,15 +559,14 @@ pub struct DBSPHandle {
 
 impl DBSPHandle {
     fn new(
+        backend: Option<Arc<dyn StorageBackend>>,
         runtime: RuntimeHandle,
         command_senders: Vec<Sender<Command>>,
         status_receivers: Vec<Receiver<Result<Response, SchedulerError>>>,
         fingerprint: u64,
     ) -> Result<Self, DbspError> {
-        let checkpointer = runtime
-            .runtime()
-            .storage_path()
-            .map(|path| Checkpointer::new(path.into(), fingerprint))
+        let checkpointer = backend
+            .map(|backend| Checkpointer::new(backend, fingerprint))
             .transpose()?;
         Ok(Self {
             start_time: Instant::now(),
