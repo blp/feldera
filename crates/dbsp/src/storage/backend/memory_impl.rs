@@ -117,4 +117,27 @@ impl StorageBackend for MemoryBackend {
             None => Err(StorageError::StdIo(ErrorKind::NotFound)),
         }
     }
+
+    fn list(&self, parent: &Path, cb: &mut dyn FnMut(&Path)) -> Result<(), StorageError> {
+        let paths = self
+            .files
+            .read()
+            .unwrap()
+            .keys()
+            .filter(|name| name.parent().is_some_and(|dir| dir == parent))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in paths {
+            cb(&path);
+        }
+        Ok(())
+    }
+
+    fn delete(&self, name: &Path) -> Result<(), StorageError> {
+        let mut files = self.files.write().unwrap();
+        match files.remove(name) {
+            Some(_) => Ok(()),
+            None => Err(StorageError::StdIo(ErrorKind::NotFound)),
+        }
+    }
 }

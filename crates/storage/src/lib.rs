@@ -66,21 +66,17 @@ pub trait StorageBackend: Send + Sync {
     /// the storage backend.
     fn open(&self, name: &Path) -> Result<Arc<dyn FileReader>, StorageError>;
 
-    /*
-       /// Calls `cb` with the name of each of the files under `parent`. This is a
-       /// non-recursive list: it does not include files under sub-directories of
-       /// `parent`.
-       fn list(&self, parent: &Path, cb: Box<dyn Fn(&Path)>) -> Result<(), StorageError>;
-    */
+    /// Calls `cb` with the name of each of the files under `parent`. This is a
+    /// non-recursive list: it does not include files under sub-directories of
+    /// `parent`.
+    fn list(&self, parent: &Path, cb: &mut dyn FnMut(&Path)) -> Result<(), StorageError>;
 
-    fn delete(&self, name: &Path) -> Result<(), StorageError> {
-        todo!()
-    }
+    fn delete(&self, name: &Path) -> Result<(), StorageError>;
 
     fn delete_if_exists(&self, name: &Path) -> Result<(), StorageError> {
         match self.delete(name) {
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            rest => rest,
+            other => other,
         }
     }
 

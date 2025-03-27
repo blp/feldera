@@ -312,6 +312,24 @@ impl StorageBackend for PosixBackend {
     fn open(&self, name: &Path) -> Result<Arc<dyn FileReader>, StorageError> {
         PosixReader::open(self.base.join(name), self.cache)
     }
+
+    fn list(&self, parent: &Path, cb: &mut dyn FnMut(&Path)) -> Result<(), StorageError> {
+        let mut result = Ok(());
+        for entry in self.base.join(parent).read_dir()? {
+            match entry {
+                Err(e) => {
+                    result = Err(e.into());
+                }
+                Ok(entry) => cb(&parent.join(entry.file_name())),
+            }
+        }
+        result
+    }
+
+    fn delete(&self, name: &Path) -> Result<(), StorageError> {
+        fs::remove_file(self.base.join(name))?;
+        Ok(())
+    }
 }
 
 pub(crate) struct PosixBackendFactory;

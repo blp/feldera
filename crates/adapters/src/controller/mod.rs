@@ -596,10 +596,11 @@ impl CircuitThread {
         }
 
         let ft = if ft {
+            let backend = storage.clone().unwrap();
             let ft = if input_metadata.is_some() {
-                FtState::open(step, controller.clone())
+                FtState::open(backend, step, controller.clone())
             } else {
-                FtState::create(&**storage.as_ref().unwrap(), controller.clone())
+                FtState::create(backend, controller.clone())
             };
             Some(ft?)
         } else {
@@ -1044,15 +1045,13 @@ struct FtState {
 
 impl FtState {
     /// Initializes fault tolerance state from storage.
-    fn open(step: Step, controller: Arc<ControllerInner>) -> Result<Self, ControllerError> {
-        let steps_path = steps_path(&controller.status.pipeline_config).unwrap();
-
-        info!(
-            "{}: opening to start from step {}",
-            steps_path.display(),
-            step
-        );
-        let journal = Journal::open(&steps_path);
+    fn open(
+        backend: Arc<dyn StorageBackend>,
+        step: Step,
+        controller: Arc<ControllerInner>,
+    ) -> Result<Self, ControllerError> {
+        info!("{STEPS_FILE}: opening to start from step {step}");
+        let journal = Journal::open(backend, STEPS_FILE);
         let input_checksums = match journal.read(step)? {
             Some(record) => {
                 // Start replaying the step.
@@ -1079,18 +1078,18 @@ impl FtState {
 
     /// Creates new fault tolerance state on storage.
     fn create(
-        storage: &dyn StorageBackend,
+        backend: Arc<dyn StorageBackend>,
         controller: Arc<ControllerInner>,
     ) -> Result<Self, ControllerError> {
         let config = controller.status.pipeline_config.clone();
         for file in [STATE_FILE, STEPS_FILE] {
-            storage.delete_if_exists(Path::new(file)).map_err(|error| {
+            backend.delete_if_exists(Path::new(file)).map_err(|error| {
                 ControllerError::storage_error("initializing fault tolerant pipeline", error)
             })?;
         }
 
         info!("{STEPS_FILE}: creating");
-        let journal = Journal::create(STEPS_FILE)?;
+        let journal = Journal::create(backend.clone(), STEPS_FILE)?;
 
         info!("{STATE_FILE}: creating");
         let checkpoint = Checkpoint {
@@ -1100,7 +1099,7 @@ impl FtState {
             processed_records: 0,
             input_metadata: CheckpointOffsets::default(),
         };
-        checkpoint.write(&*storage, STATE_FILE)?;
+        checkpoint.write(&*backend, STATE_FILE)?;
 
         Ok(Self {
             input_endpoints: Self::initial_input_endpoints(&controller),
@@ -1387,9 +1386,6 @@ fn state_path(config: &PipelineConfig) -> Option<PathBuf> {
 }
 
 pub const STEPS_FILE: &str = "steps.bin";
-fn steps_path(config: &PipelineConfig) -> Option<PathBuf> {
-    storage_path(config).map(|path| path.join(STEPS_FILE))
-}
 
 impl ControllerInit {
     fn without_resume(
