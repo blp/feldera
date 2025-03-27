@@ -599,7 +599,7 @@ impl CircuitThread {
             let ft = if input_metadata.is_some() {
                 FtState::open(step, controller.clone())
             } else {
-                FtState::create(&*storage.as_ref().unwrap(), controller.clone())
+                FtState::create(&**storage.as_ref().unwrap(), controller.clone())
             };
             Some(ft?)
         } else {
@@ -1083,19 +1083,16 @@ impl FtState {
         controller: Arc<ControllerInner>,
     ) -> Result<Self, ControllerError> {
         let config = controller.status.pipeline_config.clone();
-        storage.delete_if_exists(STATE_FILE)?;
-        storage.delete_if_exists(STEPS_FILE)?;
+        for file in [STATE_FILE, STEPS_FILE] {
+            storage.delete_if_exists(Path::new(file)).map_err(|error| {
+                ControllerError::storage_error("initializing fault tolerant pipeline", error)
+            })?;
+        }
 
-        fs::create_dir_all(path).map_err(|error| {
-            ControllerError::io_error(String::from("controller startup"), error)
-        })?;
-        let _ = fs::remove_file(&state_path);
-        let _ = fs::remove_dir(&steps_path);
+        info!("{STEPS_FILE}: creating");
+        let journal = Journal::create(STEPS_FILE)?;
 
-        info!("{}: creating", steps_path.display());
-        let journal = Journal::create(&steps_path)?;
-
-        info!("{}: creating", state_path.display());
+        info!("{STATE_FILE}: creating");
         let checkpoint = Checkpoint {
             circuit: None,
             step: 0,
@@ -1103,7 +1100,7 @@ impl FtState {
             processed_records: 0,
             input_metadata: CheckpointOffsets::default(),
         };
-        checkpoint.write(&*storage, &state_path)?;
+        checkpoint.write(&*storage, STATE_FILE)?;
 
         Ok(Self {
             input_endpoints: Self::initial_input_endpoints(&controller),
@@ -1429,10 +1426,7 @@ impl ControllerInit {
         let storage =
             CircuitStorageConfig::for_config(storage_config.clone(), storage_options.clone())
                 .map_err(|error| {
-                    ControllerError::storage_error(
-                        String::from("failed to initialize storage"),
-                        error,
-                    )
+                    ControllerError::storage_error("failed to initialize storage", error)
                 })?;
 
         // Try to read a checkpoint.

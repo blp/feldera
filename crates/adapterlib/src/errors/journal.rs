@@ -40,18 +40,13 @@ pub enum StepError {
     },
 }
 
-}
-
 impl StepError {
     pub fn kind(&self) -> ErrorKind {
         match self {
             Self::IoError { io_error, .. } => io_error.kind(),
-            Self::EncodeError { .. }
-            | Self::DecodeError { .. }
-            | Self::MissingStep { .. }
-            | Self::UnexpectedRead
-            | Self::UnexpectedWrite
-            | Self::UnexpectedWait => ErrorKind::Other,
+            Self::EncodeError { .. } | Self::DecodeError { .. } | Self::WrongStep { .. } => {
+                ErrorKind::Other
+            }
         }
     }
 }
