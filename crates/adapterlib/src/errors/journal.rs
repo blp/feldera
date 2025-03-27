@@ -33,14 +33,13 @@ pub enum StepError {
         error: rmp_serde::decode::Error,
     },
 
-    MissingStep {
+    WrongStep {
         path: PathBuf,
-        step: Step,
+        expected: Step,
+        found: Step,
     },
+}
 
-    UnexpectedRead,
-    UnexpectedWrite,
-    UnexpectedWait,
 }
 
 impl StepError {
@@ -91,17 +90,18 @@ impl Display for StepError {
             StepError::DecodeError { path, error } => {
                 write!(f, "{}: error parsing step ({error})", path.display())
             }
-            StepError::MissingStep { path, step } => write!(
-                f,
-                "{} should contain step {step} but it is not present",
-                path.display()
-            ),
             StepError::IoError { path, io_error, .. } => {
                 write!(f, "I/O error on {}: {io_error}", path.display())
             }
-            StepError::UnexpectedRead => write!(f, "Unexpected read while in write mode"),
-            StepError::UnexpectedWrite => write!(f, "Unexpected write while in read mode"),
-            StepError::UnexpectedWait => write!(f, "Unexpected wait while in read mode"),
+            StepError::WrongStep {
+                path,
+                expected,
+                found,
+            } => write!(
+                f,
+                "{}: file should contain  step {expected}, but read step {found}",
+                path.display()
+            ),
         }
     }
 }

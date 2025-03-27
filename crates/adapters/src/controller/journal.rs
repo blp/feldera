@@ -1,16 +1,12 @@
 use std::{
-    cmp::Ordering,
     collections::{HashMap, HashSet},
-    fs::{self, remove_file, File, OpenOptions},
-    io::{BufReader, BufWriter, Error as IoError, ErrorKind, Seek, SeekFrom, Write},
+    fs::{self, remove_file},
+    io::{Error as IoError, ErrorKind},
     path::{Path, PathBuf},
-    sync::mpsc::{channel, Receiver, Sender},
-    thread::{self, JoinHandle},
 };
 
 use feldera_adapterlib::{errors::journal::StepError, transport::Step};
 use feldera_types::config::InputEndpointConfig;
-use rmp_serde::decode::ReadReader;
 use rmpv::Value as RmpValue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -43,12 +39,23 @@ impl Journal {
         Ok(Self::open(path))
     }
 
-    pub fn read(&self, step: Step) -> Result<StepMetadata, StepError> {
+    pub fn read(&self, step: Step) -> Result<Option<StepMetadata>, StepError> {
         let path = self.path.join(format!("{step}.bin"));
-        let data = fs::read(&path).map_err(|error| StepError::io_error(&path, error))?;
-        let record = rmp_serde::decode::from_slice(&data)
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(StepError::io_error(&path, error)),
+        };
+        let record = rmp_serde::decode::from_slice::<StepMetadata>(&data)
             .map_err(|error| StepError::DecodeError { path, error })?;
-        Ok(record)
+        if record.step != step {
+            return Err(StepError::WrongStep {
+                path: self.path.clone(),
+                expected: step,
+                found: record.step,
+            });
+        }
+        Ok(Some(record))
     }
 
     pub fn write(&self, record: &StepMetadata) -> Result<(), StepError> {
@@ -173,12 +180,9 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::{
-        controller::journal::{Journal, ReadResult},
-        test::init_test_logger,
-    };
+    use crate::{controller::journal::Journal, test::init_test_logger};
 
-    use super::{StepMetadata, StepReader, StepWriter};
+    use super::StepMetadata;
 
     /// Create and write a steps file and then read it back.
     #[test]
@@ -188,7 +192,7 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let path = tempdir.path().join("journal");
 
-        let written_data = (0..10)
+        let records = (0..10)
             .map(|step| StepMetadata {
                 step,
                 remove_inputs: HashSet::new(),
@@ -197,122 +201,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut step_writer = Journal::create(&path).unwrap();
-        for step in written_data.iter() {
-            step_writer.write(step).unwrap();
-            step_writer.wait().unwrap();
+        let journal = Journal::create(&path).unwrap();
+        for record in records.iter() {
+            journal.write(record).unwrap();
         }
-        drop(step_writer);
 
-        let mut step_reader = Journal::open(&path).unwrap();
-        let mut read_data = Vec::new();
-        while let ReadResult::Step {
-            reader: new_reader,
-            metadata,
-        } = step_reader.read().unwrap()
-        {
-            read_data.push(metadata);
-            step_reader = new_reader;
+        for expected in records.iter() {
+            let actual = journal.read(expected.step).unwrap().unwrap();
+            assert_eq!(expected, &actual);
         }
-        assert_eq!(written_data, read_data);
-    }
 
-    /// Create and write a steps file, then read it back, and continue adding more steps at the end.
-    #[test]
-    fn test_append() {
-        init_test_logger();
-
-        let tempdir = TempDir::new().unwrap();
-        let path = tempdir.path().join("steps.bin");
-
-        let written_data = (0..10)
-            .map(|step| StepMetadata {
-                step,
-                remove_inputs: HashSet::new(),
-                add_inputs: HashMap::new(),
-                input_logs: HashMap::new(),
-            })
-            .collect::<Vec<_>>();
-
-        // Create an empty file and close it immediately.
-        // (Thus, this test also checks that we can open and read an empty file.)
-        StepWriter::create(&path).unwrap();
-
-        for new_step in 0..10 {
-            let mut step_reader = StepReader::open(&path).unwrap();
-            let mut read_data = Vec::new();
-
-            // Exactly `new_step` steps should be readable already.
-            println!("read steps 0..{new_step}");
-            for _ in 0..new_step {
-                match step_reader.read().unwrap() {
-                    ReadResult::Step {
-                        reader: new_reader,
-                        metadata,
-                    } => {
-                        step_reader = new_reader;
-                        read_data.push(metadata);
-                    }
-                    ReadResult::Writer(_) => unreachable!(),
-                }
-            }
-            assert_eq!(&written_data[..new_step], read_data);
-
-            println!("write step {new_step}");
-            let mut step_writer = match step_reader.read().unwrap() {
-                ReadResult::Step { .. } => unreachable!(),
-                ReadResult::Writer(writer) => writer,
-            };
-            step_writer.write(&written_data[new_step]).unwrap();
-        }
-    }
-
-    /// Create and write a steps file and then read it back with seeking.
-    #[test]
-    fn test_seek() {
-        init_test_logger();
-
-        let tempdir = TempDir::new().unwrap();
-        let path = tempdir.path().join("steps.bin");
-
-        let written_data = (0..10)
-            .map(|step| StepMetadata {
-                step,
-                remove_inputs: HashSet::new(),
-                add_inputs: HashMap::new(),
-                input_logs: HashMap::new(),
-            })
-            .collect::<Vec<_>>();
-
-        let mut step_writer = StepWriter::create(&path).unwrap();
-        for step in written_data.iter() {
-            step_writer.write(step).unwrap();
-            step_writer.wait().unwrap();
-        }
-        drop(step_writer);
-
-        for start in 0..10 {
-            println!("seek to {start}");
-            let step_reader = StepReader::open(&path).unwrap();
-
-            let mut read_data = Vec::new();
-            let ReadResult::Step {
-                reader: mut step_reader,
-                metadata,
-            } = step_reader.seek(start).unwrap()
-            else {
-                unreachable!()
-            };
-            read_data.push(metadata);
-            while let ReadResult::Step {
-                reader: new_reader,
-                metadata,
-            } = step_reader.read().unwrap()
-            {
-                read_data.push(metadata);
-                step_reader = new_reader;
-            }
-            assert_eq!(&written_data[start as usize..], &read_data);
-        }
+        let last_record = records.last().unwrap();
+        assert_eq!(journal.read(last_record.step + 1).unwrap(), None);
     }
 }
