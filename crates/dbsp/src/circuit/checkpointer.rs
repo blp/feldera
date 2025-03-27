@@ -13,7 +13,7 @@ use std::{
 };
 
 use crate::trace::Serializer;
-use feldera_storage::StorageBackend;
+use feldera_storage::{StorageBackend, StorageFileType};
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use uuid::Uuid;
@@ -116,32 +116,29 @@ impl Checkpointer {
             }
         }
 
-        // Collect everything found in the storage directory
-        let mut all_paths: HashSet<PathBuf> = HashSet::new();
-        self.backend.list(Path::new(""), &mut |path| {
-            all_paths.insert(path.into());
-        })?;
+        /// True if `path` is a name that we might have created ourselves.
+        fn is_feldera_filename(path: &Path) -> bool {
+            let extension = &path
+                .extension()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or_default();
+            Checkpointer::DBSP_FILE_EXTENSION.contains(extension)
+        }
 
-        // Remove everything that is not referenced by a checkpoint
-        let to_remove = all_paths.difference(&in_use_paths);
-        for path in to_remove {
-            if Checkpointer::DBSP_FILE_EXTENSION.contains(
-                &path
-                    .extension()
-                    .unwrap_or_default()
-                    .to_str()
-                    .unwrap_or_default(),
-            ) {
-                match self.backend.delete(path) {
+        // Collect everything found in the storage directory
+        self.backend.list(Path::new(""), &mut |path, file_type| {
+            println!("exists: {}", path.display());
+            if !in_use_paths.contains(path) && (is_feldera_filename(path) || file_type == StorageFileType::Directory){
+                match self.backend.delete_recursive(path) {
                     Ok(_) => {
-                        tracing::debug!("Removed unused file '{}'", path.display());
+                        tracing::debug!("Removed unused {file_type:?} '{}'", path.display());
                     }
                     Err(e) => {
                         tracing::warn!("Unable to remove old-checkpoint file {}: {} (the pipeline will try to delete the file again on a restart)", path.display(), e);
                     }
-                }
             }
-        }
+            }})?;
 
         Ok(())
     }
@@ -175,14 +172,22 @@ impl Checkpointer {
     ) -> Result<VecDeque<CheckpointMetadata>, Error> {
         match backend.read(Path::new(Self::CHECKPOINT_FILE_NAME)) {
             Ok(content) => {
+                println!("found checkpoint file");
                 let archived =
                     unsafe { rkyv::archived_root::<VecDeque<CheckpointMetadata>>(&content) };
                 let checkpoint_list: VecDeque<CheckpointMetadata> =
                     archived.deserialize(&mut rkyv::Infallible).unwrap();
+                println!("checkpoints: {checkpoint_list:?}");
                 Ok(checkpoint_list)
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(VecDeque::new()),
-            Err(error) => Err(error)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                println!("not found");
+                Ok(VecDeque::new())
+            }
+            Err(error) => {
+                println!("error: {error:?}");
+                Err(error)?
+            }
         }
     }
 
@@ -194,10 +199,12 @@ impl Checkpointer {
 
         let mut spines = Vec::new();
         self.backend
-            .list(Path::new(&cpm.uuid.to_string()), &mut |path| {
+            .list(Path::new(&cpm.uuid.to_string()), &mut |path, _file_type| {
                 if path
                     .file_name()
-                    .is_some_and(|path| Path::new(path).starts_with("pspine-batches"))
+                    .unwrap_or_default()
+                    .as_encoded_bytes()
+                    .starts_with(b"pspine-batches")
                 {
                     spines.push(path.to_path_buf());
                 }
@@ -222,10 +229,8 @@ impl Checkpointer {
     fn update_checkpoint_file(&self) -> Result<(), Error> {
         let content = crate::storage::file::to_bytes(&self.checkpoint_list)
             .expect("failed to serialize checkpoint-list data");
-        self.backend.write(
-            &Path::new(&format!("{}{}", Self::CHECKPOINT_FILE_NAME, ".mut")),
-            content,
-        )?;
+        self.backend
+            .write(&Path::new(Self::CHECKPOINT_FILE_NAME), content)?;
 
         Ok(())
     }

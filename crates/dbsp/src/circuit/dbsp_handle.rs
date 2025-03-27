@@ -1334,6 +1334,8 @@ pub(crate) mod tests {
 
         let incomplete_checkpoint_dir = temp.path().join(Uuid::now_v7().to_string());
         fs::create_dir(&incomplete_checkpoint_dir).expect("can't create checkpoint dir");
+        let _ = File::create(&incomplete_checkpoint_dir.join("filename.feldera"))
+            .expect("can't create file");
 
         let complete_batch_unused = temp.path().join("complete_batch.feldera");
         let _ = File::create(&complete_batch_unused).expect("can't create file");

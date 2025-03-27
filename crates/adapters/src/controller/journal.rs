@@ -78,18 +78,8 @@ impl Journal {
     }
 
     pub fn truncate(&self) -> Result<(), StepError> {
-        let mut result = Ok(());
-        let result2 = self.backend.list(&self.path, &mut |path| match self
-            .backend
-            .delete_if_exists(path)
-        {
-            Ok(()) => (),
-            Err(error) => {
-                result = Err(error);
-            }
-        });
-        result
-            .and(result2)
+        self.backend
+            .delete_recursive(&self.path)
             .map_err(|error| self.storage_error(error))
     }
 

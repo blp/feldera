@@ -69,12 +69,11 @@ pub trait StorageBackend: Send + Sync {
     /// Calls `cb` with the name of each of the files under `parent`. This is a
     /// non-recursive list: it does not include files under sub-directories of
     /// `parent`.
-    fn list(&self, parent: &Path, cb: &mut dyn FnMut(&Path)) -> Result<(), StorageError>;
-
-    fn list_recursive(&self, parent: &Path, cb: &mut dyn FnMut(&Path)) -> Result<(), StorageError> {
-        // XXX
-        self.list(parent, cb)
-    }
+    fn list(
+        &self,
+        parent: &Path,
+        cb: &mut dyn FnMut(&Path, StorageFileType),
+    ) -> Result<(), StorageError>;
 
     fn delete(&self, name: &Path) -> Result<(), StorageError>;
 
@@ -98,6 +97,7 @@ pub trait StorageBackend: Send + Sync {
     /// Reads `name` and returns its contents.  The file `name` is relative to
     /// the base of the storage backend.
     fn read(&self, name: &Path) -> Result<Arc<FBuf>, StorageError> {
+        println!("read {}", name.display());
         let reader = self.open(name)?;
         let size = reader.get_size()?.try_into().unwrap();
         reader.read_block(BlockLocation { offset: 0, size })
@@ -106,6 +106,7 @@ pub trait StorageBackend: Send + Sync {
     /// Writes `content` to `name`, automatically creating any parent
     /// directories within `name` that don't already exist.
     fn write(&self, name: &Path, content: FBuf) -> Result<(), StorageError> {
+        println!("write {}", name.display());
         let mut writer = self.create_named(name)?;
         writer.write_block(0, content)?;
         let (reader, _path) = writer.complete()?;
@@ -185,4 +186,23 @@ pub trait FileReader: Send + Sync + HasFileId {
 
     /// Returns the file's size in bytes.
     fn get_size(&self) -> Result<u64, StorageError>;
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StorageFileType {
+    /// A regular file.
+    File,
+
+    /// A directory.
+    ///
+    /// Only some kinds of storage backends support directories. The ones that
+    /// don't still allow files to be named hierarchically, but they don't
+    /// support creating or deleting directories independently from the files in
+    /// them. That is, with such a backend, a directory is effectively created
+    /// by creating a file in it, and is effectively deleted when the last file
+    /// in it is deleted.
+    Directory,
+
+    /// Something else.
+    Other,
 }

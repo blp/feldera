@@ -10,6 +10,7 @@ use crate::circuit::metrics::{
     WRITES_SUCCESS,
 };
 use crate::storage::buffer_cache::FBuf;
+use feldera_storage::StorageFileType;
 use metrics::counter;
 use std::{
     collections::HashMap,
@@ -118,7 +119,11 @@ impl StorageBackend for MemoryBackend {
         }
     }
 
-    fn list(&self, parent: &Path, cb: &mut dyn FnMut(&Path)) -> Result<(), StorageError> {
+    fn list(
+        &self,
+        parent: &Path,
+        cb: &mut dyn FnMut(&Path, StorageFileType),
+    ) -> Result<(), StorageError> {
         let paths = self
             .files
             .read()
@@ -128,7 +133,7 @@ impl StorageBackend for MemoryBackend {
             .cloned()
             .collect::<Vec<_>>();
         for path in paths {
-            cb(&path);
+            cb(&path, StorageFileType::File);
         }
         Ok(())
     }
