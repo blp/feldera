@@ -60,11 +60,9 @@ use stats::{CanSuspend, StepResults};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs;
 use std::io::ErrorKind;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender};
 use std::sync::LazyLock;
 use std::{
@@ -604,10 +602,17 @@ impl CircuitThread {
             };
             Some(ft?)
         } else {
-            if let Some(state_path) = state_path(&controller.status.pipeline_config) {
+            if let Some(backend) = &storage {
                 // We're not fault-tolerant, so it's not a good idea to resume
                 // from the same checkpoint twice.  Delete it.
-                let _ = fs::remove_file(&state_path);
+                backend
+                    .delete_if_exists(Path::new(STATE_FILE))
+                    .map_err(|error| {
+                        ControllerError::storage_error(
+                            "delete non-FT checkpoint following resume",
+                            error,
+                        )
+                    })?;
             }
             None
         };
@@ -796,9 +801,8 @@ impl CircuitThread {
                             .num_total_processed_records(),
                         input_metadata: this.input_metadata.clone().unwrap_or_default(),
                     };
-                    let state_path = state_path(&this.controller.status.pipeline_config).unwrap();
                     checkpoint
-                        .write(&**this.storage.as_ref().unwrap(), &state_path)
+                        .write(&**this.storage.as_ref().unwrap(), STATE_FILE)
                         .map(|()| checkpoint)
                 })?;
             if let Some(ft) = &mut this.ft {
@@ -1376,14 +1380,7 @@ struct ControllerInit {
     input_metadata: Option<CheckpointOffsets>,
 }
 
-fn storage_path(config: &PipelineConfig) -> Option<&Path> {
-    config.storage_config.as_ref().map(|storage| storage.path())
-}
-
 pub const STATE_FILE: &str = "state.json";
-fn state_path(config: &PipelineConfig) -> Option<PathBuf> {
-    storage_path(config).map(|path| path.join(STATE_FILE))
-}
 
 pub const STEPS_FILE: &str = "steps.bin";
 
