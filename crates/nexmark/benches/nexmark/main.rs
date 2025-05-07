@@ -5,12 +5,11 @@
 use anyhow::Result;
 use ascii_table::AsciiTable;
 use clap::Parser;
-use dbsp::circuit::metrics::{
-    BUFFER_CACHE_HIT, BUFFER_CACHE_MISS, COMPACTION_SIZE_SAVINGS, COMPACTION_STALL_TIME,
-    FILES_CREATED, READS_SUCCESS, TOTAL_BYTES_READ, TOTAL_BYTES_WRITTEN, TOTAL_COMPACTIONS,
-    WRITES_SUCCESS,
-};
 use dbsp::circuit::{
+    metrics::{
+        BUFFER_CACHE_HIT, BUFFER_CACHE_MISS, COMPACTION_SIZE_SAVINGS, COMPACTION_STALL_TIME,
+        TOTAL_COMPACTIONS,
+    },
     CircuitConfig, CircuitStorageConfig, StorageCacheConfig, StorageConfig, StorageOptions,
 };
 use dbsp::storage::backend::tempdir_for_thread;
@@ -26,6 +25,9 @@ use dbsp_nexmark::{
     NexmarkSource,
 };
 use env_logger::Env;
+use feldera_storage::metrics::{
+    FILES_CREATED, READS_SUCCESS, TOTAL_BYTES_READ, TOTAL_BYTES_WRITTEN, WRITES_SUCCESS,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use metrics::{Key, SharedString, Unit};
 use metrics_util::{

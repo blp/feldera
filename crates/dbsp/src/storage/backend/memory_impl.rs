@@ -5,11 +5,11 @@
 use super::{
     BlockLocation, FileId, FileReader, FileWriter, HasFileId, StorageBackend, StorageError,
 };
-use crate::circuit::metrics::{
+use crate::storage::buffer_cache::FBuf;
+use feldera_storage::metrics::{
     FILES_CREATED, READS_FAILED, READS_SUCCESS, TOTAL_BYTES_READ, TOTAL_BYTES_WRITTEN,
     WRITES_SUCCESS,
 };
-use crate::storage::buffer_cache::FBuf;
 use feldera_storage::{StorageFileType, StoragePath};
 use metrics::counter;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};

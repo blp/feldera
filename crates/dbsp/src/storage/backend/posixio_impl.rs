@@ -4,10 +4,10 @@ use super::{
     BlockLocation, FileId, FileReader, FileWriter, HasFileId, StorageCacheFlags, StorageError,
     IOV_MAX, MUTABLE_EXTENSION,
 };
-use crate::circuit::metrics::{
+use crate::storage::{buffer_cache::FBuf, init};
+use feldera_storage::metrics::{
     FILES_CREATED, FILES_DELETED, TOTAL_BYTES_WRITTEN, WRITES_SUCCESS, WRITE_LATENCY,
 };
-use crate::storage::{buffer_cache::FBuf, init};
 use feldera_storage::{
     append_to_path, StorageBackend, StorageBackendFactory, StorageFileType, StoragePath,
     StoragePathPart,

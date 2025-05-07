@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 feldera-types = { workspace = true }
+metrics = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 libc = { workspace = true }
 rkyv = { workspace = true, features = ["std", "size_64", "validation", "uuid"] }
