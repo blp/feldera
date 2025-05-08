@@ -6,7 +6,8 @@ use super::{
 };
 use crate::storage::{buffer_cache::FBuf, init};
 use feldera_storage::metrics::{
-    FILES_CREATED, FILES_DELETED, TOTAL_BYTES_WRITTEN, WRITES_SUCCESS, WRITE_LATENCY,
+    FILES_CREATED, FILES_DELETED, READS_SUCCESS, READ_LATENCY, TOTAL_BYTES_READ,
+    TOTAL_BYTES_WRITTEN, WRITES_SUCCESS, WRITE_LATENCY,
 };
 use feldera_storage::{
     append_to_path, StorageBackend, StorageBackendFactory, StorageFileType, StoragePath,
@@ -17,6 +18,8 @@ use metrics::{counter, histogram};
 use std::ffi::OsString;
 use std::fs::{create_dir_all, DirEntry};
 use std::io::{ErrorKind, IoSlice, Write};
+use std::thread::sleep;
+use std::time::Duration;
 use std::{
     fs::{self, File, OpenOptions},
     io::Error as IoError,
@@ -45,6 +48,7 @@ impl PosixReader {
         }
     }
     fn open(
+        name: &StoragePath,
         path: PathBuf,
         cache: StorageCacheConfig,
         usage: Arc<AtomicI64>,
@@ -55,9 +59,11 @@ impl PosixReader {
             .open(&path)?;
         let size = file.metadata()?.size();
 
+        let file_id = FileId::new();
+        println!("{name}: open with FileId {file_id:?}");
         Ok(Arc::new(Self::new(
             Arc::new(file),
-            FileId::new(),
+            file_id,
             DeleteOnDrop::new(path, true, size, usage),
         )))
     }
@@ -75,10 +81,17 @@ impl FileReader for PosixReader {
     }
 
     fn read_block(&self, location: BlockLocation) -> Result<Arc<FBuf>, StorageError> {
+        sleep(Duration::from_millis(2));
+        let request_start = Instant::now();
         let mut buffer = FBuf::with_capacity(location.size);
 
         match buffer.read_exact_at(&self.file, location.offset, location.size) {
-            Ok(()) => Ok(Arc::new(buffer)),
+            Ok(()) => {
+                counter!(TOTAL_BYTES_READ).increment(buffer.len() as u64);
+                counter!(READS_SUCCESS).increment(1);
+                histogram!(READ_LATENCY).record(request_start.elapsed().as_secs_f64());
+                Ok(Arc::new(buffer))
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -179,8 +192,10 @@ impl FileWriter for PosixWriter {
 
 impl PosixWriter {
     fn new(file: File, name: StoragePath, path: PathBuf, usage: Arc<AtomicI64>) -> Self {
+        let file_id = FileId::new();
+        println!("{name}: create with FileId {file_id:?}");
         Self {
-            file_id: FileId::new(),
+            file_id,
             file,
             name,
             drop: DeleteOnDrop::new(path, false, 0, usage),
@@ -323,7 +338,7 @@ impl StorageBackend for PosixBackend {
     }
 
     fn open(&self, name: &StoragePath) -> Result<Arc<dyn FileReader>, StorageError> {
-        PosixReader::open(self.fs_path(name)?, self.cache, self.usage.clone())
+        PosixReader::open(name, self.fs_path(name)?, self.cache, self.usage.clone())
     }
 
     fn list(

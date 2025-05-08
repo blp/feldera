@@ -118,6 +118,7 @@ impl CacheInner {
             .map(|(k, v)| (k.offset, v.serial))
             .collect();
         for (offset, serial) in offsets {
+            println!("remove ({file_id:?}, {offset})");
             self.lru.remove(&serial).unwrap();
             self.cur_cost -= self
                 .cache
@@ -144,6 +145,7 @@ impl CacheInner {
     fn evict_to(&mut self, max_size: usize) {
         while self.cur_cost > max_size {
             let (_serial, key) = self.lru.pop_first().unwrap();
+            println!("remove ({:?}, {})", key.file_id, key.offset);
             let value = self.cache.remove(&key).unwrap();
             self.cur_cost -= value.aux.cost();
         }
@@ -151,6 +153,7 @@ impl CacheInner {
     }
 
     fn insert(&mut self, key: CacheKey, aux: Arc<dyn CacheEntry>) {
+        println!("insert ({:?}, {})", key.file_id, key.offset);
         let cost = aux.cost();
         self.evict_to(self.max_cost.saturating_sub(cost));
         if let Some(old_value) = self.cache.insert(
