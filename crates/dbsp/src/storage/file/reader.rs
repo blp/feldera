@@ -3,7 +3,7 @@
 //! [`Reader`] is the top-level interface for reading layer files.
 
 use super::format::{Compression, FileTrailer};
-use super::{AnyFactories, Factories, BLOOM_FILTER_FALSE_POSITIVE_RATE};
+use super::{AnyFactories, Factories};
 use crate::storage::buffer_cache::AsyncCacheContext;
 use crate::storage::buffer_cache::{CacheAccess, CacheEntry};
 use crate::storage::file::format::FilterBlock;
@@ -1295,6 +1295,7 @@ impl ImmutableFileRef {
     }
 }
 
+/// XXX docs
 pub fn decompress(
     compression: Option<Compression>,
     location: BlockLocation,

@@ -13,11 +13,9 @@ use crate::{
         },
     },
     trace::{
-        cursor::{CursorFactory, CursorFactoryWrapper},
-        merge_batches_by_reference,
-        ord::{merge_batcher::MergeBatcher, vec::VecIndexedWSet},
-        Batch, BatchFactories, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor,
-        Filter, VecIndexedWSetFactories, WeightedItem,
+        merge_batches_by_reference, ord::merge_batcher::MergeBatcher, Batch, BatchFactories,
+        BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor, VecIndexedWSetFactories,
+        WeightedItem,
     },
     DBData, DBWeight, NumEntries, Runtime,
 };
@@ -389,7 +387,7 @@ where
         }
     }
 
-    async fn fetch<B>(
+    /*    async fn fetch<B>(
         &self,
         keys: &B,
     ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
@@ -440,7 +438,7 @@ where
             }
         }
         Some(Box::new(CursorFactoryWrapper(builder.done())))
-    }
+    }*/
 }
 
 impl<K, V, R> Batch for FileIndexedWSet<K, V, R>

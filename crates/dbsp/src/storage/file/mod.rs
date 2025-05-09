@@ -884,9 +884,14 @@ mod test {
                     &StorageOptions::default(),
                 )
                 .unwrap();
-                let mut writer =
-                    Writer1::new(&factories, cache, &*storage_backend, parameters.clone(), n)
-                        .unwrap();
+                let mut writer = Writer1::new(
+                    &factories,
+                    cache.clone(),
+                    &*storage_backend,
+                    parameters.clone(),
+                    n,
+                )
+                .unwrap();
                 for row in 0..n {
                     let (_before, key, _after, aux) = expected(row);
                     writer.write0((&key, &aux)).unwrap();

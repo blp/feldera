@@ -33,7 +33,7 @@ use crate::storage::buffer_cache::CacheStats;
 pub use crate::storage::file::{Deserializable, Deserializer, Rkyv, Serializer};
 use crate::trace::cursor::{FilteredMergeCursor, UnfilteredMergeCursor};
 use crate::{dynamic::ArchivedDBData, storage::buffer_cache::FBuf};
-use cursor::{CursorFactory, CursorList};
+use cursor::{CursorFactory};
 use dyn_clone::DynClone;
 use feldera_storage::StoragePath;
 use rand::Rng;

@@ -28,7 +28,7 @@ use crate::trace::CommittedSpine;
 use feldera_storage::StoragePath;
 use futures::{stream::FuturesUnordered, StreamExt};
 use list_merger::ArcMerger;
-use metrics::{counter, gauge};
+use metrics::{counter};
 use ouroboros::self_referencing;
 use rand::Rng;
 use rkyv::{
