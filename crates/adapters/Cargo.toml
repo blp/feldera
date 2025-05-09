@@ -53,7 +53,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 serde_urlencoded = { workspace = true }
 form_urlencoded = { workspace = true }
 csv = { workspace = true }
-rdkafka = { workspace = true, features = ["ssl-vendored", "gssapi-vendored", "zstd", "libz"], optional = true }
+rdkafka = { workspace = true, features = ["ssl-vendored", "zstd", "libz"], optional = true }
 aws-sdk-s3 = { workspace = true, features = ["behavior-version-latest"] }
 aws-types = { workspace = true }
 actix = { workspace = true }
