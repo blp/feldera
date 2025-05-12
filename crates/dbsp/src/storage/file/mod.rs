@@ -36,14 +36,12 @@
 //! value and for sequential reads.  It should be possible to disable indexing
 //! by data value for workloads that don't require it.[^0]
 //!
-//! Layer files should support approximate set membership query in `~O(1)`
-//! time.[^0]
+//! Layer files support approximate set membership query in `~O(1)` time using
+//! [a filter block](format::FilterBlock).
 //!
 //! Layer files should support 1 TB data size.
 //!
 //! Layer files should include data checksums to detect accidental corruption.
-//!
-//! [^0]: Not yet implemented.
 //!
 //! # Design
 //!
@@ -293,13 +291,16 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    use std::{marker::PhantomData, sync::Arc};
 
     use crate::{
         storage::{
             backend::StorageBackend,
             buffer_cache::BufferCache,
-            file::{format::Compression, reader::Reader},
+            file::{
+                format::Compression,
+                reader::{BulkRows, Reader},
+            },
             test::init_test_logger,
         },
         Runtime,
@@ -345,6 +346,77 @@ mod test {
         fn key1(row0: usize, row1: usize) -> Self::K1;
         fn near1(row0: usize, row1: usize) -> (Self::K1, Self::K1);
         fn aux1(row0: usize, row1: usize) -> Self::A1;
+    }
+
+    struct Column0<T> {
+        row: usize,
+        _phantom: PhantomData<T>,
+    }
+
+    impl<T> Column0<T> {
+        pub fn new() -> Self {
+            Self {
+                row: 0,
+                _phantom: PhantomData,
+            }
+        }
+    }
+
+    impl<T> Iterator for Column0<T>
+    where
+        T: TwoColumns,
+    {
+        type Item = (T::K0, T::A0);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.row >= T::n0() {
+                None
+            } else {
+                let retval = Some((T::key0(self.row), T::aux0(self.row)));
+                self.row += 1;
+                retval
+            }
+        }
+    }
+
+    struct Column1<T> {
+        row0: usize,
+        row1: usize,
+        _phantom: PhantomData<T>,
+    }
+
+    impl<T> Column1<T>
+    where
+        T: TwoColumns,
+    {
+        fn new() -> Self {
+            Self {
+                row0: 0,
+                row1: 0,
+                _phantom: PhantomData,
+            }
+        }
+    }
+
+    impl<T> Iterator for Column1<T>
+    where
+        T: TwoColumns,
+    {
+        type Item = (T::K1, T::A1);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.row0 >= T::n0() {
+                None
+            } else {
+                let retval = Some((T::key1(self.row0, self.row1), T::aux1(self.row0, self.row1)));
+                self.row1 += 1;
+                if self.row1 >= T::n1(self.row0) {
+                    self.row0 += 1;
+                    self.row1 = 0;
+                }
+                retval
+            }
+        }
     }
 
     fn test_find<K, A, N, T>(
@@ -718,6 +790,34 @@ mod test {
         })
     }
 
+    fn test_bulk_rows<K, A, N, T>(
+        mut bulk: BulkRows<DynData, DynData, N, T>,
+        mut expected: impl Iterator<Item = (K, A)>,
+    ) where
+        K: DBData,
+        A: DBData,
+        T: ColumnSpec,
+    {
+        let mut tmp_key = K::default();
+        let mut tmp_aux = A::default();
+        let (tmp_key, tmp_aux): (&mut DynData, &mut DynData) =
+            (tmp_key.erase_mut(), tmp_aux.erase_mut());
+
+        let mut row = 0;
+        while !bulk.at_eof() {
+            bulk.wait().unwrap();
+            let (mut key, mut aux) = expected.next().unwrap();
+            dbg!(row);
+            assert_eq!(
+                unsafe { bulk.item((tmp_key, tmp_aux)) },
+                Some((key.erase_mut(), aux.erase_mut()))
+            );
+            bulk.step();
+            row += 1;
+        }
+        assert!(expected.next().is_none());
+    }
+
     fn test_bloom<K, A, N>(
         reader: &Reader<(&'static DynData, &'static DynData, N)>,
         n: usize,
@@ -828,7 +928,11 @@ mod test {
             let n1 = T::n1(row0);
             test_cursor(&rows1, n1, |row1| expected1(row0, row1));
         }
-
+        test_bulk_rows(reader.bulk_rows().unwrap(), Column0::<T>::new());
+        test_bulk_rows(
+            reader.bulk_rows().unwrap().next_column().unwrap(),
+            Column1::<T>::new(),
+        );
         TOKIO.block_on(async {
             // Force some blocking due to I/O, to test those cases in
             // [AsyncCacheContext].
@@ -913,6 +1017,40 @@ mod test {
         test_2_columns_helper(Parameters::default().with_max_branch(2));
     }
 
+    struct OneColumn<'a, T> {
+        expected: &'a T,
+        row: usize,
+        n: usize,
+    }
+
+    impl<'a, T> OneColumn<'a, T> {
+        pub fn new(expected: &'a T, n: usize) -> Self {
+            Self {
+                expected,
+                row: 0,
+                n,
+            }
+        }
+    }
+
+    impl<'a, T, K, A> Iterator for OneColumn<'a, T>
+    where
+        T: Fn(usize) -> (K, K, K, A),
+    {
+        type Item = (K, A);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.row >= self.n {
+                None
+            } else {
+                let (_before, key, _after, aux) = (self.expected)(self.row);
+                let retval = Some((key, aux));
+                self.row += 1;
+                retval
+            }
+        }
+    }
+
     fn test_one_column<K, A>(
         n: usize,
         expected: impl Fn(usize) -> (K, K, K, A),
@@ -965,6 +1103,7 @@ mod test {
                 assert_eq!(reader.rows().len(), n as u64);
                 test_cursor(&reader.rows(), n, &expected);
                 test_bloom(&reader, n, &expected);
+                test_bulk_rows(reader.bulk_rows().unwrap(), OneColumn::new(&expected, n));
 
                 TOKIO.block_on(async {
                     // Force some blocking due to I/O, to test those cases in

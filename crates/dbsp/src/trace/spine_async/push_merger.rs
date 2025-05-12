@@ -1,129 +1,86 @@
 use std::{
     cmp::Ordering,
     ops::{BitOr, BitOrAssign},
-    sync::Arc,
 };
-
-use ouroboros::self_referencing;
 
 use crate::{
     algebra::Lattice,
-    dynamic::{DynDataTyped, DynWeightedPairs, Weight, WeightTrait},
+    dynamic::{DynDataTyped, DynWeightedPairs, WeightTrait},
     time::Timestamp,
-    trace::{
-        Batch, BatchFactories, BatchReader, BatchReaderFactories, Builder, Filter, MergeCursor,
-    },
+    trace::{Batch, BatchFactories, BatchReaderFactories, Builder, Weight},
 };
 
-pub struct ArcMerger<B>(ArcMergerInner<B>)
-where
-    B: Batch;
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Pending;
 
-#[self_referencing]
-struct ArcMergerInner<B>
+pub trait PushCursor<K, V, T, R>
 where
-    B: Batch,
+    K: ?Sized,
+    V: ?Sized,
+    R: ?Sized,
 {
-    batches: Vec<Arc<B>>,
-    builder: B::Builder,
-    #[borrows(batches)]
-    #[not_covariant]
-    merger: ListMerger<Box<dyn MergeCursor<B::Key, B::Val, B::Time, B::R> + Send + 'this>, B>,
+    fn key(&self) -> Result<Option<&K>, Pending>;
+    fn val(&self) -> Result<Option<&V>, Pending>;
+    fn map_times(&mut self, logic: &mut dyn FnMut(&T, &R));
+    fn weight(&mut self) -> &R
+    where
+        T: PartialEq<()>;
+    fn step_key(&mut self);
+    fn step_val(&mut self);
 }
 
-impl<B> ArcMerger<B>
+pub struct PushMerger<C, B>
 where
-    B: Batch,
-{
-    pub fn new(
-        factories: &B::Factories,
-        builder: B::Builder,
-        batches: Vec<Arc<B>>,
-        key_filter: &Option<Filter<B::Key>>,
-        value_filter: &Option<Filter<B::Val>>,
-    ) -> Self {
-        Self(
-            ArcMergerInnerBuilder {
-                batches,
-                builder,
-                merger_builder: |batches| {
-                    ListMerger::new(
-                        factories,
-                        batches
-                            .iter()
-                            .map(|b| b.merge_cursor(key_filter.clone(), value_filter.clone()))
-                            .collect(),
-                    )
-                },
-            }
-            .build(),
-        )
-    }
-
-    pub fn work(&mut self, frontier: &B::Time, fuel: &mut isize) {
-        self.0
-            .with_mut(|fields| fields.merger.work(fields.builder, frontier, fuel))
-    }
-
-    pub fn done(self) -> B {
-        self.0.into_heads().builder.done()
-    }
-}
-
-/// Merger that merges up to 64 batches at a time.
-pub struct ListMerger<C, B>
-where
-    C: MergeCursor<B::Key, B::Val, B::Time, B::R>,
+    C: PushCursor<B::Key, B::Val, B::Time, B::R>,
     B: Batch,
 {
     cursors: Vec<C>,
-    has_mut: Vec<bool>,
+    any_values: bool,
     tmp_weight: Box<B::R>,
     time_diffs: Option<Box<DynWeightedPairs<DynDataTyped<B::Time>, B::R>>>,
 }
 
-impl<C, B> ListMerger<C, B>
+impl<C, B> PushMerger<C, B>
 where
-    C: MergeCursor<B::Key, B::Val, B::Time, B::R>,
+    C: PushCursor<B::Key, B::Val, B::Time, B::R>,
     B: Batch,
 {
-    pub fn merge(factories: &B::Factories, mut builder: B::Builder, cursors: Vec<C>) -> B {
-        let mut merger = Self::new(factories, cursors);
-        let mut fuel = isize::MAX;
-        merger.work(&mut builder, &B::Time::default(), &mut fuel);
-        assert!(fuel > 0);
-        builder.done()
-    }
-
     /// Creates a new merger for `cursors`.
     pub fn new(factories: &B::Factories, cursors: Vec<C>) -> Self {
-        // [IndexSet] supports a maximum of 64 batches.
         assert!(cursors.len() <= 64);
-
-        let time_diffs = factories.time_diffs_factory().map(|f| f.default_box());
-        let has_mut = cursors.iter().map(|c| c.has_mut()).collect();
-
-        ListMerger {
+        Self {
             cursors,
-            has_mut,
+            any_values: false,
             tmp_weight: factories.weight_factory().default_box(),
-            time_diffs,
+            time_diffs: factories.time_diffs_factory().map(|f| f.default_box()),
         }
     }
 
-    /// Perform `fuel` amount of work.
-    ///
-    /// When the function returns and fuel > 0, the batches should be guaranteed to be fully merged.
-    pub fn work(&mut self, builder: &mut B::Builder, frontier: &B::Time, fuel: &mut isize) {
+    fn is_done(&self) -> bool {
+        self.cursors.iter().all(|cursor| cursor.key() == Ok(None))
+    }
+
+    fn is_ready(&self) -> bool {
+        self.cursors.iter().all(|cursor| cursor.key().is_ok())
+    }
+
+    fn work(&mut self, builder: &mut B::Builder, frontier: &B::Time) {
+        let _ = self.work_(builder, frontier);
+    }
+
+    fn work_(&mut self, builder: &mut B::Builder, frontier: &B::Time) -> Result<(), Pending> {
+        // We can drop all the cursors whose keys are at EOI.  If that
+        // eliminates all of them, we're all done.  If any keys are pending,
+        // then we can't do any work.
         assert!(self.cursors.len() <= 64);
-        let mut remaining_cursors = self
-            .cursors
-            .iter()
-            .enumerate()
-            .filter_map(|(index, cursor)| cursor.key_valid().then_some(index))
-            .collect::<IndexSet>();
+        let mut remaining_cursors = IndexSet::empty();
+        for (index, cursor) in self.cursors.iter().enumerate() {
+            if cursor.key()?.is_some() {
+                remaining_cursors.add(index);
+            }
+        }
         if remaining_cursors.is_empty() {
-            return;
+            return Ok(());
         }
 
         let advance_func = |t: &mut DynDataTyped<B::Time>| t.join_assign(frontier);
@@ -135,17 +92,16 @@ where
         };
 
         // As long as there are multiple cursors...
-        while remaining_cursors.is_long() && *fuel > 0 {
+        while remaining_cursors.is_long() {
             // Find the indexes of the cursors with minimum keys, among the
             // remaining cursors.
             let orig_min_keys = find_min_indexes(
                 remaining_cursors
                     .into_iter()
-                    .map(|index| (index, self.cursors[index].key())),
+                    .map(|index| (index, self.cursors[index].key().unwrap())),
             );
 
             // As long as there is more than one cursor with minimum keys...
-            let mut any_values = false;
             let mut min_keys = orig_min_keys;
             while min_keys.is_long() {
                 // ...Find the indexes of the cursors with minimum values, among
@@ -154,15 +110,16 @@ where
                 let min_vals = find_min_indexes(
                     min_keys
                         .into_iter()
-                        .map(|index| (index, self.cursors[index].val())),
+                        .map(|index| (index, self.cursors[index].val().unwrap())),
                 );
-                any_values = self.copy_times(builder, time_map_func, min_vals, fuel) || any_values;
+                self.any_values =
+                    self.copy_times(builder, time_map_func, min_vals) || self.any_values;
 
                 // Then go on to the next value in each cursor, dropping the keys
                 // for which we've exhausted the values.
                 for index in min_vals {
                     self.cursors[index].step_val();
-                    if !self.cursors[index].val_valid() {
+                    if self.cursors[index].val()?.is_none() {
                         min_keys.remove(index);
                     }
                 }
@@ -172,30 +129,27 @@ where
             // values into the output.
             if let Some(index) = min_keys.first() {
                 loop {
-                    any_values =
-                        self.copy_times(builder, time_map_func, min_keys, fuel) || any_values;
+                    self.any_values =
+                        self.copy_times(builder, time_map_func, min_keys) || self.any_values;
                     self.cursors[index].step_val();
-                    if !self.cursors[index].val_valid() {
+                    if self.cursors[index].val()?.is_none() {
                         break;
                     }
                 }
             }
 
             // If we wrote any values for these minimum keys, write the key.
-            if any_values {
+            if self.any_values {
                 let index = orig_min_keys.first().unwrap();
-                if self.has_mut[index] {
-                    builder.push_key_mut(self.cursors[index].key_mut());
-                } else {
-                    builder.push_key(self.cursors[index].key());
-                }
+                builder.push_key(self.cursors[index].key().unwrap().unwrap());
+                self.any_values = false;
             }
 
             // Advance each minimum-key cursor, dropping the cursors for which
             // we've exhausted the data.
             for index in orig_min_keys {
                 self.cursors[index].step_key();
-                if !self.cursors[index].key_valid() {
+                if self.cursors[index].key()?.is_none() {
                     remaining_cursors.remove(index);
                 }
             }
@@ -204,38 +158,33 @@ where
         // If there is a cursor left (there's either one or none), copy it
         // directly to the output.
         if let Some(index) = remaining_cursors.first() {
-            while *fuel > 0 {
-                let mut any_values = false;
+            loop {
                 loop {
-                    any_values = self.copy_times(builder, time_map_func, remaining_cursors, fuel)
-                        || any_values;
+                    self.any_values = self.copy_times(builder, time_map_func, remaining_cursors)
+                        || self.any_values;
                     self.cursors[index].step_val();
-                    if !self.cursors[index].val_valid() {
+                    if self.cursors[index].val()?.is_none() {
                         break;
                     }
                 }
-                debug_assert!(time_map_func.is_some() || any_values, "This assertion should fail only if B::Cursor is a spine or a CursorList, but we shouldn't be merging those");
-                if any_values {
-                    if self.has_mut[index] {
-                        builder.push_key_mut(self.cursors[index].key_mut());
-                    } else {
-                        builder.push_key(self.cursors[index].key());
-                    }
+                debug_assert!(time_map_func.is_some() || self.any_values, "This assertion should fail only if B::Cursor is a spine or a CursorList, but we shouldn't be merging those");
+                if self.any_values {
+                    self.any_values = false;
+                    builder.push_key(self.cursors[index].key().unwrap().unwrap());
                 }
                 self.cursors[index].step_key();
-                if !self.cursors[index].key_valid() {
+                if self.cursors[index].key()?.is_none() {
                     break;
                 }
             }
         }
+        Ok(())
     }
-
     fn copy_times(
         &mut self,
         builder: &mut B::Builder,
         map_func: Option<&dyn Fn(&mut DynDataTyped<B::Time>)>,
         indexes: IndexSet,
-        fuel: &mut isize,
     ) -> bool {
         // If this is a timed batch, we must consolidate the (time, weight) array; otherwise we
         // simply compute the total weight of the current value.
@@ -293,12 +242,7 @@ where
         }
 
         let index = indexes.first().unwrap();
-        if self.has_mut[index] {
-            builder.push_val_mut(self.cursors[index].val_mut());
-        } else {
-            builder.push_val(self.cursors[index].val());
-        }
-        *fuel -= 1;
+        builder.push_val(self.cursors[index].val().unwrap().unwrap());
         true
     }
 }
