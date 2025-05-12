@@ -557,6 +557,7 @@ where
                     file.file_handle.file_id(),
                     node.location.offset,
                     entry.clone(),
+                    false,
                 );
                 data_block_reader.complete(entry)
             }
@@ -572,13 +573,17 @@ where
             Either::Left(data_block_reader) => {
                 let compression = file.compression;
                 let entry = context
-                    .read(node.location, move |raw| {
-                        Ok(Arc::new(Self::from_raw(
-                            decompress(compression, node.location, raw)?,
-                            node.location,
-                            node.rows.start,
-                        )?))
-                    })
+                    .read(
+                        node.location,
+                        move |raw| {
+                            Ok(Arc::new(Self::from_raw(
+                                decompress(compression, node.location, raw)?,
+                                node.location,
+                                node.rows.start,
+                            )?))
+                        },
+                        false,
+                    )
                     .await?;
                 data_block_reader.complete(entry)
             }
@@ -974,6 +979,7 @@ where
                     file.file_handle.file_id(),
                     node.location.offset,
                     entry.clone(),
+                    true,
                 );
                 index_block_reader.complete(entry)
             }
@@ -989,13 +995,17 @@ where
             Either::Left(index_block_reader) => {
                 let compression = file.compression;
                 let entry = context
-                    .read(node.location, move |raw| {
-                        Ok(Arc::new(Self::from_raw(
-                            decompress(compression, node.location, raw)?,
-                            node.location,
-                            node.rows.start,
-                        )?))
-                    })
+                    .read(
+                        node.location,
+                        move |raw| {
+                            Ok(Arc::new(Self::from_raw(
+                                decompress(compression, node.location, raw)?,
+                                node.location,
+                                node.rows.start,
+                            )?))
+                        },
+                        true,
+                    )
                     .await?;
                 index_block_reader.complete(entry)
             }
@@ -1325,7 +1335,7 @@ impl FileTrailer {
             None => {
                 let block = file_handle.read_block(location)?;
                 let entry = Arc::new(Self::from_raw(block)?);
-                cache.insert(file_handle.file_id(), location.offset, entry.clone());
+                cache.insert(file_handle.file_id(), location.offset, entry.clone(), false);
                 (CacheAccess::Miss, entry)
             }
         };

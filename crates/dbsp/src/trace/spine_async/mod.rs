@@ -29,7 +29,7 @@ use enum_map::EnumMap;
 use feldera_storage::StoragePath;
 use futures::{stream::FuturesUnordered, StreamExt};
 use list_merger::ArcMerger;
-use metrics::{counter};
+use metrics::counter;
 use ouroboros::self_referencing;
 use rand::Rng;
 use rkyv::{

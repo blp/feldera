@@ -13,9 +13,9 @@ use crate::{
         },
     },
     trace::{
-        merge_batches_by_reference, ord::merge_batcher::MergeBatcher, Batch, BatchFactories,
-        BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor, Deserializer,
-        Serializer, VecWSetFactories, WeightedItem,
+        cursor::CursorFactory, merge_batches_by_reference, ord::merge_batcher::MergeBatcher, Batch,
+        BatchFactories, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor,
+        Deserializer, Serializer, VecWSetFactories, WeightedItem,
     },
     DBData, DBWeight, NumEntries, Runtime,
 };
@@ -386,6 +386,18 @@ where
                 output.push_ref(cursor.key());
             }
         }
+    }
+
+    async fn fetch<B>(
+        &self,
+        keys: &B,
+    ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
+    where
+        B: Batch<Key = Self::Key, Time = ()>,
+    {
+        dbg!();
+        let _ = keys;
+        None
     }
 }
 

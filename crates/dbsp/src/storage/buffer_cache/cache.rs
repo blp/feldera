@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{collections::BTreeMap, ops::Range};
 
-use enum_map::{Enum, EnumMap};
+use enum_map::{enum_map, Enum, EnumMap};
+use futures::poll;
 use futures::{
     future::{self, Either},
     pin_mut,
@@ -69,6 +70,10 @@ struct CacheValue {
     serial: u64,
 }
 
+fn is_locked(serial: u64) -> bool {
+    serial > u64::MAX / 2
+}
+
 pub trait CacheEntry: Send + Sync + Debug {
     fn cost(&self) -> usize;
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
@@ -83,7 +88,7 @@ struct CacheInner {
     lru: BTreeMap<u64, CacheKey>,
 
     /// Serial number to use the next time we touch a block.
-    next_serial: u64,
+    next_serial: EnumMap<bool, u64>,
 
     /// Sum over `cache[*].block.cost()`.
     cur_cost: usize,
@@ -97,7 +102,7 @@ impl CacheInner {
         Self {
             cache: BTreeMap::new(),
             lru: BTreeMap::new(),
-            next_serial: 0,
+            next_serial: enum_map! { false => 0, true => u64::MAX / 2 },
             cur_cost: 0,
             max_cost,
         }
@@ -142,10 +147,11 @@ impl CacheInner {
 
     fn get(&mut self, key: CacheKey) -> Option<Arc<dyn CacheEntry>> {
         if let Some(value) = self.cache.get_mut(&key) {
+            let is_locked = is_locked(value.serial);
             self.lru.remove(&value.serial);
-            value.serial = self.next_serial;
+            value.serial = self.next_serial[is_locked];
             self.lru.insert(value.serial, key);
-            self.next_serial += 1;
+            self.next_serial[is_locked] += 1;
             Some(value.aux.clone())
         } else {
             None
@@ -161,22 +167,23 @@ impl CacheInner {
         self.debug_check_invariants();
     }
 
-    fn insert(&mut self, key: CacheKey, aux: Arc<dyn CacheEntry>) {
+    fn insert(&mut self, key: CacheKey, aux: Arc<dyn CacheEntry>, lock: bool) {
+        //println!("insert {key:?}");
         let cost = aux.cost();
         self.evict_to(self.max_cost.saturating_sub(cost));
         if let Some(old_value) = self.cache.insert(
             key,
             CacheValue {
                 aux,
-                serial: self.next_serial,
+                serial: self.next_serial[lock],
             },
         ) {
             self.lru.remove(&old_value.serial);
             self.cur_cost -= old_value.aux.cost();
         }
-        self.lru.insert(self.next_serial, key);
+        self.lru.insert(self.next_serial[lock], key);
         self.cur_cost += cost;
-        self.next_serial += 1;
+        self.next_serial[lock] += 1;
         self.debug_check_invariants();
     }
 }
@@ -218,11 +225,11 @@ impl BufferCache {
             .clone()
     }
 
-    pub fn insert(&self, file_id: FileId, offset: u64, aux: Arc<dyn CacheEntry>) {
+    pub fn insert(&self, file_id: FileId, offset: u64, aux: Arc<dyn CacheEntry>, lock: bool) {
         self.inner
             .lock()
             .unwrap()
-            .insert(CacheKey::new(file_id, offset), aux);
+            .insert(CacheKey::new(file_id, offset), aux, lock);
     }
 
     pub fn evict(&self, file: &dyn FileReader) {
@@ -422,16 +429,18 @@ pub struct AsyncCacheContext {
 struct AsyncCacheTask {
     parse: Box<dyn FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error> + 'static>,
     send_replies: Vec<oneshot::Sender<Result<Arc<dyn CacheEntry>, Error>>>,
+    lock: bool,
 }
 
 impl AsyncCacheTask {
-    fn new<F>(parse: F) -> Self
+    fn new<F>(parse: F, lock: bool) -> Self
     where
         F: FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error> + 'static,
     {
         Self {
             parse: Box::new(parse),
             send_replies: Vec::new(),
+            lock,
         }
     }
 }
@@ -453,6 +462,7 @@ impl AsyncCacheContext {
         &self,
         location: BlockLocation,
         parse: F,
+        lock: bool,
     ) -> Result<Arc<dyn CacheEntry>, Error>
     where
         F: FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error> + 'static,
@@ -461,14 +471,16 @@ impl AsyncCacheContext {
         if let Some(aux) = self.cache.inner.lock().unwrap().get(key) {
             return Ok(aux.clone());
         }
+        //println!("wait for {key:?}");
 
         let (sender, receiver) = oneshot::channel();
 
+        //dbg!();
         self.requests
             .lock()
             .unwrap()
             .entry(location)
-            .or_insert_with(|| AsyncCacheTask::new(parse))
+            .or_insert_with(|| AsyncCacheTask::new(parse, lock))
             .send_replies
             .push(sender);
 
@@ -486,7 +498,7 @@ impl AsyncCacheContext {
     }
 
     /// Runs all of the pending I/O and wakes up threads blocked in [Self::read].
-    pub async fn run_io_batch<R>(&self, file: &R)
+    async fn run_io_batch<R>(&self, file: &R)
     where
         R: FileReader + ?Sized,
     {
@@ -496,6 +508,7 @@ impl AsyncCacheContext {
             .map(|task| task.send_replies.len())
             .sum::<usize>();
         self.n_requests.send_modify(|n| *n -= n_requests);
+        println!("{n_requests} request for {} unique blocks", requests.len());
         let blocks = requests.keys().cloned().collect::<Vec<_>>();
         let (sender, receiver) = oneshot::channel();
         file.read_async(
@@ -511,6 +524,7 @@ impl AsyncCacheContext {
                 self.cache.inner.lock().unwrap().insert(
                     CacheKey::new(self.file_id, location.offset),
                     cache_entry.clone(),
+                    task.lock,
                 );
             }
             for send_reply in task.send_replies {
@@ -540,10 +554,12 @@ impl AsyncCacheContext {
             .enumerate()
             .map(|(index, future)| async move { (index, future.await) })
             .collect::<FuturesUnordered<_>>();
+        let n = tasks.len();
         let mut outputs = Vec::with_capacity(tasks.len());
         for _ in 0..tasks.len() {
             outputs.push(None);
         }
+        let mut x = 0;
         while !tasks.is_empty() {
             let wait = self.wait(tasks.len());
             pin_mut!(wait);
@@ -560,8 +576,12 @@ impl AsyncCacheContext {
                     // All of the tasks we launched have blocked on I/O. Launch a batch
                     // of I/O and wait for it to complete.
                     self.run_io_batch(file).await;
+                    x += 1;
                 }
             }
+        }
+        if n > 0 {
+            println!("{n} in {x} rounds");
         }
         outputs.into_iter().map(|output| output.unwrap()).collect()
     }

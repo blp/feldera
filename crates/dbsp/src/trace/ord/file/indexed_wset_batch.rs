@@ -399,6 +399,7 @@ where
         let context = self.file.new_async_context();
         let mut tasks = Vec::new();
         let mut keys = keys.cursor();
+        let mut outputs = Vec::new();
         while let Some(key) = keys.get_key() {
             let key = clone_box(key);
             tasks.push(async {
@@ -423,10 +424,14 @@ where
                 }
                 output
             });
+            if tasks.len() >= 100 {
+                outputs.append(&mut context.execute_tasks(self.file.file_handle(), tasks).await);
+                tasks = Vec::new();
+            }
             keys.step_key();
         }
 
-        let outputs = context.execute_tasks(self.file.file_handle(), tasks).await;
+        outputs.append(&mut context.execute_tasks(self.file.file_handle(), tasks).await);
 
         let builder =
             <VecIndexedWSet<Self::Key, Self::Val, Self::R> as Batch>::Builder::with_capacity(
