@@ -4,6 +4,8 @@
 
 use super::format::{Compression, FileTrailer};
 use super::{AnyFactories, Factories};
+use crate::circuit::runtime::ThreadType;
+use crate::dynamic::{DynVec, WeightTrait};
 use crate::storage::buffer_cache::AsyncCacheContext;
 use crate::storage::buffer_cache::{CacheAccess, CacheEntry};
 use crate::storage::file::format::FilterBlock;
@@ -15,6 +17,10 @@ use crate::storage::{
     },
     file::item::ArchivedItem,
 };
+use crate::trace::ord::vec::wset_batch::VecWSetBuilder;
+use crate::trace::{
+    BatchFactories, Builder, VecIndexedWSet, VecIndexedWSetFactories, VecWSet, VecWSetFactories,
+};
 use crate::{
     dynamic::{DataTrait, DeserializeDyn, Factory},
     storage::{
@@ -24,15 +30,19 @@ use crate::{
 };
 use binrw::{
     io::{self},
-    BinRead, Error as BinError,
+    BinRead,
 };
 use crc32c::crc32c;
 use fastbloom::BloomFilter;
+use feldera_storage::file::FileId;
 use feldera_storage::StoragePath;
 use futures::future::Either;
+use itertools::Itertools;
+use smallvec::{smallvec, SmallVec};
 use snap::raw::{decompress_len, Decoder};
-use std::any::Any;
+use std::collections::{BTreeMap, VecDeque};
 use std::mem::replace;
+use std::sync::mpsc::{self, channel, Receiver, Sender};
 use std::time::Instant;
 use std::{
     cmp::{
@@ -46,6 +56,7 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error as ThisError;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// Any kind of error encountered reading a layer file.
 #[derive(ThisError, Clone, Debug)]
@@ -70,12 +81,6 @@ pub enum Error {
     /// The invocation is not supported.
     #[error("The requested operation is not supported.")]
     Unsupported,
-}
-
-impl From<BinError> for Error {
-    fn from(source: BinError) -> Self {
-        Error::Corruption(source.into())
-    }
 }
 
 impl From<io::Error> for Error {
@@ -119,11 +124,17 @@ pub enum CorruptionError {
     },
 
     /// [`mod@binrw`] reported a format violation.
-    #[error("Binary read/write error: {0}")]
-    Binrw(
+    #[error("Binary read/write error reading {block_type} block ({location}): {inner}")]
+    Binrw {
+        /// Block location.
+        location: BlockLocation,
+
+        /// Block type.
+        block_type: &'static str,
+
         /// Underlying error.
-        String,
-    ),
+        inner: String,
+    },
 
     /// Array overflows block bounds.
     #[error("{count}-element array of {each}-byte elements starting at offset {offset} within block overflows {block_size}-byte block")]
@@ -302,12 +313,6 @@ pub enum CorruptionError {
     InvalidFilterLocation(InvalidBlockLocation),
 }
 
-impl From<BinError> for CorruptionError {
-    fn from(value: BinError) -> Self {
-        CorruptionError::Binrw(value.to_string())
-    }
-}
-
 #[derive(Clone, Debug)]
 struct VarintReader {
     varint: Varint,
@@ -450,10 +455,6 @@ where
     fn cost(&self) -> usize {
         size_of::<Self>() + self.raw.capacity()
     }
-
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
-    }
 }
 
 struct DataBlockReader<'a> {
@@ -497,9 +498,7 @@ impl<'a> DataBlockReader<'a> {
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
-        let data_block = Arc::downcast::<DataBlock<K, A>>(cache_entry.as_any())
-            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(self.node.location)))?;
-
+        let data_block = DataBlock::from_cache_entry(cache_entry, self.node.location)?;
         self.file
             .stats
             .record(self.access, self.start.elapsed(), self.node.location);
@@ -527,7 +526,14 @@ where
         location: BlockLocation,
         first_row: u64,
     ) -> Result<Self, Error> {
-        let header = DataBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice()))?;
+        let header =
+            DataBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "data",
+                    inner: e.to_string(),
+                })
+            })?;
         Ok(Self {
             location,
             value_map: ValueMapReader::new(
@@ -547,17 +553,33 @@ where
             _phantom: PhantomData,
         })
     }
-
+    pub(super) fn from_raw_with_cache(
+        raw: Arc<FBuf>,
+        node: &TreeNode,
+        cache: &BufferCache,
+        file_id: FileId,
+    ) -> Result<Arc<Self>, Error> {
+        let block = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
+        cache.insert(file_id, node.location.offset, block.clone(), false);
+        Ok(block)
+    }
+    fn from_cache_entry(
+        cache_entry: Arc<dyn CacheEntry>,
+        location: BlockLocation,
+    ) -> Result<Arc<Self>, Error> {
+        cache_entry
+            .downcast()
+            .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))
+    }
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         match DataBlockReader::new(file, node)? {
             Either::Left(data_block_reader) => {
-                let raw = file.read_blocking(node.location)?;
-                let entry = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
-                data_block_reader.cache.insert(
+                let entry = Self::from_raw_with_cache(
+                    file.read_blocking(node.location)?,
+                    node,
+                    &data_block_reader.cache,
                     file.file_handle.file_id(),
-                    node.location.offset,
-                    entry.clone(),
-                );
+                )?;
                 data_block_reader.complete(entry)
             }
             Either::Right(data_block) => Ok(data_block),
@@ -572,13 +594,17 @@ where
             Either::Left(data_block_reader) => {
                 let compression = file.compression;
                 let entry = context
-                    .read(node.location, move |raw| {
-                        Ok(Arc::new(Self::from_raw(
-                            decompress(compression, node.location, raw)?,
-                            node.location,
-                            node.rows.start,
-                        )?))
-                    })
+                    .read(
+                        node.location,
+                        move |raw| {
+                            Ok(Arc::new(Self::from_raw(
+                                decompress(compression, node.location, raw)?,
+                                node.location,
+                                node.rows.start,
+                            )?))
+                        },
+                        false,
+                    )
                     .await?;
                 data_block_reader.complete(entry)
             }
@@ -592,8 +618,7 @@ where
     fn rows(&self) -> Range<u64> {
         self.first_row..(self.first_row + self.n_values() as u64)
     }
-    fn row_group(&self, row: u64) -> Result<Range<u64>, Error> {
-        let index = (row - self.first_row) as usize;
+    fn row_group(&self, index: usize) -> Result<Range<u64>, Error> {
         let row_groups = self.row_groups.as_ref().unwrap();
         let start = row_groups.get(&self.raw, index);
         let end = row_groups.get(&self.raw, index + 1);
@@ -608,6 +633,10 @@ where
             }
             .into())
         }
+    }
+    fn row_group_for_row(&self, row: u64) -> Result<Range<u64>, Error> {
+        let index = (row - self.first_row) as usize;
+        self.row_group(index)
     }
     unsafe fn archived_item(
         &self,
@@ -673,7 +702,7 @@ where
             let mut start = (max(block_rows.start, target_rows.start) - self.first_row) as usize;
             let mut end = (min(block_rows.end, target_rows.end) - self.first_row) as usize;
             while start < end {
-                let mid = (start + end) / 2;
+                let mid = start.midpoint(end);
                 self.key(factories, mid, key);
                 let cmp = compare(key);
 
@@ -703,6 +732,26 @@ where
         C: Fn(&K) -> Ordering,
     {
         self.find_best_match(factories, target_rows, compare, Equal)
+    }
+
+    unsafe fn find_next(
+        &self,
+        factories: &Factories<K, A>,
+        tmp: &mut K,
+        target: &K,
+        start: &mut usize,
+    ) -> Option<usize> {
+        let mut end = self.n_values();
+        while *start < end {
+            let mid = start.midpoint(end);
+            self.key(factories, mid, tmp);
+            match target.cmp(tmp) {
+                Less => end = mid,
+                Equal => return Some(mid),
+                Greater => *start = mid + 1,
+            };
+        }
+        None
     }
 
     /// Returns the comparison of the key in `row` using `compare`.
@@ -740,21 +789,72 @@ where
 /// `_blocking`. Thus, an `async` function should not call a `_blocking`
 /// function.
 #[derive(Clone, Debug)]
-struct TreeNode {
-    location: BlockLocation,
-    node_type: NodeType,
-    rows: Range<u64>,
+pub(super) struct TreeNode {
+    pub location: BlockLocation,
+    pub node_type: NodeType,
+    pub rows: Range<u64>,
 }
 
 impl TreeNode {
-    fn read_blocking<K, A>(self, file: &ImmutableFileRef) -> Result<TreeBlock<K, A>, Error>
+    fn read_blocking<K, A>(&self, file: &ImmutableFileRef) -> Result<TreeBlock<K, A>, Error>
     where
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
         match self.node_type {
-            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new_blocking(file, &self)?)),
-            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new_blocking(file, &self)?)),
+            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new_blocking(file, self)?)),
+            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new_blocking(file, self)?)),
+        }
+    }
+    fn read_blocking_multiple<K, A, const N: usize>(
+        mut nodes: SmallVec<[TreeNode; N]>,
+        file: &ImmutableFileRef,
+    ) -> Result<TreeBlock<K, A>, Error>
+    where
+        K: DataTrait + ?Sized,
+        A: DataTrait + ?Sized,
+    {
+        if nodes.len() > 1 {
+            let cache = (file.cache)();
+            let mut missing =
+                cache.missing(&*file.file_handle, nodes.iter().map(|node| node.location));
+            if (missing & 1) == 0 {
+                return nodes[0].read_blocking(file);
+            }
+            if missing != 0 {
+                let mut retval = if (missing & 1) == 0 {
+                    Some(nodes[0].read_blocking(file)?)
+                } else {
+                    None
+                };
+                nodes.retain(|_| {
+                    let retain = (missing & 1) != 0;
+                    missing >>= 1;
+                    retain
+                });
+                let (sender, receiver) = mpsc::channel();
+                file.file_handle.read_async(
+                    nodes.iter().map(|node| node.location).collect(),
+                    Box::new(move |result| sender.send(result).unwrap()),
+                );
+                for (result, node) in receiver.recv().unwrap().into_iter().zip(nodes.iter()) {
+                    let raw = decompress(file.compression, node.location, result?)?;
+                    let entry = TreeBlock::from_raw_with_cache(
+                        raw,
+                        node,
+                        &cache,
+                        file.file_handle.file_id(),
+                    )?;
+                    if retval.is_none() {
+                        retval = Some(entry);
+                    }
+                }
+                Ok(retval.unwrap())
+            } else {
+                nodes[0].read_blocking(file)
+            }
+        } else {
+            nodes[0].read_blocking(file)
         }
     }
     async fn read_async<K, A>(
@@ -787,20 +887,61 @@ where
     K: DataTrait + ?Sized,
     A: DataTrait + ?Sized,
 {
+    fn from_cache(
+        node: &TreeNode,
+        cache: &BufferCache,
+        file: &dyn FileReader,
+    ) -> Result<Option<Self>, Error> {
+        match cache.get(file, node.location) {
+            Some(cache_entry) => match node.node_type {
+                NodeType::Data => Ok(Some(Self::Data(DataBlock::from_cache_entry(
+                    cache_entry,
+                    node.location,
+                )?))),
+                NodeType::Index => Ok(Some(Self::Index(IndexBlock::from_cache_entry(
+                    cache_entry,
+                    node.location,
+                )?))),
+            },
+            None => Ok(None),
+        }
+    }
+
+    pub(super) fn from_raw_with_cache(
+        raw: Arc<FBuf>,
+        node: &TreeNode,
+        cache: &BufferCache,
+        file_id: FileId,
+    ) -> Result<Self, Error> {
+        match node.node_type {
+            NodeType::Data => Ok(Self::Data(DataBlock::from_raw_with_cache(
+                raw, node, cache, file_id,
+            )?)),
+            NodeType::Index => Ok(Self::Index(IndexBlock::from_raw_with_cache(
+                raw, node, cache, file_id,
+            )?)),
+        }
+    }
+
     fn lookup_row(&self, row: u64) -> Result<Option<TreeNode>, Error> {
+        self.lookup_row_and_successors::<1>(row)
+            .map(|mut vec| vec.pop())
+    }
+
+    fn lookup_row_and_successors<const N: usize>(
+        &self,
+        row: u64,
+    ) -> Result<SmallVec<[TreeNode; N]>, Error> {
         match self {
             Self::Data(data_block) => {
                 if data_block.rows().contains(&row) {
-                    return Ok(None);
+                    Ok(SmallVec::new())
+                } else {
+                    Err(CorruptionError::MissingRow(row).into())
                 }
             }
-            Self::Index(index_block) => {
-                if let Some(child_node) = index_block.get_child_by_row(row)? {
-                    return Ok(Some(child_node));
-                }
-            }
+            Self::Index(index_block) => Ok(index_block.get_children_by_row(row)?),
         }
-        Err(CorruptionError::MissingRow(row).into())
     }
 }
 
@@ -832,9 +973,6 @@ where
 {
     fn cost(&self) -> usize {
         size_of::<Self>() + self.raw.capacity()
-    }
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
     }
 }
 
@@ -877,8 +1015,7 @@ impl<'a> IndexBlockReader<'a> {
     where
         K: DataTrait + ?Sized,
     {
-        let index_block = Arc::downcast::<IndexBlock<K>>(cache_entry.as_any())
-            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(self.node.location)))?;
+        let index_block = IndexBlock::from_cache_entry(cache_entry, self.node.location)?;
         if index_block.first_row != self.node.rows.start {
             return Err(Error::Corruption(CorruptionError::MultiplePaths(
                 self.node.location,
@@ -913,7 +1050,14 @@ where
         location: BlockLocation,
         first_row: u64,
     ) -> Result<Self, Error> {
-        let header = IndexBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice()))?;
+        let header =
+            IndexBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "index",
+                    inner: e.to_string(),
+                })
+            })?;
         if header.n_children == 0 {
             return Err(CorruptionError::EmptyIndex(location).into());
         }
@@ -964,17 +1108,34 @@ where
             _phantom: PhantomData,
         })
     }
+    pub(super) fn from_raw_with_cache(
+        raw: Arc<FBuf>,
+        node: &TreeNode,
+        cache: &BufferCache,
+        file_id: FileId,
+    ) -> Result<Arc<Self>, Error> {
+        let block = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
+        cache.insert(file_id, node.location.offset, block.clone(), true);
+        Ok(block)
+    }
+    fn from_cache_entry(
+        cache_entry: Arc<dyn CacheEntry>,
+        location: BlockLocation,
+    ) -> Result<Arc<Self>, Error> {
+        cache_entry
+            .downcast()
+            .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))
+    }
 
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         match IndexBlockReader::new(file, node)? {
             Either::Left(index_block_reader) => {
-                let raw = file.read_blocking(node.location)?;
-                let entry = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
-                index_block_reader.cache.insert(
+                let entry = Self::from_raw_with_cache(
+                    file.read_blocking(node.location)?,
+                    &node,
+                    &index_block_reader.cache,
                     file.file_handle.file_id(),
-                    node.location.offset,
-                    entry.clone(),
-                );
+                )?;
                 index_block_reader.complete(entry)
             }
             Either::Right(index_block) => Ok(index_block),
@@ -989,13 +1150,17 @@ where
             Either::Left(index_block_reader) => {
                 let compression = file.compression;
                 let entry = context
-                    .read(node.location, move |raw| {
-                        Ok(Arc::new(Self::from_raw(
-                            decompress(compression, node.location, raw)?,
-                            node.location,
-                            node.rows.start,
-                        )?))
-                    })
+                    .read(
+                        node.location,
+                        move |raw| {
+                            Ok(Arc::new(Self::from_raw(
+                                decompress(compression, node.location, raw)?,
+                                node.location,
+                                node.rows.start,
+                            )?))
+                        },
+                        true,
+                    )
                     .await?;
                 index_block_reader.complete(entry)
             }
@@ -1029,10 +1194,22 @@ where
         })
     }
 
-    fn get_child_by_row(&self, row: u64) -> Result<Option<TreeNode>, Error> {
-        self.find_row(row)
-            .map(|child_idx| self.get_child(child_idx))
-            .transpose()
+    fn get_child_by_row(&self, row: u64) -> Result<TreeNode, Error> {
+        self.get_child(self.find_row(row)?)
+    }
+
+    fn get_children_by_row<const N: usize>(
+        &self,
+        row: u64,
+    ) -> Result<SmallVec<[TreeNode; N]>, Error> {
+        let mut nodes = SmallVec::new();
+        for index in self.find_row(row)?..self.n_children() {
+            if nodes.len() == nodes.inline_size() {
+                break;
+            }
+            nodes.push(self.get_child(index)?);
+        }
+        Ok(nodes)
     }
 
     fn get_rows(&self, index: usize) -> Range<u64> {
@@ -1055,35 +1232,25 @@ where
         }
     }
 
-    fn find_row(&self, row: u64) -> Option<usize> {
+    fn find_row(&self, row: u64) -> Result<usize, Error> {
         let mut indexes = 0..self.n_children();
         while !indexes.is_empty() {
-            let mid = (indexes.start + indexes.end) / 2;
+            let mid = indexes.start.midpoint(indexes.end);
             let rows = self.get_rows(mid);
             if row < rows.start {
                 indexes.end = mid;
             } else if row >= rows.end {
                 indexes.start = mid + 1;
             } else {
-                return Some(mid);
+                return Ok(mid);
             }
         }
-        None
+        Err(CorruptionError::MissingRow(row).into())
     }
 
     unsafe fn get_bound(&self, index: usize, bound: &mut K) {
         let offset = self.bounds.get(&self.raw, index) as usize;
         bound.deserialize_from_bytes(&self.raw, offset)
-    }
-
-    fn get_row_range(&self, child_idx: usize) -> Range<u64> {
-        let start = if child_idx > 0 {
-            self.row_totals.get(&self.raw, child_idx - 1)
-        } else {
-            0
-        } + self.first_row;
-        let end = self.row_totals.get(&self.raw, child_idx) + self.first_row;
-        start..end
     }
 
     unsafe fn find_exact<C>(
@@ -1103,8 +1270,8 @@ where
                 if start >= end {
                     break None;
                 }
-                let mid = (start + end) / 2;
-                let rows = self.get_row_range(mid);
+                let mid = start.midpoint(end);
+                let rows = self.get_rows(mid);
 
                 /// Compares `a` to `b` and reports their relationship.
                 fn compare_ranges(a: &Range<u64>, b: &Range<u64>) -> Case {
@@ -1222,7 +1389,7 @@ where
             let mut end = self.n_children() * 2;
             result = None;
             while start < end {
-                let mid = (start + end) / 2;
+                let mid = start.midpoint(end);
                 let row = self.get_row_bound(mid) + self.first_row;
                 let cmp = match range_compare(target_rows, row) {
                     Equal => {
@@ -1248,6 +1415,35 @@ where
         });
 
         result
+    }
+
+    unsafe fn find_next(
+        &self,
+        tmp_lower: &mut K,
+        tmp_upper: &mut K,
+        targets: &DynVec<K>,
+        mut target_indexes: Range<usize>,
+        start: &mut usize,
+    ) -> Option<(usize, usize)> {
+        let start_index = target_indexes.next().unwrap();
+        let mut end = self.n_children();
+        while *start < end {
+            let mid = start.midpoint(end);
+            self.get_bound(mid * 2, tmp_lower);
+            if &targets[start_index] < tmp_lower {
+                end = mid;
+            } else {
+                *start = mid + 1;
+                self.get_bound(mid * 2 + 1, tmp_upper);
+                if &targets[start_index] <= tmp_upper {
+                    let n = 1 + target_indexes
+                        .take_while(|i| &targets[*i] <= tmp_upper)
+                        .count();
+                    return Some((mid, n));
+                }
+            }
+        }
+        None
     }
 
     fn n_children(&self) -> usize {
@@ -1297,15 +1493,19 @@ impl CacheEntry for FileTrailer {
     fn cost(&self) -> usize {
         size_of::<FileTrailer>()
     }
-
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
-    }
 }
 
 impl FileTrailer {
-    fn from_raw(raw: Arc<FBuf>) -> Result<Self, Error> {
-        Ok(Self::read_le(&mut io::Cursor::new(raw.as_slice()))?)
+    fn from_raw(raw: Arc<FBuf>, location: BlockLocation) -> Result<Self, Error> {
+        Ok(
+            Self::read_le(&mut io::Cursor::new(raw.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "trailer",
+                    inner: e.to_string(),
+                })
+            })?,
+        )
     }
     fn new(
         cache: fn() -> Arc<BufferCache>,
@@ -1318,14 +1518,15 @@ impl FileTrailer {
         #[allow(clippy::borrow_deref_ref)]
         let (access, entry) = match cache.get(&*file_handle, location) {
             Some(entry) => {
-                let entry = Arc::downcast::<Self>(entry.as_any())
-                    .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(location)))?;
+                let entry = entry
+                    .downcast()
+                    .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))?;
                 (CacheAccess::Hit, entry)
             }
             None => {
                 let block = file_handle.read_block(location)?;
-                let entry = Arc::new(Self::from_raw(block)?);
-                cache.insert(file_handle.file_id(), location.offset, entry.clone());
+                let entry = Arc::new(Self::from_raw(block, location)?);
+                cache.insert(file_handle.file_id(), location.offset, entry.clone(), false);
                 (CacheAccess::Miss, entry)
             }
         };
@@ -1344,7 +1545,15 @@ struct Column {
 impl FilterBlock {
     fn new(file_handle: &dyn FileReader, location: BlockLocation) -> Result<Self, Error> {
         let block = file_handle.read_block(location)?;
-        Ok(Self::read_le(&mut io::Cursor::new(block.as_slice()))?)
+        Ok(
+            Self::read_le(&mut io::Cursor::new(block.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "filter",
+                    inner: e.to_string(),
+                })
+            })?,
+        )
     }
 }
 
@@ -1717,6 +1926,21 @@ where
         RowGroup::new(self, 0, 0..self.columns[0].n_rows)
     }
 
+    /// Returns a [`BulkRows`] for column 0.
+    pub fn bulk_rows(&self) -> Result<BulkRows<K, A, N, (&'static K, &'static A, N)>, Error> {
+        BulkRows::new(self, 0)
+    }
+
+    pub fn multifetch_zset<'a, 'b>(
+        &'a self,
+        keys: &'b DynVec<K>,
+    ) -> Result<MultifetchZSet<'a, 'b, K, A, N, (&'static K, &'static A, N)>, Error>
+    where
+        A: WeightTrait,
+    {
+        MultifetchZSet::new(self, keys)
+    }
+
     /// Returns an [AsyncRowGroup] for all of the rows in column 0.
     ///
     /// Use [Reader::new_async_context] to create `context`.
@@ -1728,6 +1952,21 @@ where
             row_group: self.rows(),
             context,
         }
+    }
+}
+
+impl<K0, A0, K1, A1> Reader<(&'static K0, &'static A0, (&'static K1, &'static A1, ()))>
+where
+    K0: DataTrait + ?Sized,
+    A0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
+{
+    pub fn multifetch_indexed_zset<'a, 'b>(
+        &'a self,
+        keys: &'b DynVec<K0>,
+    ) -> Result<MultifetchIndexedZSet<'a, 'b, K0, A0, K1, A1>, Error> {
+        MultifetchIndexedZSet::new(self, keys)
     }
 }
 
@@ -2367,10 +2606,10 @@ where
         row_group: &RowGroup<'_, K, A, N, T>,
         row: u64,
     ) -> Result<Self, Error> {
-        Self::for_row_from_ancestor_blocking(
+        Self::for_row_from_ancestors_blocking::<_, 4>(
             row_group.reader,
             Vec::new(),
-            row_group.root_node().unwrap(),
+            smallvec![row_group.root_node().unwrap()],
             row,
         )
     }
@@ -2387,24 +2626,44 @@ where
         )
         .await
     }
-    fn for_row_from_ancestor_blocking<T>(
+    fn for_row_from_ancestors_blocking<T, const N: usize>(
         reader: &Reader<T>,
         mut indexes: Vec<Arc<IndexBlock<K>>>,
-        mut node: TreeNode,
+        nodes: SmallVec<[TreeNode; N]>,
         row: u64,
     ) -> Result<Self, Error> {
-        loop {
-            let block = node.read_blocking(&reader.file)?;
-            let next = block.lookup_row(row)?;
-            match block {
-                TreeBlock::Data(data) => {
-                    return Ok(Self { row, indexes, data });
+        match ThreadType::current() {
+            ThreadType::Background => {
+                let mut block = TreeNode::read_blocking_multiple(nodes, &reader.file)?;
+                loop {
+                    let next = block.lookup_row_and_successors::<N>(row)?;
+                    match block {
+                        TreeBlock::Data(data) => {
+                            return Ok(Self { row, indexes, data });
+                        }
+                        TreeBlock::Index(index) => {
+                            push_index_block(&mut indexes, index)?;
+                        }
+                    };
+                    block = TreeNode::read_blocking_multiple(next, &reader.file)?;
                 }
-                TreeBlock::Index(index) => {
-                    push_index_block(&mut indexes, index)?;
+            }
+            ThreadType::Foreground => {
+                let mut node = nodes.into_iter().next().unwrap();
+                loop {
+                    let block = node.read_blocking(&reader.file)?;
+                    let next = block.lookup_row(row)?;
+                    match block {
+                        TreeBlock::Data(data) => {
+                            return Ok(Self { row, indexes, data });
+                        }
+                        TreeBlock::Index(index) => {
+                            push_index_block(&mut indexes, index)?;
+                        }
+                    };
+                    node = next.unwrap();
                 }
-            };
-            node = next.unwrap();
+            }
         }
     }
     async fn for_row_from_ancestor_async(
@@ -2428,8 +2687,29 @@ where
     }
     fn find_ancestor(&self, row: u64) -> Result<(TreeNode, Vec<Arc<IndexBlock<K>>>), Error> {
         for (idx, index_block) in self.indexes.iter().enumerate().rev() {
-            if let Some(node) = index_block.get_child_by_row(row)? {
-                return Ok((node, self.indexes[0..=idx].to_vec()));
+            match index_block.get_child_by_row(row) {
+                Ok(node) => return Ok((node, self.indexes[0..=idx].to_vec())),
+                Err(Error::Corruption(CorruptionError::MissingRow(_))) => {
+                    // Ignore this because: we're moving upward looking until we
+                    // find `row`, and we just haven't found it yet.
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(CorruptionError::MissingRow(row).into())
+    }
+    fn find_ancestors<const N: usize>(
+        &self,
+        row: u64,
+    ) -> Result<(SmallVec<[TreeNode; N]>, Vec<Arc<IndexBlock<K>>>), Error> {
+        for (idx, index_block) in self.indexes.iter().enumerate().rev() {
+            match index_block.get_children_by_row(row) {
+                Ok(nodes) => return Ok((nodes, self.indexes[0..=idx].to_vec())),
+                Err(Error::Corruption(CorruptionError::MissingRow(_))) => {
+                    // Ignore this because: we're moving upward looking until we
+                    // find `row`, and we just haven't found it yet.
+                }
+                Err(error) => return Err(error),
             }
         }
         Err(CorruptionError::MissingRow(row).into())
@@ -2449,7 +2729,12 @@ where
             });
         }
         let (node, indexes) = hint.find_ancestor(row)?;
-        Self::for_row_from_ancestor_blocking(row_group.reader, indexes, node, row)
+        Self::for_row_from_ancestors_blocking::<_, 4>(
+            row_group.reader,
+            indexes,
+            smallvec![node],
+            row,
+        )
     }
     async fn for_row_from_hint_async<N, T>(
         row_group: &AsyncRowGroup<'_, K, A, N, T>,
@@ -2489,14 +2774,14 @@ where
     }
 
     fn row_group(&self) -> Result<Range<u64>, Error> {
-        self.data.row_group(self.row)
+        self.data.row_group_for_row(self.row)
     }
     fn move_to_row_blocking<T>(&mut self, reader: &Reader<T>, row: u64) -> Result<(), Error> {
         if self.data.rows().contains(&row) {
             self.row = row;
         } else {
-            let (ancestor, indexes) = self.find_ancestor(row)?;
-            *self = Self::for_row_from_ancestor_blocking(reader, indexes, ancestor, row)?;
+            let (ancestors, indexes) = self.find_ancestors::<4>(row)?;
+            *self = Self::for_row_from_ancestors_blocking(reader, indexes, ancestors, row)?;
         }
         Ok(())
     }
@@ -2768,12 +3053,12 @@ where
         for index in &self.indexes {
             let n = index.n_children();
             match index.find_row(self.row) {
-                Some(i) => {
+                Ok(i) => {
                     let min_row = index.get_row_bound(i * 2);
                     let max_row = index.get_row_bound(i * 2 + 1);
                     write!(f, "\n[child {i} of {n}: rows {min_row}..={max_row}]",)?;
                 }
-                None => {
+                Err(_) => {
                     // This should not be possible because it indicates an
                     // invariant violation.  Possibly we should panic.
                     write!(f, " [unknown child of {n}]")?
@@ -3454,5 +3739,1579 @@ where
             ),
             context: self.row_group.context,
         })
+    }
+}
+
+struct BulkRead {
+    node: TreeNode,
+    level: usize,
+}
+
+struct BulkReadResults {
+    reads: Vec<BulkRead>,
+    results: Vec<Result<Arc<FBuf>, StorageError>>,
+}
+
+/// Reads all of the data in a column in order.
+///
+/// `BulkRows` provides non-blocking access to all of the data in a [Reader]
+/// column.  It does all of the I/O asynchronously with heavy readahead.
+pub struct BulkRows<'a, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+{
+    reader: &'a Reader<T>,
+    cache: Arc<BufferCache>,
+    factories: Factories<K, A>,
+    column: usize,
+    row: u64,
+    n_rows: u64,
+
+    receiver: Receiver<BulkReadResults>,
+    sender: Sender<BulkReadResults>,
+
+    /// If nonempty, then:
+    /// - `data_blocks[0]` contains `row`.
+    /// - `data_blocks[1..]` are subsequent blocks.
+    data_blocks: VecDeque<Arc<DataBlock<K, A>>>,
+
+    /// First row in the next block to be added to `data_blocks`.  If
+    /// `data_blocks` is nonempty, then this is
+    /// `data_blocks.last().unwrap().first_row`.
+    next_data: u64,
+
+    /// Blocks that have been received out of order.  They will be moved to
+    /// `blocks` when `next_data` catches up to their starting row.
+    out_of_order_data: BTreeMap<u64, Arc<DataBlock<K, A>>>,
+
+    data_pending: usize,
+
+    indexes: Vec<IndexLevel<K>>,
+    _phantom: PhantomData<fn(&K, &A, N)>,
+}
+
+impl<'a, K, A, N, T> Debug for BulkRows<'a, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+    T: ColumnSpec,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(
+            f,
+            "BulkRows {{ row: {}, n_rows: {}, n_readable: {} }}",
+            self.row,
+            self.n_rows,
+            self.n_readable()
+        )
+    }
+}
+
+impl<'a, K, A, NK, NA, NN, T> BulkRows<'a, K, A, (&'static NK, &'static NA, NN), T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+    NK: DataTrait + ?Sized,
+    NA: DataTrait + ?Sized,
+    T: ColumnSpec,
+{
+    /// Returns a [BulkRows] for the next column.
+    pub fn next_column<'b>(&'b self) -> Result<BulkRows<'a, NK, NA, NN, T>, Error> {
+        BulkRows::new(&self.reader, self.column + 1)
+    }
+}
+
+#[allow(missing_docs)]
+impl<'a, K, A, N, T> BulkRows<'a, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+    T: ColumnSpec,
+{
+    fn new(reader: &'a Reader<T>, column: usize) -> Result<Self, Error> {
+        let (sender, receiver) = channel();
+        let mut this = Self {
+            reader,
+            cache: (reader.file.cache)(),
+            factories: reader.columns[column].factories.factories(),
+            column,
+            row: 0,
+            sender,
+            receiver,
+            n_rows: reader.columns[column].n_rows,
+            indexes: Vec::new(),
+            data_blocks: VecDeque::new(),
+            next_data: 0,
+            out_of_order_data: BTreeMap::new(),
+            data_pending: 0,
+            _phantom: PhantomData,
+        };
+        if let Some(node) = &reader.columns[column].root {
+            let reads = this.start_block_read(&node, 0)?.into_iter().collect();
+            this.work_(reads)?;
+        }
+        Ok(this)
+    }
+
+    fn start_index_read(
+        &mut self,
+        node: &TreeNode,
+        level: usize,
+    ) -> Result<Option<BulkRead>, Error> {
+        if level >= self.indexes.len() {
+            self.indexes.push(IndexLevel::new());
+        }
+        self.indexes[level].pending += 1;
+        if let Some(cache_entry) = self
+            .cache
+            .get(&*self.reader.file.file_handle, node.location)
+        {
+            self.indexes[level].received(IndexBlock::from_cache_entry(cache_entry, node.location)?);
+            Ok(None)
+        } else {
+            Ok(Some(BulkRead {
+                node: node.clone(),
+                level,
+            }))
+        }
+    }
+
+    fn start_data_read(&mut self, node: &TreeNode) -> Result<Option<BulkRead>, Error> {
+        self.data_pending += 1;
+        if let Some(cache_entry) = self
+            .cache
+            .get(&*self.reader.file.file_handle, node.location)
+        {
+            self.received_data(DataBlock::from_cache_entry(cache_entry, node.location)?);
+            Ok(None)
+        } else {
+            Ok(Some(BulkRead {
+                node: node.clone(),
+                level: 0,
+            }))
+        }
+    }
+
+    fn start_block_read(
+        &mut self,
+        node: &TreeNode,
+        level: usize,
+    ) -> Result<Option<BulkRead>, Error> {
+        match node.node_type {
+            NodeType::Data => self.start_data_read(node),
+            NodeType::Index => self.start_index_read(node, level),
+        }
+    }
+
+    fn process_read_results(&mut self, read_results: BulkReadResults) -> Result<(), Error> {
+        for (BulkRead { node, level }, result) in read_results
+            .reads
+            .into_iter()
+            .zip(read_results.results.into_iter())
+        {
+            let raw = decompress(self.reader.file.compression, node.location, result?)?;
+            let file_id = self.reader.file.file_handle.file_id();
+            let tree_block = TreeBlock::from_raw_with_cache(raw, &node, &self.cache, file_id)?;
+            match tree_block {
+                TreeBlock::Data(data_block) => self.received_data(data_block),
+                TreeBlock::Index(index_block) => self.indexes[level].received(index_block),
+            }
+        }
+        Ok(())
+    }
+
+    /// Initiates and continues background work for reading data in this column.
+    /// This must be called periodically to keep data flowing.  It limits the
+    /// amount of data buffered beyond the current read point.
+    pub fn work(&mut self) -> Result<(), Error> {
+        self.work_(Vec::new())
+    }
+
+    fn work_(&mut self, mut reads: Vec<BulkRead>) -> Result<(), Error> {
+        // First, catch up on all completed reads.
+        while let Ok(read_results) = self.receiver.try_recv() {
+            self.process_read_results(read_results)?;
+        }
+
+        // Then schedule more reads.
+        let mut level = 0;
+        while level < self.indexes.len() {
+            while let Some(node) = self.indexes[level].child()? {
+                if self.is_level_full(node.node_type, level + 1) {
+                    break;
+                }
+                self.indexes[level].next_child();
+                if let Some(read) = self.start_block_read(&node, level + 1)? {
+                    reads.push(read);
+                }
+            }
+            level += 1;
+        }
+
+        if !reads.is_empty() {
+            self.reader.file.file_handle.read_async(
+                reads.iter().map(|read| read.node.location).collect(),
+                {
+                    let sender = self.sender.clone();
+                    Box::new(move |results| {
+                        let _ = sender.send(BulkReadResults { reads, results });
+                    })
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    fn is_level_full(&self, node_type: NodeType, level: usize) -> bool {
+        match node_type {
+            NodeType::Data => {
+                self.data_pending + self.data_blocks.len() + self.out_of_order_data.len() >= 100
+            }
+            NodeType::Index => self
+                .indexes
+                .get(level)
+                .is_some_and(|child| child.is_full(level)),
+        }
+    }
+
+    /// Adds `block` to the collection of data blocks.
+    fn received_data(&mut self, block: Arc<DataBlock<K, A>>) {
+        self.data_pending -= 1;
+        if block.first_row == self.next_data {
+            self.next_data = block.rows().end;
+            self.data_blocks.push_back(block);
+            while let Some(entry) = self.out_of_order_data.first_entry() {
+                if *entry.key() != self.next_data {
+                    break;
+                }
+                let block = entry.remove();
+                self.next_data = block.rows().end;
+                self.data_blocks.push_back(block);
+            }
+        } else if block.first_row > self.next_data {
+            self.out_of_order_data.insert(block.first_row, block);
+        } else {
+            // File corruption or (more likely) a bug.
+            todo!()
+        }
+    }
+
+    pub fn n_readable(&self) -> usize {
+        self.data_blocks
+            .back()
+            .map_or(0, |last| last.rows().end - self.row) as usize
+    }
+
+    pub fn at_eof(&self) -> bool {
+        self.row >= self.n_rows
+    }
+
+    pub fn is_readable(&self) -> bool {
+        !self.data_blocks.is_empty()
+    }
+
+    pub fn wait(&mut self) -> Result<(), Error> {
+        if self.at_eof() {
+            return Ok(());
+        }
+
+        while !self.is_readable() {
+            // Process received blocks and schedule block reads.  The latter is
+            // particularly important on the first loop iteration, since the
+            // caller might have read all of the rows without ever calling
+            // `work` to schedule more block reads.
+            self.work()?;
+            if self.is_readable() {
+                break;
+            }
+
+            // Nothing is readable, and we're not at the end, so there must be
+            // pending reads.  Wait until one completes, and process it.
+            debug_assert!(self.pending());
+            self.process_read_results(self.receiver.recv().unwrap())?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether we're waiting on any block reads.
+    #[allow(dead_code)]
+    fn pending(&self) -> bool {
+        self.data_pending > 0 || self.indexes.iter().any(|level| level.pending > 0)
+    }
+
+    /// Returns the key in the current row, or `None` if we're at EOF or this
+    /// row isn't readable yet.
+    ///
+    /// # Safety
+    ///
+    /// Unsafe because `rkyv` deserialization is unsafe.
+    pub unsafe fn key<'b>(&self, key: &'b mut K) -> Option<&'b mut K> {
+        self.data_blocks.front().map(|block| {
+            block.key_for_row(&self.factories, self.row, key);
+            key
+        })
+    }
+
+    /// Returns the auxiliary data in the current row, or `None` if we're at EOF
+    /// or this row isn't readable yet.
+    ///
+    /// # Safety
+    ///
+    /// Unsafe because `rkyv` deserialization is unsafe.
+    pub unsafe fn aux<'b>(&self, aux: &'b mut A) -> Option<&'b mut A> {
+        self.data_blocks.front().map(|block| {
+            block.aux_for_row(&self.factories, self.row, aux);
+            aux
+        })
+    }
+
+    pub unsafe fn item<'b>(&self, item: (&'b mut K, &'b mut A)) -> Option<(&'b mut K, &'b mut A)> {
+        self.data_blocks.front().map(|block| {
+            block.item_for_row(&self.factories, self.row, (item.0, item.1));
+            item
+        })
+    }
+
+    pub fn row_group(&self) -> Result<Option<Range<u64>>, Error> {
+        self.data_blocks
+            .front()
+            .map(|block| block.row_group_for_row(self.row))
+            .transpose()
+    }
+
+    pub fn row(&self) -> u64 {
+        self.row
+    }
+
+    pub fn n_rows(&self) -> u64 {
+        self.n_rows
+    }
+
+    pub fn step(&mut self) {
+        debug_assert!(self.data_blocks[0].rows().contains(&self.row));
+        self.row += 1;
+        if self.row >= self.data_blocks[0].rows().end {
+            self.data_blocks.pop_front();
+        }
+    }
+
+    pub fn step_to(&mut self, target_row: u64) -> bool {
+        debug_assert!(target_row >= self.row);
+        debug_assert!(target_row <= self.n_rows);
+        while target_row > self.row {
+            let Some(end) = self.data_blocks.front().map(|block| block.rows().end) else {
+                return false;
+            };
+            if target_row >= end {
+                self.row = end;
+                self.data_blocks.pop_front();
+            } else {
+                self.row = target_row;
+            }
+        }
+        true
+    }
+}
+
+struct IndexLevel<K>
+where
+    K: DataTrait + ?Sized,
+{
+    /// Number of outstanding block reads pending completion for this level.
+    pending: usize,
+
+    /// Sequential blocks whose children need to be loaded.
+    blocks: VecDeque<Arc<IndexBlock<K>>>,
+
+    index: usize,
+
+    /// First row in the next block to be added to `blocks`.  If `blocks` is
+    /// nonempty, then this is `blocks.last().unwrap().first_row`.
+    next: u64,
+
+    /// Blocks that have been received out of order.  They will be moved to
+    /// `blocks` when `next` catches up to their starting row.
+    out_of_order: BTreeMap<u64, Arc<IndexBlock<K>>>,
+}
+
+impl<K> IndexLevel<K>
+where
+    K: DataTrait + ?Sized,
+{
+    fn new() -> Self {
+        Self {
+            pending: 0,
+            blocks: VecDeque::new(),
+            index: 0,
+            next: 0,
+            out_of_order: BTreeMap::new(),
+        }
+    }
+
+    /// Adds `block` to the collection of blocks in this level.
+    fn received(&mut self, block: Arc<IndexBlock<K>>) {
+        debug_assert!(self.pending > 0);
+        self.pending -= 1;
+
+        if block.first_row == self.next {
+            self.next = block.rows().end;
+            self.blocks.push_back(block);
+            while let Some(entry) = self.out_of_order.first_entry() {
+                if *entry.key() != self.next {
+                    break;
+                }
+                let block = entry.remove();
+                self.next = block.rows().end;
+                self.blocks.push_back(block);
+            }
+        } else if block.first_row > self.next {
+            self.out_of_order.insert(block.first_row, block);
+        } else {
+            // File corruption or (more likely) a bug.
+            todo!()
+        }
+    }
+
+    /// Returns the next [TreeNode] to read in the level below this one, or
+    /// `None` if we've exhausted this level or there are none to read yet.
+    /// (Use [eof](Self::eof) to distinguish the meanings of `None`.)
+    fn child(&self) -> Result<Option<TreeNode>, Error> {
+        self.blocks
+            .front()
+            .map(|block| block.get_child(self.index))
+            .transpose()
+    }
+
+    fn next_child(&mut self) {
+        let block = self.blocks.front().unwrap();
+        self.index += 1;
+        if self.index >= block.n_children() {
+            self.blocks.pop_front();
+            self.index = 0;
+        }
+    }
+
+    fn is_full(&self, level: usize) -> bool {
+        self.pending + self.blocks.len() + self.out_of_order.len() >= 1 << level
+    }
+}
+
+pub struct MultifetchZSet<'a, 'b, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+{
+    reader: &'a Reader<T>,
+    keys: &'b DynVec<K>,
+    cache: Arc<BufferCache>,
+    factories: Factories<K, A>,
+
+    receiver: UnboundedReceiver<MultifetchZSetReadResults>,
+    sender: UnboundedSender<MultifetchZSetReadResults>,
+
+    tmp_key: Box<K>,
+    tmp_key2: Box<K>,
+
+    output_blocks: BTreeMap<u64, (Range<usize>, Arc<DataBlock<K, A>>)>,
+    pending: usize,
+
+    _phantom: PhantomData<fn(&N)>,
+}
+
+impl<'a, 'b, K, A, N, T> MultifetchZSet<'a, 'b, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: WeightTrait + ?Sized,
+    T: ColumnSpec,
+{
+    fn new(reader: &'a Reader<T>, keys: &'b DynVec<K>) -> Result<Self, Error> {
+        debug_assert!(keys.is_sorted_by(&|a, b| a.cmp(b)));
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let factories = reader.columns[0].factories.factories();
+        let tmp_key = factories.key_factory.default_box();
+        let tmp_key2 = factories.key_factory.default_box();
+        let mut this = Self {
+            reader,
+            keys,
+            cache: (reader.file.cache)(),
+            factories,
+            sender,
+            receiver,
+            tmp_key,
+            tmp_key2,
+            output_blocks: BTreeMap::new(),
+            pending: 0,
+            _phantom: PhantomData,
+        };
+        if !keys.is_empty() {
+            if let Some(node) = &reader.columns[0].root {
+                let mut reads = Vec::new();
+                this.try_read(
+                    MultifetchZSetRead::new(0..keys.len(), node.clone()),
+                    &mut reads,
+                )?;
+                this.start_reads(reads);
+            }
+        }
+        Ok(this)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.pending == 0
+    }
+
+    pub fn results(self, factories: VecWSetFactories<K, A>) -> VecWSet<K, A> {
+        debug_assert!(self.is_done());
+        let mut builder = VecWSetBuilder::<K, A>::new_builder(&factories);
+        let mut weighted_item = factories.weighted_item_factory().default_box();
+        let (kv, tmp_diff) = weighted_item.split_mut();
+        let (tmp_key, _val) = kv.split_mut();
+        for (key_range, data_block) in self.output_blocks.into_values() {
+            let mut start = 0;
+            for i in key_range {
+                let key = &self.keys[i];
+                if let Some(child_index) =
+                    unsafe { data_block.find_next(&self.factories, tmp_key, key, &mut start) }
+                {
+                    unsafe { data_block.aux(&self.factories, child_index, tmp_diff) };
+                    builder.push_val_diff(&(), tmp_diff);
+                    builder.push_key_mut(tmp_key);
+                }
+                if start >= data_block.n_values() {
+                    break;
+                }
+            }
+        }
+        builder.done()
+    }
+
+    pub async fn async_results(
+        mut self,
+        factories: VecWSetFactories<K, A>,
+    ) -> Result<VecWSet<K, A>, Error> {
+        while !self.is_done() {
+            let mut reads = Vec::new();
+            let msg = self.receiver.recv().await.unwrap();
+            self.process_results(msg, &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(self.results(factories))
+    }
+
+    pub fn wait(&mut self) -> Result<(), Error> {
+        if !self.is_done() {
+            let mut reads = Vec::new();
+            let msg = self.receiver.blocking_recv().unwrap();
+            self.process_results(msg, &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(())
+    }
+
+    pub fn run(&mut self) -> Result<(), Error> {
+        self.run_(Vec::new())
+    }
+
+    fn run_(&mut self, mut reads: Vec<MultifetchZSetRead>) -> Result<(), Error> {
+        while let Ok(results) = self.receiver.try_recv() {
+            self.process_results(results, &mut reads)?;
+        }
+        self.start_reads(reads);
+        Ok(())
+    }
+
+    fn process_results(
+        &mut self,
+        results: MultifetchZSetReadResults,
+        reads: &mut Vec<MultifetchZSetRead>,
+    ) -> Result<(), Error> {
+        self.pending -= 1;
+        for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
+            let raw = result?;
+            let tree_block = TreeBlock::from_raw_with_cache(
+                decompress(self.reader.file.compression, read.node.location, raw)?,
+                &read.node,
+                &self.cache,
+                self.reader.file_handle().file_id(),
+            )
+            .unwrap();
+            self.process_read(&read.keys, tree_block, reads)?;
+        }
+        Ok(())
+    }
+
+    fn start_reads(&mut self, reads: Vec<MultifetchZSetRead>) {
+        if !reads.is_empty() {
+            self.reader.file.file_handle.read_async(
+                reads.iter().map(|read| read.node.location).collect(),
+                {
+                    let sender = self.sender.clone();
+                    Box::new(move |results| {
+                        let _ = sender.send(MultifetchZSetReadResults { reads, results });
+                    })
+                },
+            );
+            self.pending += 1;
+        }
+    }
+
+    fn try_read(
+        &mut self,
+        read: MultifetchZSetRead,
+        reads: &mut Vec<MultifetchZSetRead>,
+    ) -> Result<(), Error> {
+        if let Some(tree_block) =
+            TreeBlock::from_cache(&read.node, &self.cache, &*self.reader.file.file_handle).unwrap()
+        {
+            self.process_read(&read.keys, tree_block, reads)?;
+        } else {
+            reads.push(read);
+        }
+        Ok(())
+    }
+
+    fn process_read(
+        &mut self,
+        key_range: &Range<usize>,
+        tree_block: TreeBlock<K, A>,
+        reads: &mut Vec<MultifetchZSetRead>,
+    ) -> Result<(), Error> {
+        match tree_block {
+            TreeBlock::Data(data_block) => {
+                let _existing = self
+                    .output_blocks
+                    .insert(data_block.first_row, (key_range.clone(), data_block));
+                debug_assert!(_existing.is_none());
+            }
+            TreeBlock::Index(index_block) => {
+                let mut child_idx = 0;
+                let mut i = key_range.start;
+                while i < key_range.end {
+                    if let Some((child_index, n_keys)) = unsafe {
+                        index_block.find_next(
+                            &mut self.tmp_key,
+                            &mut self.tmp_key2,
+                            self.keys,
+                            i..key_range.end,
+                            &mut child_idx,
+                        )
+                    } {
+                        let read = MultifetchZSetRead::new(
+                            i..i + n_keys,
+                            index_block.get_child(child_index)?,
+                        );
+                        self.try_read(read, reads)?;
+                        i += n_keys;
+                    } else {
+                        i += 1;
+                    }
+                    if child_idx >= index_block.n_children() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct MultifetchZSetRead {
+    keys: Range<usize>,
+    node: TreeNode,
+}
+
+impl MultifetchZSetRead {
+    fn new(keys: Range<usize>, node: TreeNode) -> Self {
+        Self { keys, node }
+    }
+}
+
+struct MultifetchZSetReadResults {
+    reads: Vec<MultifetchZSetRead>,
+    results: Vec<Result<Arc<FBuf>, StorageError>>,
+}
+
+pub enum MultifetchIndexedZSet<'a, 'b, K0, A0, K1, A1>
+where
+    K0: DataTrait + ?Sized,
+    A0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
+{
+    Column0(
+        Option<
+            Multifetch0<
+                'a,
+                'b,
+                K0,
+                A0,
+                (&'static K1, &'static A1, ()),
+                (&'static K0, &'static A0, (&'static K1, &'static A1, ())),
+            >,
+        >,
+    ),
+    Column1(
+        Multifetch1<'a, K0, K1, A1, (&'static K0, &'static A0, (&'static K1, &'static A1, ()))>,
+    ),
+}
+
+impl<'a, 'b, K0, A0, K1, A1> MultifetchIndexedZSet<'a, 'b, K0, A0, K1, A1>
+where
+    K0: DataTrait + ?Sized,
+    A0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
+{
+    fn new(
+        reader: &'a Reader<(&'static K0, &'static A0, (&'static K1, &'static A1, ()))>,
+        keys: &'b DynVec<K0>,
+    ) -> Result<Self, Error> {
+        Ok(Self::Column0(Some(Multifetch0::new(reader, keys)?)))
+    }
+
+    pub fn wait(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Column0(option0) => {
+                let inner0 = option0.as_mut().unwrap();
+                inner0.wait()?;
+                if inner0.is_done() {
+                    let inner0 = option0.take().unwrap();
+                    *self = Self::Column1(inner0.next_column()?);
+                }
+                Ok(())
+            }
+            Self::Column1(inner1) => inner1.wait(),
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        match self {
+            MultifetchIndexedZSet::Column0(option0) => option0.as_ref().unwrap().is_done(),
+            MultifetchIndexedZSet::Column1(multifetch1) => multifetch1.is_done(),
+        }
+    }
+
+    pub fn results(
+        self,
+        factories: VecIndexedWSetFactories<K0, K1, A1>,
+    ) -> VecIndexedWSet<K0, K1, A1> {
+        match self {
+            MultifetchIndexedZSet::Column0(_) => {
+                panic!("can't get results because MultifetchIndexedZSet is not done yet")
+            }
+            MultifetchIndexedZSet::Column1(multifetch1) => multifetch1.results(factories),
+        }
+    }
+
+    pub async fn async_results(
+        self,
+        factories: VecIndexedWSetFactories<K0, K1, A1>,
+    ) -> Result<VecIndexedWSet<K0, K1, A1>, Error> {
+        let multifetch1 = match self {
+            MultifetchIndexedZSet::Column0(option0) => {
+                let mut inner0 = option0.unwrap();
+                inner0.async_run().await?;
+                inner0.next_column()?
+            }
+            MultifetchIndexedZSet::Column1(multifetch1) => multifetch1,
+        };
+        multifetch1.async_results(factories).await
+    }
+}
+
+pub struct Multifetch0<'a, 'b, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+{
+    reader: &'a Reader<T>,
+    keys: &'b DynVec<K>,
+    cache: Arc<BufferCache>,
+    factories: Factories<K, A>,
+
+    receiver: UnboundedReceiver<Multifetch0ReadResults>,
+    sender: UnboundedSender<Multifetch0ReadResults>,
+
+    tmp_key: Box<K>,
+    tmp_key2: Box<K>,
+    output: Box<DynVec<K>>,
+    row_groups: Vec<Range<u64>>,
+
+    pending: usize,
+    _phantom: PhantomData<fn(&N)>,
+}
+
+impl<'a, 'b, K, A, N, T> Multifetch0<'a, 'b, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+    T: ColumnSpec,
+{
+    fn new(reader: &'a Reader<T>, keys: &'b DynVec<K>) -> Result<Self, Error> {
+        debug_assert!(keys.is_sorted_by(&|a, b| a.cmp(b)));
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let factories = reader.columns[0].factories.factories();
+        let output = factories.keys_factory.default_box();
+        let tmp_key = factories.key_factory.default_box();
+        let tmp_key2 = factories.key_factory.default_box();
+        let mut this = Self {
+            reader,
+            keys,
+            cache: (reader.file.cache)(),
+            factories,
+            sender,
+            receiver,
+            tmp_key,
+            tmp_key2,
+            output,
+            row_groups: Vec::new(),
+            pending: 0,
+            _phantom: PhantomData,
+        };
+        if !keys.is_empty() {
+            if let Some(node) = &reader.columns[0].root {
+                let mut reads = Vec::new();
+                this.try_read(
+                    Multifetch0Read::new(0..keys.len(), node.clone()),
+                    &mut reads,
+                )?;
+                this.start_reads(reads);
+            }
+        }
+        Ok(this)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.pending == 0
+    }
+
+    fn finish(&mut self) {
+        debug_assert!(self.is_done());
+        self.output.sort_unstable();
+        self.row_groups.sort_unstable_by_key(|rows| rows.start);
+    }
+
+    pub fn results(mut self) -> (Box<DynVec<K>>, Vec<Range<u64>>) {
+        self.finish();
+        (self.output, self.row_groups)
+    }
+
+    pub async fn async_run(&mut self) -> Result<(), Error> {
+        while !self.is_done() {
+            let mut reads = Vec::new();
+            let msg = self.receiver.recv().await.unwrap();
+            self.process_results(msg, &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(())
+    }
+
+    pub fn wait(&mut self) -> Result<(), Error> {
+        if !self.is_done() {
+            let mut reads = Vec::new();
+            let msg = self.receiver.blocking_recv().unwrap();
+            self.process_results(msg, &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(())
+    }
+
+    pub fn run(&mut self) -> Result<(), Error> {
+        self.run_(Vec::new())
+    }
+
+    fn run_(&mut self, mut reads: Vec<Multifetch0Read>) -> Result<(), Error> {
+        while let Ok(results) = self.receiver.try_recv() {
+            self.process_results(results, &mut reads)?;
+        }
+        self.start_reads(reads);
+        Ok(())
+    }
+
+    fn process_results(
+        &mut self,
+        results: Multifetch0ReadResults,
+        reads: &mut Vec<Multifetch0Read>,
+    ) -> Result<(), Error> {
+        self.pending -= 1;
+        for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
+            let raw = result?;
+            let tree_block = TreeBlock::from_raw_with_cache(
+                decompress(self.reader.file.compression, read.node.location, raw)?,
+                &read.node,
+                &self.cache,
+                self.reader.file_handle().file_id(),
+            )
+            .unwrap();
+            self.process_read(&read.keys, tree_block, reads)?;
+        }
+        Ok(())
+    }
+
+    fn start_reads(&mut self, reads: Vec<Multifetch0Read>) {
+        if !reads.is_empty() {
+            self.reader.file.file_handle.read_async(
+                reads.iter().map(|read| read.node.location).collect(),
+                {
+                    let sender = self.sender.clone();
+                    Box::new(move |results| {
+                        let _ = sender.send(Multifetch0ReadResults { reads, results });
+                    })
+                },
+            );
+            self.pending += 1;
+        }
+    }
+
+    fn try_read(
+        &mut self,
+        read: Multifetch0Read,
+        reads: &mut Vec<Multifetch0Read>,
+    ) -> Result<(), Error> {
+        if let Some(tree_block) =
+            TreeBlock::from_cache(&read.node, &self.cache, &*self.reader.file.file_handle).unwrap()
+        {
+            self.process_read(&read.keys, tree_block, reads)?;
+        } else {
+            reads.push(read);
+        }
+        Ok(())
+    }
+
+    fn process_read(
+        &mut self,
+        key_range: &Range<usize>,
+        tree_block: TreeBlock<K, A>,
+        reads: &mut Vec<Multifetch0Read>,
+    ) -> Result<(), Error> {
+        match tree_block {
+            TreeBlock::Data(data_block) => {
+                let mut start = 0;
+                for i in key_range.clone() {
+                    let key = &self.keys[i];
+                    if let Some(child_index) = unsafe {
+                        data_block.find_next(&self.factories, &mut self.tmp_key, key, &mut start)
+                    } {
+                        self.output.push_val(&mut self.tmp_key);
+                        if data_block.row_groups.is_some() {
+                            self.row_groups.push(data_block.row_group(child_index)?);
+                        }
+                    }
+                    if start >= data_block.n_values() {
+                        break;
+                    }
+                }
+            }
+            TreeBlock::Index(index_block) => {
+                let mut child_idx = 0;
+                let mut i = key_range.start;
+                while i < key_range.end {
+                    if let Some((child_index, n_keys)) = unsafe {
+                        index_block.find_next(
+                            &mut self.tmp_key,
+                            &mut self.tmp_key2,
+                            self.keys,
+                            i..key_range.end,
+                            &mut child_idx,
+                        )
+                    } {
+                        let read = Multifetch0Read::new(
+                            i..i + n_keys,
+                            index_block.get_child(child_index)?,
+                        );
+                        self.try_read(read, reads)?;
+                        i += n_keys;
+                    } else {
+                        i += 1;
+                    }
+                    if child_idx >= index_block.n_children() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct Multifetch0Read {
+    keys: Range<usize>,
+    node: TreeNode,
+}
+
+impl Multifetch0Read {
+    fn new(keys: Range<usize>, node: TreeNode) -> Self {
+        Self { keys, node }
+    }
+}
+
+struct Multifetch0ReadResults {
+    reads: Vec<Multifetch0Read>,
+    results: Vec<Result<Arc<FBuf>, StorageError>>,
+}
+
+#[derive(Debug)]
+struct Multifetch1Read {
+    keys: Rows,
+    node: TreeNode,
+}
+
+impl Multifetch1Read {
+    fn new(keys: Rows, node: TreeNode) -> Self {
+        Self { keys, node }
+    }
+}
+
+struct Multifetch1ReadResults {
+    reads: Vec<Multifetch1Read>,
+    results: Vec<Result<Arc<FBuf>, StorageError>>,
+}
+
+impl<'a, 'b, K, A, NK, NA, NN, T> Multifetch0<'a, 'b, K, A, (&'static NK, &'static NA, NN), T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+    NK: DataTrait + ?Sized,
+    NA: WeightTrait + ?Sized,
+    T: ColumnSpec,
+{
+    pub fn next_column(self) -> Result<Multifetch1<'a, K, NK, NA, T>, Error> {
+        Multifetch1::new(self)
+    }
+}
+
+pub struct Multifetch1<'a, K0, K1, A1, T>
+where
+    K0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
+{
+    reader: &'a Reader<T>,
+    cache: Arc<BufferCache>,
+    factories: Factories<K1, A1>,
+
+    receiver: UnboundedReceiver<Multifetch1ReadResults>,
+    sender: UnboundedSender<Multifetch1ReadResults>,
+
+    keys: Box<DynVec<K0>>,
+    offs: Vec<usize>,
+    vals: Box<DynVec<K1>>,
+    diffs: Box<DynVec<A1>>,
+
+    rows: Vec<Range<u64>>,
+
+    /// Next row to append to `vals` and `diffs`.
+    next_row: u64,
+
+    out_of_order: BTreeMap<u64, (Rows, Arc<DataBlock<K1, A1>>)>,
+
+    pending: usize,
+}
+
+impl<'a, K0, K1, A1, T> Multifetch1<'a, K0, K1, A1, T>
+where
+    K0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
+    T: ColumnSpec,
+{
+    fn new<'b, A0, N>(
+        mut source: Multifetch0<'a, 'b, K0, A0, (&'static K1, &'static A1, N), T>,
+    ) -> Result<Self, Error>
+    where
+        A0: DataTrait + ?Sized,
+    {
+        source.finish();
+
+        let factories = source.reader.columns[1].factories.factories();
+
+        let offs = {
+            let mut offs = Vec::with_capacity(source.row_groups.len() + 1);
+            offs.push(0);
+            for row_group in &source.row_groups {
+                offs.push(offs.last().unwrap() + (row_group.end - row_group.start) as usize);
+            }
+            offs
+        };
+
+        // Combine contiguous row groups.
+        //
+        // This could be done in-place with a little extra work.
+        let rows = source
+            .row_groups
+            .into_iter()
+            .coalesce(|x, y| {
+                if x.end == y.start {
+                    Ok(x.start..y.end)
+                } else {
+                    Err((x, y))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut this = Self {
+            reader: source.reader,
+            cache: source.cache,
+            keys: source.output,
+            offs,
+            vals: factories.keys_factory.default_box(),
+            diffs: factories.auxes_factory.default_box(),
+            next_row: rows.get(0).map_or(0, |range| range.start),
+            rows,
+            factories,
+            receiver,
+            sender,
+            out_of_order: BTreeMap::new(),
+            pending: 0,
+        };
+        if !this.rows.is_empty() {
+            if let Some(node) = &source.reader.columns[1].root {
+                let mut reads = Vec::new();
+                this.try_read(
+                    Multifetch1Read::new(Rows::new(&this.rows), node.clone()),
+                    &mut reads,
+                )?;
+                this.start_reads(reads);
+            }
+        }
+        Ok(this)
+    }
+
+    fn start_reads(&mut self, reads: Vec<Multifetch1Read>) {
+        if !reads.is_empty() {
+            self.reader.file.file_handle.read_async(
+                reads.iter().map(|read| read.node.location).collect(),
+                {
+                    let sender = self.sender.clone();
+                    Box::new(move |results| {
+                        let _ = sender.send(Multifetch1ReadResults { reads, results });
+                    })
+                },
+            );
+            self.pending += 1;
+        }
+    }
+    fn try_read(
+        &mut self,
+        read: Multifetch1Read,
+        reads: &mut Vec<Multifetch1Read>,
+    ) -> Result<(), Error> {
+        if let Some(tree_block) =
+            TreeBlock::from_cache(&read.node, &self.cache, &*self.reader.file.file_handle).unwrap()
+        {
+            self.process_read(read.keys, tree_block, reads)?;
+        } else {
+            reads.push(read);
+        }
+        Ok(())
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.pending == 0
+    }
+
+    pub fn results(
+        self,
+        factories: VecIndexedWSetFactories<K0, K1, A1>,
+    ) -> VecIndexedWSet<K0, K1, A1> {
+        debug_assert!(self.is_done());
+        VecIndexedWSet::from_parts(factories, self.keys, self.offs, self.vals, self.diffs)
+    }
+
+    pub async fn async_results(
+        mut self,
+        factories: VecIndexedWSetFactories<K0, K1, A1>,
+    ) -> Result<VecIndexedWSet<K0, K1, A1>, Error> {
+        while !self.is_done() {
+            let mut reads = Vec::new();
+            let msg = self.receiver.recv().await.unwrap();
+            self.process_results(msg, &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(self.results(factories))
+    }
+
+    pub fn wait(&mut self) -> Result<(), Error> {
+        if !self.is_done() {
+            let mut reads = Vec::new();
+            let msg = self.receiver.blocking_recv().unwrap();
+            self.process_results(msg, &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(())
+    }
+
+    pub fn run(&mut self) -> Result<(), Error> {
+        self.run_(Vec::new())
+    }
+
+    fn run_(&mut self, mut reads: Vec<Multifetch1Read>) -> Result<(), Error> {
+        while let Ok(results) = self.receiver.try_recv() {
+            self.process_results(results, &mut reads)?;
+        }
+        self.start_reads(reads);
+        Ok(())
+    }
+
+    fn process_results(
+        &mut self,
+        results: Multifetch1ReadResults,
+        reads: &mut Vec<Multifetch1Read>,
+    ) -> Result<(), Error> {
+        self.pending -= 1;
+        for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
+            let raw = result?;
+            let tree_block = TreeBlock::from_raw_with_cache(
+                decompress(self.reader.file.compression, read.node.location, raw)?,
+                &read.node,
+                &self.cache,
+                self.reader.file_handle().file_id(),
+            )
+            .unwrap();
+            self.process_read(read.keys, tree_block, reads)?;
+        }
+        Ok(())
+    }
+
+    fn process_data_block(&mut self, rows: Rows, data_block: Arc<DataBlock<K1, A1>>) {
+        for row in rows.iter(&self.rows) {
+            self.vals
+                .push_with(&mut |val| unsafe { data_block.key_for_row(&self.factories, row, val) });
+            self.diffs.push_with(&mut |diff| unsafe {
+                data_block.aux_for_row(&self.factories, row, diff)
+            });
+        }
+        self.next_row = Rows::next(&self.rows, data_block.rows().end);
+    }
+
+    fn process_read(
+        &mut self,
+        mut rows: Rows,
+        tree_block: TreeBlock<K1, A1>,
+        reads: &mut Vec<Multifetch1Read>,
+    ) -> Result<(), Error> {
+        match tree_block {
+            TreeBlock::Data(data_block) => {
+                let first_row = rows.first(&self.rows).unwrap();
+                if first_row == self.next_row {
+                    self.process_data_block(rows, data_block);
+                    while let Some(first_entry) = self.out_of_order.first_entry() {
+                        if &self.next_row != first_entry.key() {
+                            break;
+                        }
+                        let (rows, data_block) = first_entry.remove();
+                        self.process_data_block(rows, data_block);
+                    }
+                } else {
+                    self.out_of_order.insert(first_row, (rows, data_block));
+                }
+            }
+            TreeBlock::Index(index_block) => {
+                while let Some(first_row) = rows.first(&self.rows) {
+                    let child_idx = index_block.find_row(first_row)?;
+                    let child_rows;
+                    (child_rows, rows) =
+                        rows.split(&self.rows, index_block.get_rows(child_idx).end);
+                    let read = Multifetch1Read::new(child_rows, index_block.get_child(child_idx)?);
+                    self.try_read(read, reads)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Rows {
+    before: Option<Range<u64>>,
+    middle: Range<usize>,
+    after: Option<Range<u64>>,
+}
+
+impl Rows {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    #[allow(dead_code)]
+    fn check_invariants(&self, _rows: &[Range<u64>]) {
+        #[cfg(debug_assertions)]
+        {
+            if let Some(before) = &self.before {
+                assert!(!before.is_empty());
+                if !self.middle.is_empty() {
+                    assert!(before.end < _rows[self.middle.start].start);
+                }
+                if let Some(after) = &self.after {
+                    assert!(before.end < after.start);
+                }
+            }
+            if let Some(after) = &self.after {
+                assert!(!after.is_empty());
+                if !self.middle.is_empty() {
+                    assert!(_rows[self.middle.end - 1].end < after.start);
+                }
+            }
+        }
+    }
+
+    pub fn new(rows: &[Range<u64>]) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            for range in rows {
+                assert!(!range.is_empty());
+            }
+            for i in 1..rows.len() {
+                assert!(rows[i - 1].end < rows[i].start);
+            }
+        }
+
+        let this = Self {
+            before: None,
+            middle: 0..rows.len(),
+            after: None,
+        };
+        this.check_invariants(rows);
+        this
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.before.is_none() && self.middle.is_empty() && self.after.is_none()
+    }
+
+    /// Equivalent to `self.iter(rows).next()`.
+    pub fn first(&self, rows: &[Range<u64>]) -> Option<u64> {
+        if let Some(before) = &self.before {
+            Some(before.start)
+        } else if !self.middle.is_empty() {
+            Some(rows[self.middle.start].start)
+        } else if let Some(after) = &self.after {
+            Some(after.start)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the smallest row within the ranges in `rows` that is greater
+    /// than or equal to `row`, or `row` if `row` is greater than all of the
+    /// rows in `rows`.
+    pub fn next(rows: &[Range<u64>], row: u64) -> u64 {
+        match rows.binary_search_by_key(&row, |range| range.start) {
+            Ok(_) => row,
+            Err(0) if rows.is_empty() => row,
+            Err(0) => rows[0].start,
+            Err(index) if row < rows[index - 1].end => row,
+            Err(index) if index < rows.len() => rows[index].start,
+            _ => row,
+        }
+    }
+
+    pub fn iter<'a>(&self, rows: &'a [Range<u64>]) -> RowsIter<'a> {
+        RowsIter::new(self, rows)
+    }
+
+    /// Splits this set of rows into two at `row`.  Returns the rows before
+    /// `row` and the rest as new `Rows`.
+    pub fn split(self, rows: &[Range<u64>], row: u64) -> (Rows, Rows) {
+        fn split_range(range: &Range<u64>, row: u64) -> (Option<Range<u64>>, Option<Range<u64>>) {
+            if row == range.start {
+                (None, Some(range.clone()))
+            } else if row == range.end {
+                (Some(range.clone()), None)
+            } else {
+                debug_assert!(range.contains(&row));
+                (Some(range.start..row), Some(row..range.end))
+            }
+        }
+
+        if let Some(before) = &self.before {
+            if row < before.start {
+                return (Self::empty(), self);
+            } else if row <= before.end {
+                let split = split_range(before, row);
+                return (
+                    Self {
+                        before: split.0,
+                        ..Self::empty()
+                    },
+                    Self {
+                        before: split.1,
+                        ..self
+                    },
+                );
+            }
+        }
+
+        if let Some(after) = &self.after {
+            if row >= after.end {
+                return (self, Self::empty());
+            } else if row >= after.start {
+                let split = split_range(after, row);
+                return (
+                    Self {
+                        after: split.0,
+                        ..self
+                    },
+                    Self {
+                        after: split.1,
+                        ..Self::empty()
+                    },
+                );
+            }
+        }
+
+        match rows.binary_search_by_key(&row, |range| range.start) {
+            Ok(index) => (
+                Self {
+                    before: self.before,
+                    middle: self.middle.start..index,
+                    after: None,
+                },
+                Self {
+                    before: None,
+                    middle: index..self.middle.end,
+                    after: self.after,
+                },
+            ),
+            Err(0) => (
+                Self {
+                    before: self.before,
+                    middle: 0..0,
+                    after: None,
+                },
+                Self {
+                    before: None,
+                    ..self
+                },
+            ),
+            Err(index) if row >= rows[index - 1].end => (
+                Self {
+                    before: self.before,
+                    middle: self.middle.start..index,
+                    after: None,
+                },
+                Self {
+                    before: None,
+                    middle: index..self.middle.end,
+                    after: self.after,
+                },
+            ),
+            Err(index) => (
+                Self {
+                    before: self.before,
+                    middle: self.middle.start..index - 1,
+                    after: Some(rows[index - 1].start..row),
+                },
+                Self {
+                    before: Some(row..rows[index - 1].end),
+                    middle: index..self.middle.end,
+                    after: self.after,
+                },
+            ),
+        }
+    }
+}
+
+struct RowsIter<'a> {
+    rows: Rows,
+    range: Range<u64>,
+    ranges: &'a [Range<u64>],
+}
+
+impl<'a> Iterator for RowsIter<'a> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.range.is_empty() {
+            if let Some(before) = self.rows.before.take() {
+                self.range = before;
+            } else if !self.rows.middle.is_empty() {
+                self.range = self.ranges[self.rows.middle.start].clone();
+                self.rows.middle.start += 1;
+            } else if let Some(after) = self.rows.after.take() {
+                self.range = after;
+            } else {
+                return None;
+            }
+        }
+
+        debug_assert!(!self.range.is_empty());
+        let row = self.range.start;
+        self.range.start += 1;
+        Some(row)
+    }
+}
+
+impl<'a> RowsIter<'a> {
+    fn new(rows: &Rows, ranges: &'a [Range<u64>]) -> Self {
+        Self {
+            rows: rows.clone(),
+            range: 0..0,
+            ranges,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::ops::Range;
+
+    use itertools::Itertools;
+
+    use crate::storage::file::reader::Rows;
+
+    fn check_rows(rows: &Rows, ranges: &[Range<u64>], expected: u32) {
+        rows.check_invariants(ranges);
+        let mut actual = 0;
+        for row in rows.iter(&ranges) {
+            assert!((0..32).contains(&row));
+            actual |= 1 << row;
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rows() {
+        for pattern in 0..4096u32 {
+            let ranges = (0..12)
+                .map(|index| (pattern & (1 << index)) != 0)
+                .enumerate()
+                .dedup_by_with_count(|a, b| a.1 == b.1)
+                .filter_map(|(count, (offset, value))| {
+                    value.then(|| offset as u64..offset as u64 + count as u64)
+                })
+                .collect::<Vec<_>>();
+
+            let rows = Rows::new(&ranges);
+            check_rows(&rows, &ranges, pattern);
+            assert_eq!(
+                rows.first(&ranges),
+                (pattern != 0).then(|| pattern.trailing_zeros() as u64)
+            );
+
+            check_rows(&rows, &ranges, pattern);
+
+            for i in 0..=12 {
+                let (a, b) = rows.clone().split(&ranges, i);
+                check_rows(&a, &ranges, ((1 << i) - 1) & pattern);
+                check_rows(&b, &ranges, !((1 << i) - 1) & pattern);
+            }
+
+            for i in 0..=12 {
+                let remaining = !((1 << i) - 1) & pattern;
+                let next = if remaining != 0 {
+                    remaining.trailing_zeros()
+                } else {
+                    i
+                };
+                assert_eq!(Rows::next(&ranges, i as u64), next as u64);
+            }
+        }
     }
 }
