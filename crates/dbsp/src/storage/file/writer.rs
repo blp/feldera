@@ -300,6 +300,7 @@ impl ColumnWriter {
                 super::reader::DataBlock::<K, A>::from_raw(block, location, data_block.first_row)
                     .unwrap(),
             ),
+            false,
         );
 
         if let Some(index_block) = self.get_index_block(0).add_entry(
@@ -335,6 +336,7 @@ impl ColumnWriter {
                     )
                     .unwrap(),
                 ),
+                true,
             );
 
             level += 1;
@@ -1057,11 +1059,12 @@ impl BlockWriter {
         Ok((uncompressed, location))
     }
 
-    fn insert_cache_entry(&self, location: BlockLocation, entry: Arc<dyn CacheEntry>) {
+    fn insert_cache_entry(&self, location: BlockLocation, entry: Arc<dyn CacheEntry>, lock: bool) {
         self.cache.insert(
             self.file_handle.as_ref().unwrap().file_id(),
             location.offset,
             entry,
+            lock,
         );
     }
 }
@@ -1173,7 +1176,7 @@ impl Writer {
             .writer
             .write_block(file_trailer.clone().into_block(), None)?;
         self.writer
-            .insert_cache_entry(location, Arc::new(file_trailer));
+            .insert_cache_entry(location, Arc::new(file_trailer), false);
 
         let (reader, path) = self.writer.complete()?;
 

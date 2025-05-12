@@ -13,9 +13,11 @@ use crate::{
         },
     },
     trace::{
-        merge_batches_by_reference, ord::merge_batcher::MergeBatcher, Batch, BatchFactories,
-        BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor, Deserializer,
-        Serializer, VecWSetFactories, WeightedItem,
+        cursor::{CursorFactory, CursorFactoryWrapper},
+        merge_batches_by_reference,
+        ord::merge_batcher::MergeBatcher,
+        Batch, BatchFactories, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor,
+        Deserializer, Serializer, VecWSet, VecWSetFactories, WeightedItem,
     },
     DBData, DBWeight, NumEntries, Runtime,
 };
@@ -386,6 +388,53 @@ where
                 output.push_ref(cursor.key());
             }
         }
+    }
+
+    async fn fetch<B>(
+        &self,
+        keys: &B,
+    ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
+    where
+        B: BatchReader<Key = Self::Key>,
+    {
+        let context = self.file.new_async_context();
+        let mut tasks = context.tasks();
+        let mut keys = keys.cursor();
+        while let Some(key) = keys.get_key() {
+            let key = clone_box(key);
+            tasks
+                .push(async {
+                    let key = key; // Force moving `key`.
+
+                    let rows = self.file.rows_async(&context);
+                    if let Some(cursor) = unsafe { rows.find_exact(&key) }.await.unwrap() {
+                        let mut item = self.factories.weighted_item_factory().default_box();
+                        let (kv, weight) = item.split_mut();
+                        let (key, _) = kv.split_mut();
+                        unsafe { cursor.key(key) };
+                        unsafe { cursor.aux(weight) };
+                        Some(item)
+                    } else {
+                        None
+                    }
+                })
+                .await;
+            keys.step_key();
+        }
+
+        let outputs = tasks.run(self.file.file_handle()).await;
+
+        let mut builder = <VecWSet<Self::Key, Self::R> as Batch>::Builder::with_capacity(
+            &self.factories.vec_wset_factory,
+            outputs.len(),
+        );
+        for mut output in outputs.into_iter().flatten() {
+            let (kv, diff) = output.split_mut();
+            let (key, _) = kv.split_mut();
+            builder.push_diff_mut(diff);
+            builder.push_key_mut(key);
+        }
+        Some(Box::new(CursorFactoryWrapper(builder.done())))
     }
 }
 
