@@ -13,6 +13,7 @@ use crate::storage::{
             IndexBlockHeader, NodeType, Varint, DATA_BLOCK_MAGIC, FILE_TRAILER_BLOCK_MAGIC,
             INDEX_BLOCK_MAGIC, VERSION_NUMBER,
         },
+        reader::TreeNode,
         with_serializer, BLOOM_FILTER_SEED,
     },
 };
@@ -292,20 +293,27 @@ impl ColumnWriter {
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
+        let rows = data_block.rows();
         let (block, location) =
             block_writer.write_block(data_block.raw, self.parameters.compression)?;
-        block_writer.insert_cache_entry(
+
+        let tree_node = TreeNode {
             location,
-            Arc::new(
-                super::reader::DataBlock::<K, A>::from_raw(block, location, data_block.first_row)
-                    .unwrap(),
-            ),
-        );
+            node_type: NodeType::Data,
+            rows,
+        };
+        super::reader::DataBlock::<K, A>::from_raw_with_cache(
+            block,
+            &tree_node,
+            &block_writer.cache,
+            block_writer.file_handle.as_ref().unwrap().file_id(),
+        )
+        .unwrap();
 
         if let Some(index_block) = self.get_index_block(0).add_entry(
             location,
             &data_block.min_max,
-            data_block.n_values as u64,
+            data_block.n_rows as u64,
         ) {
             self.write_index_block::<K>(block_writer, index_block, 0)?;
         }
@@ -335,6 +343,7 @@ impl ColumnWriter {
                     )
                     .unwrap(),
                 ),
+                true,
             );
 
             level += 1;
@@ -426,8 +435,17 @@ struct DataBuildSpecs {
 struct DataBlock<K: ?Sized> {
     raw: FBuf,
     min_max: (Box<K>, Box<K>),
-    n_values: usize,
+    n_rows: usize,
     first_row: u64,
+}
+
+impl<K> DataBlock<K>
+where
+    K: ?Sized,
+{
+    fn rows(&self) -> Range<u64> {
+        self.first_row..self.first_row + self.n_rows as u64
+    }
 }
 
 impl DataBlockBuilder {
@@ -621,7 +639,7 @@ impl DataBlockBuilder {
         let data_block = DataBlock {
             raw,
             min_max: (min, max),
-            n_values,
+            n_rows: n_values,
             first_row: self.first_row,
         };
         self.first_row += self.value_offsets.len() as u64;
@@ -1057,11 +1075,12 @@ impl BlockWriter {
         Ok((uncompressed, location))
     }
 
-    fn insert_cache_entry(&self, location: BlockLocation, entry: Arc<dyn CacheEntry>) {
+    fn insert_cache_entry(&self, location: BlockLocation, entry: Arc<dyn CacheEntry>, lock: bool) {
         self.cache.insert(
             self.file_handle.as_ref().unwrap().file_id(),
             location.offset,
             entry,
+            lock,
         );
     }
 }
@@ -1173,7 +1192,7 @@ impl Writer {
             .writer
             .write_block(file_trailer.clone().into_block(), None)?;
         self.writer
-            .insert_cache_entry(location, Arc::new(file_trailer));
+            .insert_cache_entry(location, Arc::new(file_trailer), false);
 
         let (reader, path) = self.writer.complete()?;
 
@@ -1307,6 +1326,7 @@ where
     /// Finishes writing the layer file and returns a reader for it.
     pub fn into_reader(
         self,
+        cache: fn() -> Arc<BufferCache>,
     ) -> Result<Reader<(&'static K0, &'static A0, ())>, super::reader::Error> {
         let any_factories = self.factories.any_factories();
 
@@ -1315,7 +1335,7 @@ where
         Reader::new(
             &[&any_factories],
             path,
-            Runtime::buffer_cache,
+            cache,
             file_handle,
             Some(bloom_filter),
         )
@@ -1487,6 +1507,7 @@ where
     #[allow(clippy::type_complexity)]
     pub fn into_reader(
         self,
+        cache: fn() -> Arc<BufferCache>,
     ) -> Result<
         Reader<(&'static K0, &'static A0, (&'static K1, &'static A1, ()))>,
         super::reader::Error,
@@ -1497,7 +1518,7 @@ where
         Reader::new(
             &[&any_factories0, &any_factories1],
             path,
-            Runtime::buffer_cache,
+            cache,
             file_handle,
             Some(bloom_filter),
         )

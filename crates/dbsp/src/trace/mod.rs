@@ -31,9 +31,11 @@ use crate::circuit::GlobalNodeId;
 use crate::dynamic::{ClonableTrait, DynDataTyped, DynUnit, Weight};
 use crate::storage::buffer_cache::CacheStats;
 pub use crate::storage::file::{Deserializable, Deserializer, Rkyv, Serializer};
-use crate::trace::cursor::{FilteredMergeCursor, UnfilteredMergeCursor};
+use crate::trace::cursor::{
+    DefaultPushCursor, FilteredMergeCursor, PushCursor, UnfilteredMergeCursor,
+};
 use crate::{dynamic::ArchivedDBData, storage::buffer_cache::FBuf};
-use cursor::{CursorFactory};
+use cursor::CursorFactory;
 use dyn_clone::DynClone;
 use enum_map::Enum;
 use feldera_storage::StoragePath;
@@ -389,7 +391,14 @@ where
     /// Acquires a cursor to the batch's contents.
     fn cursor(&self) -> Self::Cursor<'_>;
 
-    /// Acquires a merge cursor for the batch's contents.
+    /// Acquires a [PushCursor] for the batch's contents.
+    fn push_cursor(
+        &self,
+    ) -> Box<dyn PushCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_> {
+        Box::new(DefaultPushCursor::new(self.cursor()))
+    }
+
+    /// Acquires a [MergeCursor] for the batch's contents.
     fn merge_cursor(
         &self,
         key_filter: Option<Filter<Self::Key>>,
@@ -529,7 +538,7 @@ where
         keys: &B,
     ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
     where
-        B: Batch<Key = Self::Key, Time = ()>,
+        B: BatchReader<Key = Self::Key, Time = ()>,
     {
         let _ = keys;
         None
@@ -586,6 +595,22 @@ where
         RG: Rng,
     {
         (**self).sample_keys(rng, sample_size, sample)
+    }
+    fn consuming_cursor(
+        &mut self,
+        key_filter: Option<Filter<Self::Key>>,
+        value_filter: Option<Filter<Self::Val>>,
+    ) -> Box<dyn MergeCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_> {
+        (**self).merge_cursor(key_filter, value_filter)
+    }
+    async fn fetch<KB>(
+        &self,
+        keys: &KB,
+    ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
+    where
+        KB: BatchReader<Key = Self::Key, Time = ()>,
+    {
+        (**self).fetch(keys).await
     }
 }
 

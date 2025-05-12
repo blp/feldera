@@ -18,6 +18,7 @@ use metrics::counter;
 use std::ffi::OsString;
 use std::fs::{create_dir_all, DirEntry};
 use std::io::{ErrorKind, IoSlice, Write};
+use std::time::{Duration, Instant};
 use std::{
     fs::{self, File, OpenOptions},
     io::Error as IoError,
@@ -75,12 +76,18 @@ impl HasFileId for PosixReader {
     }
 }
 
+fn busy_wait(duration: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < duration {}
+}
+
 impl FileReader for PosixReader {
     fn mark_for_checkpoint(&self) {
         self.drop.keep();
     }
 
     fn read_block(&self, location: BlockLocation) -> Result<Arc<FBuf>, StorageError> {
+        busy_wait(Duration::from_millis(2));
         let mut buffer = FBuf::with_capacity(location.size);
 
         match buffer.read_exact_at(&self.file, location.offset, location.size) {
@@ -97,6 +104,7 @@ impl FileReader for PosixReader {
         if self.async_threads {
             let file = self.file.clone();
             TOKIO.spawn_blocking(move || {
+                busy_wait(Duration::from_millis(2));
                 callback(
                     blocks
                         .into_iter()
@@ -286,7 +294,7 @@ impl PosixBackend {
             base: Arc::new(base.as_ref().to_path_buf()),
             cache,
             usage: Arc::new(AtomicI64::new(0)),
-            async_threads: options.async_threads.unwrap_or(false),
+            async_threads: options.async_threads.unwrap_or(true),
         }
     }
 

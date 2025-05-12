@@ -4,6 +4,8 @@
 
 use super::format::{Compression, FileTrailer};
 use super::{AnyFactories, Factories};
+use crate::circuit::runtime::ThreadType;
+use crate::dynamic::{DynVec, WeightTrait};
 use crate::storage::buffer_cache::AsyncCacheContext;
 use crate::storage::buffer_cache::{CacheAccess, CacheEntry};
 use crate::storage::file::format::FilterBlock;
@@ -24,15 +26,17 @@ use crate::{
 };
 use binrw::{
     io::{self},
-    BinRead, Error as BinError,
+    BinRead,
 };
 use crc32c::crc32c;
 use fastbloom::BloomFilter;
+use feldera_storage::file::FileId;
 use feldera_storage::StoragePath;
 use futures::future::Either;
+use smallvec::{smallvec, SmallVec};
 use snap::raw::{decompress_len, Decoder};
-use std::any::Any;
 use std::mem::replace;
+use std::sync::mpsc::{self};
 use std::time::Instant;
 use std::{
     cmp::{
@@ -46,6 +50,15 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error as ThisError;
+
+mod bulk_rows;
+pub use bulk_rows::BulkRows;
+
+mod fetch_zset;
+pub use fetch_zset::FetchZSet;
+
+mod fetch_indexed_zset;
+pub use fetch_indexed_zset::FetchIndexedZSet;
 
 /// Any kind of error encountered reading a layer file.
 #[derive(ThisError, Clone, Debug)]
@@ -70,12 +83,6 @@ pub enum Error {
     /// The invocation is not supported.
     #[error("The requested operation is not supported.")]
     Unsupported,
-}
-
-impl From<BinError> for Error {
-    fn from(source: BinError) -> Self {
-        Error::Corruption(source.into())
-    }
 }
 
 impl From<io::Error> for Error {
@@ -119,11 +126,17 @@ pub enum CorruptionError {
     },
 
     /// [`mod@binrw`] reported a format violation.
-    #[error("Binary read/write error: {0}")]
-    Binrw(
+    #[error("Binary read/write error reading {block_type} block ({location}): {inner}")]
+    Binrw {
+        /// Block location.
+        location: BlockLocation,
+
+        /// Block type.
+        block_type: &'static str,
+
         /// Underlying error.
-        String,
-    ),
+        inner: String,
+    },
 
     /// Array overflows block bounds.
     #[error("{count}-element array of {each}-byte elements starting at offset {offset} within block overflows {block_size}-byte block")]
@@ -302,12 +315,6 @@ pub enum CorruptionError {
     InvalidFilterLocation(InvalidBlockLocation),
 }
 
-impl From<BinError> for CorruptionError {
-    fn from(value: BinError) -> Self {
-        CorruptionError::Binrw(value.to_string())
-    }
-}
-
 #[derive(Clone, Debug)]
 struct VarintReader {
     varint: Varint,
@@ -450,10 +457,6 @@ where
     fn cost(&self) -> usize {
         size_of::<Self>() + self.raw.capacity()
     }
-
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
-    }
 }
 
 struct DataBlockReader<'a> {
@@ -497,9 +500,7 @@ impl<'a> DataBlockReader<'a> {
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
-        let data_block = Arc::downcast::<DataBlock<K, A>>(cache_entry.as_any())
-            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(self.node.location)))?;
-
+        let data_block = DataBlock::from_cache_entry(cache_entry, self.node.location)?;
         self.file
             .stats
             .record(self.access, self.start.elapsed(), self.node.location);
@@ -527,7 +528,14 @@ where
         location: BlockLocation,
         first_row: u64,
     ) -> Result<Self, Error> {
-        let header = DataBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice()))?;
+        let header =
+            DataBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "data",
+                    inner: e.to_string(),
+                })
+            })?;
         Ok(Self {
             location,
             value_map: ValueMapReader::new(
@@ -547,17 +555,33 @@ where
             _phantom: PhantomData,
         })
     }
-
+    pub(super) fn from_raw_with_cache(
+        raw: Arc<FBuf>,
+        node: &TreeNode,
+        cache: &BufferCache,
+        file_id: FileId,
+    ) -> Result<Arc<Self>, Error> {
+        let block = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
+        cache.insert(file_id, node.location.offset, block.clone(), false);
+        Ok(block)
+    }
+    fn from_cache_entry(
+        cache_entry: Arc<dyn CacheEntry>,
+        location: BlockLocation,
+    ) -> Result<Arc<Self>, Error> {
+        cache_entry
+            .downcast()
+            .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))
+    }
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         match DataBlockReader::new(file, node)? {
             Either::Left(data_block_reader) => {
-                let raw = file.read_blocking(node.location)?;
-                let entry = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
-                data_block_reader.cache.insert(
+                let entry = Self::from_raw_with_cache(
+                    file.read_blocking(node.location)?,
+                    node,
+                    &data_block_reader.cache,
                     file.file_handle.file_id(),
-                    node.location.offset,
-                    entry.clone(),
-                );
+                )?;
                 data_block_reader.complete(entry)
             }
             Either::Right(data_block) => Ok(data_block),
@@ -572,13 +596,17 @@ where
             Either::Left(data_block_reader) => {
                 let compression = file.compression;
                 let entry = context
-                    .read(node.location, move |raw| {
-                        Ok(Arc::new(Self::from_raw(
-                            decompress(compression, node.location, raw)?,
-                            node.location,
-                            node.rows.start,
-                        )?))
-                    })
+                    .read(
+                        node.location,
+                        move |raw| {
+                            Ok(Arc::new(Self::from_raw(
+                                decompress(compression, node.location, raw)?,
+                                node.location,
+                                node.rows.start,
+                            )?))
+                        },
+                        false,
+                    )
                     .await?;
                 data_block_reader.complete(entry)
             }
@@ -592,8 +620,7 @@ where
     fn rows(&self) -> Range<u64> {
         self.first_row..(self.first_row + self.n_values() as u64)
     }
-    fn row_group(&self, row: u64) -> Result<Range<u64>, Error> {
-        let index = (row - self.first_row) as usize;
+    fn row_group(&self, index: usize) -> Result<Range<u64>, Error> {
         let row_groups = self.row_groups.as_ref().unwrap();
         let start = row_groups.get(&self.raw, index);
         let end = row_groups.get(&self.raw, index + 1);
@@ -608,6 +635,10 @@ where
             }
             .into())
         }
+    }
+    fn row_group_for_row(&self, row: u64) -> Result<Range<u64>, Error> {
+        let index = (row - self.first_row) as usize;
+        self.row_group(index)
     }
     unsafe fn archived_item(
         &self,
@@ -673,7 +704,7 @@ where
             let mut start = (max(block_rows.start, target_rows.start) - self.first_row) as usize;
             let mut end = (min(block_rows.end, target_rows.end) - self.first_row) as usize;
             while start < end {
-                let mid = (start + end) / 2;
+                let mid = start.midpoint(end);
                 self.key(factories, mid, key);
                 let cmp = compare(key);
 
@@ -703,6 +734,26 @@ where
         C: Fn(&K) -> Ordering,
     {
         self.find_best_match(factories, target_rows, compare, Equal)
+    }
+
+    unsafe fn find_next(
+        &self,
+        factories: &Factories<K, A>,
+        tmp: &mut K,
+        target: &K,
+        start: &mut usize,
+    ) -> Option<usize> {
+        let mut end = self.n_values();
+        while *start < end {
+            let mid = start.midpoint(end);
+            self.key(factories, mid, tmp);
+            match target.cmp(tmp) {
+                Less => end = mid,
+                Equal => return Some(mid),
+                Greater => *start = mid + 1,
+            };
+        }
+        None
     }
 
     /// Returns the comparison of the key in `row` using `compare`.
@@ -740,21 +791,72 @@ where
 /// `_blocking`. Thus, an `async` function should not call a `_blocking`
 /// function.
 #[derive(Clone, Debug)]
-struct TreeNode {
-    location: BlockLocation,
-    node_type: NodeType,
-    rows: Range<u64>,
+pub(super) struct TreeNode {
+    pub location: BlockLocation,
+    pub node_type: NodeType,
+    pub rows: Range<u64>,
 }
 
 impl TreeNode {
-    fn read_blocking<K, A>(self, file: &ImmutableFileRef) -> Result<TreeBlock<K, A>, Error>
+    fn read_blocking<K, A>(&self, file: &ImmutableFileRef) -> Result<TreeBlock<K, A>, Error>
     where
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
         match self.node_type {
-            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new_blocking(file, &self)?)),
-            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new_blocking(file, &self)?)),
+            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new_blocking(file, self)?)),
+            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new_blocking(file, self)?)),
+        }
+    }
+    fn read_blocking_multiple<K, A, const N: usize>(
+        mut nodes: SmallVec<[TreeNode; N]>,
+        file: &ImmutableFileRef,
+    ) -> Result<TreeBlock<K, A>, Error>
+    where
+        K: DataTrait + ?Sized,
+        A: DataTrait + ?Sized,
+    {
+        if nodes.len() > 1 {
+            let cache = (file.cache)();
+            let mut missing =
+                cache.missing(&*file.file_handle, nodes.iter().map(|node| node.location));
+            if (missing & 1) == 0 {
+                return nodes[0].read_blocking(file);
+            }
+            if missing != 0 {
+                let mut retval = if (missing & 1) == 0 {
+                    Some(nodes[0].read_blocking(file)?)
+                } else {
+                    None
+                };
+                nodes.retain(|_| {
+                    let retain = (missing & 1) != 0;
+                    missing >>= 1;
+                    retain
+                });
+                let (sender, receiver) = mpsc::channel();
+                file.file_handle.read_async(
+                    nodes.iter().map(|node| node.location).collect(),
+                    Box::new(move |result| sender.send(result).unwrap()),
+                );
+                for (result, node) in receiver.recv().unwrap().into_iter().zip(nodes.iter()) {
+                    let raw = decompress(file.compression, node.location, result?)?;
+                    let entry = TreeBlock::from_raw_with_cache(
+                        raw,
+                        node,
+                        &cache,
+                        file.file_handle.file_id(),
+                    )?;
+                    if retval.is_none() {
+                        retval = Some(entry);
+                    }
+                }
+                Ok(retval.unwrap())
+            } else {
+                nodes[0].read_blocking(file)
+            }
+        } else {
+            nodes[0].read_blocking(file)
         }
     }
     async fn read_async<K, A>(
@@ -787,20 +889,61 @@ where
     K: DataTrait + ?Sized,
     A: DataTrait + ?Sized,
 {
+    fn from_cache(
+        node: &TreeNode,
+        cache: &BufferCache,
+        file: &dyn FileReader,
+    ) -> Result<Option<Self>, Error> {
+        match cache.get(file, node.location) {
+            Some(cache_entry) => match node.node_type {
+                NodeType::Data => Ok(Some(Self::Data(DataBlock::from_cache_entry(
+                    cache_entry,
+                    node.location,
+                )?))),
+                NodeType::Index => Ok(Some(Self::Index(IndexBlock::from_cache_entry(
+                    cache_entry,
+                    node.location,
+                )?))),
+            },
+            None => Ok(None),
+        }
+    }
+
+    pub(super) fn from_raw_with_cache(
+        raw: Arc<FBuf>,
+        node: &TreeNode,
+        cache: &BufferCache,
+        file_id: FileId,
+    ) -> Result<Self, Error> {
+        match node.node_type {
+            NodeType::Data => Ok(Self::Data(DataBlock::from_raw_with_cache(
+                raw, node, cache, file_id,
+            )?)),
+            NodeType::Index => Ok(Self::Index(IndexBlock::from_raw_with_cache(
+                raw, node, cache, file_id,
+            )?)),
+        }
+    }
+
     fn lookup_row(&self, row: u64) -> Result<Option<TreeNode>, Error> {
+        self.lookup_row_and_successors::<1>(row)
+            .map(|mut vec| vec.pop())
+    }
+
+    fn lookup_row_and_successors<const N: usize>(
+        &self,
+        row: u64,
+    ) -> Result<SmallVec<[TreeNode; N]>, Error> {
         match self {
             Self::Data(data_block) => {
                 if data_block.rows().contains(&row) {
-                    return Ok(None);
+                    Ok(SmallVec::new())
+                } else {
+                    Err(CorruptionError::MissingRow(row).into())
                 }
             }
-            Self::Index(index_block) => {
-                if let Some(child_node) = index_block.get_child_by_row(row)? {
-                    return Ok(Some(child_node));
-                }
-            }
+            Self::Index(index_block) => Ok(index_block.get_children_by_row(row)?),
         }
-        Err(CorruptionError::MissingRow(row).into())
     }
 }
 
@@ -832,9 +975,6 @@ where
 {
     fn cost(&self) -> usize {
         size_of::<Self>() + self.raw.capacity()
-    }
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
     }
 }
 
@@ -877,8 +1017,7 @@ impl<'a> IndexBlockReader<'a> {
     where
         K: DataTrait + ?Sized,
     {
-        let index_block = Arc::downcast::<IndexBlock<K>>(cache_entry.as_any())
-            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(self.node.location)))?;
+        let index_block = IndexBlock::from_cache_entry(cache_entry, self.node.location)?;
         if index_block.first_row != self.node.rows.start {
             return Err(Error::Corruption(CorruptionError::MultiplePaths(
                 self.node.location,
@@ -913,7 +1052,14 @@ where
         location: BlockLocation,
         first_row: u64,
     ) -> Result<Self, Error> {
-        let header = IndexBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice()))?;
+        let header =
+            IndexBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "index",
+                    inner: e.to_string(),
+                })
+            })?;
         if header.n_children == 0 {
             return Err(CorruptionError::EmptyIndex(location).into());
         }
@@ -964,17 +1110,34 @@ where
             _phantom: PhantomData,
         })
     }
+    pub(super) fn from_raw_with_cache(
+        raw: Arc<FBuf>,
+        node: &TreeNode,
+        cache: &BufferCache,
+        file_id: FileId,
+    ) -> Result<Arc<Self>, Error> {
+        let block = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
+        cache.insert(file_id, node.location.offset, block.clone(), true);
+        Ok(block)
+    }
+    fn from_cache_entry(
+        cache_entry: Arc<dyn CacheEntry>,
+        location: BlockLocation,
+    ) -> Result<Arc<Self>, Error> {
+        cache_entry
+            .downcast()
+            .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))
+    }
 
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         match IndexBlockReader::new(file, node)? {
             Either::Left(index_block_reader) => {
-                let raw = file.read_blocking(node.location)?;
-                let entry = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
-                index_block_reader.cache.insert(
+                let entry = Self::from_raw_with_cache(
+                    file.read_blocking(node.location)?,
+                    &node,
+                    &index_block_reader.cache,
                     file.file_handle.file_id(),
-                    node.location.offset,
-                    entry.clone(),
-                );
+                )?;
                 index_block_reader.complete(entry)
             }
             Either::Right(index_block) => Ok(index_block),
@@ -989,13 +1152,17 @@ where
             Either::Left(index_block_reader) => {
                 let compression = file.compression;
                 let entry = context
-                    .read(node.location, move |raw| {
-                        Ok(Arc::new(Self::from_raw(
-                            decompress(compression, node.location, raw)?,
-                            node.location,
-                            node.rows.start,
-                        )?))
-                    })
+                    .read(
+                        node.location,
+                        move |raw| {
+                            Ok(Arc::new(Self::from_raw(
+                                decompress(compression, node.location, raw)?,
+                                node.location,
+                                node.rows.start,
+                            )?))
+                        },
+                        true,
+                    )
                     .await?;
                 index_block_reader.complete(entry)
             }
@@ -1029,10 +1196,22 @@ where
         })
     }
 
-    fn get_child_by_row(&self, row: u64) -> Result<Option<TreeNode>, Error> {
-        self.find_row(row)
-            .map(|child_idx| self.get_child(child_idx))
-            .transpose()
+    fn get_child_by_row(&self, row: u64) -> Result<TreeNode, Error> {
+        self.get_child(self.find_row(row)?)
+    }
+
+    fn get_children_by_row<const N: usize>(
+        &self,
+        row: u64,
+    ) -> Result<SmallVec<[TreeNode; N]>, Error> {
+        let mut nodes = SmallVec::new();
+        for index in self.find_row(row)?..self.n_children() {
+            if nodes.len() == nodes.inline_size() {
+                break;
+            }
+            nodes.push(self.get_child(index)?);
+        }
+        Ok(nodes)
     }
 
     fn get_rows(&self, index: usize) -> Range<u64> {
@@ -1055,35 +1234,25 @@ where
         }
     }
 
-    fn find_row(&self, row: u64) -> Option<usize> {
+    fn find_row(&self, row: u64) -> Result<usize, Error> {
         let mut indexes = 0..self.n_children();
         while !indexes.is_empty() {
-            let mid = (indexes.start + indexes.end) / 2;
+            let mid = indexes.start.midpoint(indexes.end);
             let rows = self.get_rows(mid);
             if row < rows.start {
                 indexes.end = mid;
             } else if row >= rows.end {
                 indexes.start = mid + 1;
             } else {
-                return Some(mid);
+                return Ok(mid);
             }
         }
-        None
+        Err(CorruptionError::MissingRow(row).into())
     }
 
     unsafe fn get_bound(&self, index: usize, bound: &mut K) {
         let offset = self.bounds.get(&self.raw, index) as usize;
         bound.deserialize_from_bytes(&self.raw, offset)
-    }
-
-    fn get_row_range(&self, child_idx: usize) -> Range<u64> {
-        let start = if child_idx > 0 {
-            self.row_totals.get(&self.raw, child_idx - 1)
-        } else {
-            0
-        } + self.first_row;
-        let end = self.row_totals.get(&self.raw, child_idx) + self.first_row;
-        start..end
     }
 
     unsafe fn find_exact<C>(
@@ -1103,8 +1272,8 @@ where
                 if start >= end {
                     break None;
                 }
-                let mid = (start + end) / 2;
-                let rows = self.get_row_range(mid);
+                let mid = start.midpoint(end);
+                let rows = self.get_rows(mid);
 
                 /// Compares `a` to `b` and reports their relationship.
                 fn compare_ranges(a: &Range<u64>, b: &Range<u64>) -> Case {
@@ -1222,7 +1391,7 @@ where
             let mut end = self.n_children() * 2;
             result = None;
             while start < end {
-                let mid = (start + end) / 2;
+                let mid = start.midpoint(end);
                 let row = self.get_row_bound(mid) + self.first_row;
                 let cmp = match range_compare(target_rows, row) {
                     Equal => {
@@ -1248,6 +1417,35 @@ where
         });
 
         result
+    }
+
+    unsafe fn find_next(
+        &self,
+        tmp_lower: &mut K,
+        tmp_upper: &mut K,
+        targets: &DynVec<K>,
+        mut target_indexes: Range<usize>,
+        start: &mut usize,
+    ) -> Option<(usize, usize)> {
+        let start_index = target_indexes.next().unwrap();
+        let mut end = self.n_children();
+        while *start < end {
+            let mid = start.midpoint(end);
+            self.get_bound(mid * 2, tmp_lower);
+            if &targets[start_index] < tmp_lower {
+                end = mid;
+            } else {
+                *start = mid + 1;
+                self.get_bound(mid * 2 + 1, tmp_upper);
+                if &targets[start_index] <= tmp_upper {
+                    let n = 1 + target_indexes
+                        .take_while(|i| &targets[*i] <= tmp_upper)
+                        .count();
+                    return Some((mid, n));
+                }
+            }
+        }
+        None
     }
 
     fn n_children(&self) -> usize {
@@ -1297,15 +1495,19 @@ impl CacheEntry for FileTrailer {
     fn cost(&self) -> usize {
         size_of::<FileTrailer>()
     }
-
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
-    }
 }
 
 impl FileTrailer {
-    fn from_raw(raw: Arc<FBuf>) -> Result<Self, Error> {
-        Ok(Self::read_le(&mut io::Cursor::new(raw.as_slice()))?)
+    fn from_raw(raw: Arc<FBuf>, location: BlockLocation) -> Result<Self, Error> {
+        Ok(
+            Self::read_le(&mut io::Cursor::new(raw.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "trailer",
+                    inner: e.to_string(),
+                })
+            })?,
+        )
     }
     fn new(
         cache: fn() -> Arc<BufferCache>,
@@ -1318,14 +1520,15 @@ impl FileTrailer {
         #[allow(clippy::borrow_deref_ref)]
         let (access, entry) = match cache.get(&*file_handle, location) {
             Some(entry) => {
-                let entry = Arc::downcast::<Self>(entry.as_any())
-                    .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(location)))?;
+                let entry = entry
+                    .downcast()
+                    .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))?;
                 (CacheAccess::Hit, entry)
             }
             None => {
                 let block = file_handle.read_block(location)?;
-                let entry = Arc::new(Self::from_raw(block)?);
-                cache.insert(file_handle.file_id(), location.offset, entry.clone());
+                let entry = Arc::new(Self::from_raw(block, location)?);
+                cache.insert(file_handle.file_id(), location.offset, entry.clone(), false);
                 (CacheAccess::Miss, entry)
             }
         };
@@ -1344,7 +1547,15 @@ struct Column {
 impl FilterBlock {
     fn new(file_handle: &dyn FileReader, location: BlockLocation) -> Result<Self, Error> {
         let block = file_handle.read_block(location)?;
-        Ok(Self::read_le(&mut io::Cursor::new(block.as_slice()))?)
+        Ok(
+            Self::read_le(&mut io::Cursor::new(block.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "filter",
+                    inner: e.to_string(),
+                })
+            })?,
+        )
     }
 }
 
@@ -1717,6 +1928,21 @@ where
         RowGroup::new(self, 0, 0..self.columns[0].n_rows)
     }
 
+    /// Returns a [`BulkRows`] for column 0.
+    pub fn bulk_rows(&self) -> Result<BulkRows<K, A, N, (&'static K, &'static A, N)>, Error> {
+        BulkRows::new(self, 0)
+    }
+
+    pub fn fetch_zset<'a, 'b>(
+        &'a self,
+        keys: &'b DynVec<K>,
+    ) -> Result<FetchZSet<'a, 'b, K, A, N, (&'static K, &'static A, N)>, Error>
+    where
+        A: WeightTrait,
+    {
+        FetchZSet::new(self, keys)
+    }
+
     /// Returns an [AsyncRowGroup] for all of the rows in column 0.
     ///
     /// Use [Reader::new_async_context] to create `context`.
@@ -1728,6 +1954,21 @@ where
             row_group: self.rows(),
             context,
         }
+    }
+}
+
+impl<K0, A0, K1, A1> Reader<(&'static K0, &'static A0, (&'static K1, &'static A1, ()))>
+where
+    K0: DataTrait + ?Sized,
+    A0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
+{
+    pub fn fetch_indexed_zset<'a, 'b>(
+        &'a self,
+        keys: &'b DynVec<K0>,
+    ) -> Result<FetchIndexedZSet<'a, 'b, K0, A0, K1, A1>, Error> {
+        FetchIndexedZSet::new(self, keys)
     }
 }
 
@@ -2367,10 +2608,10 @@ where
         row_group: &RowGroup<'_, K, A, N, T>,
         row: u64,
     ) -> Result<Self, Error> {
-        Self::for_row_from_ancestor_blocking(
+        Self::for_row_from_ancestors_blocking::<_, 4>(
             row_group.reader,
             Vec::new(),
-            row_group.root_node().unwrap(),
+            smallvec![row_group.root_node().unwrap()],
             row,
         )
     }
@@ -2387,24 +2628,44 @@ where
         )
         .await
     }
-    fn for_row_from_ancestor_blocking<T>(
+    fn for_row_from_ancestors_blocking<T, const N: usize>(
         reader: &Reader<T>,
         mut indexes: Vec<Arc<IndexBlock<K>>>,
-        mut node: TreeNode,
+        nodes: SmallVec<[TreeNode; N]>,
         row: u64,
     ) -> Result<Self, Error> {
-        loop {
-            let block = node.read_blocking(&reader.file)?;
-            let next = block.lookup_row(row)?;
-            match block {
-                TreeBlock::Data(data) => {
-                    return Ok(Self { row, indexes, data });
+        match ThreadType::current() {
+            ThreadType::Background => {
+                let mut block = TreeNode::read_blocking_multiple(nodes, &reader.file)?;
+                loop {
+                    let next = block.lookup_row_and_successors::<N>(row)?;
+                    match block {
+                        TreeBlock::Data(data) => {
+                            return Ok(Self { row, indexes, data });
+                        }
+                        TreeBlock::Index(index) => {
+                            push_index_block(&mut indexes, index)?;
+                        }
+                    };
+                    block = TreeNode::read_blocking_multiple(next, &reader.file)?;
                 }
-                TreeBlock::Index(index) => {
-                    push_index_block(&mut indexes, index)?;
+            }
+            ThreadType::Foreground => {
+                let mut node = nodes.into_iter().next().unwrap();
+                loop {
+                    let block = node.read_blocking(&reader.file)?;
+                    let next = block.lookup_row(row)?;
+                    match block {
+                        TreeBlock::Data(data) => {
+                            return Ok(Self { row, indexes, data });
+                        }
+                        TreeBlock::Index(index) => {
+                            push_index_block(&mut indexes, index)?;
+                        }
+                    };
+                    node = next.unwrap();
                 }
-            };
-            node = next.unwrap();
+            }
         }
     }
     async fn for_row_from_ancestor_async(
@@ -2428,8 +2689,29 @@ where
     }
     fn find_ancestor(&self, row: u64) -> Result<(TreeNode, Vec<Arc<IndexBlock<K>>>), Error> {
         for (idx, index_block) in self.indexes.iter().enumerate().rev() {
-            if let Some(node) = index_block.get_child_by_row(row)? {
-                return Ok((node, self.indexes[0..=idx].to_vec()));
+            match index_block.get_child_by_row(row) {
+                Ok(node) => return Ok((node, self.indexes[0..=idx].to_vec())),
+                Err(Error::Corruption(CorruptionError::MissingRow(_))) => {
+                    // Ignore this because: we're moving upward looking until we
+                    // find `row`, and we just haven't found it yet.
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(CorruptionError::MissingRow(row).into())
+    }
+    fn find_ancestors<const N: usize>(
+        &self,
+        row: u64,
+    ) -> Result<(SmallVec<[TreeNode; N]>, Vec<Arc<IndexBlock<K>>>), Error> {
+        for (idx, index_block) in self.indexes.iter().enumerate().rev() {
+            match index_block.get_children_by_row(row) {
+                Ok(nodes) => return Ok((nodes, self.indexes[0..=idx].to_vec())),
+                Err(Error::Corruption(CorruptionError::MissingRow(_))) => {
+                    // Ignore this because: we're moving upward looking until we
+                    // find `row`, and we just haven't found it yet.
+                }
+                Err(error) => return Err(error),
             }
         }
         Err(CorruptionError::MissingRow(row).into())
@@ -2449,7 +2731,12 @@ where
             });
         }
         let (node, indexes) = hint.find_ancestor(row)?;
-        Self::for_row_from_ancestor_blocking(row_group.reader, indexes, node, row)
+        Self::for_row_from_ancestors_blocking::<_, 4>(
+            row_group.reader,
+            indexes,
+            smallvec![node],
+            row,
+        )
     }
     async fn for_row_from_hint_async<N, T>(
         row_group: &AsyncRowGroup<'_, K, A, N, T>,
@@ -2489,14 +2776,14 @@ where
     }
 
     fn row_group(&self) -> Result<Range<u64>, Error> {
-        self.data.row_group(self.row)
+        self.data.row_group_for_row(self.row)
     }
     fn move_to_row_blocking<T>(&mut self, reader: &Reader<T>, row: u64) -> Result<(), Error> {
         if self.data.rows().contains(&row) {
             self.row = row;
         } else {
-            let (ancestor, indexes) = self.find_ancestor(row)?;
-            *self = Self::for_row_from_ancestor_blocking(reader, indexes, ancestor, row)?;
+            let (ancestors, indexes) = self.find_ancestors::<4>(row)?;
+            *self = Self::for_row_from_ancestors_blocking(reader, indexes, ancestors, row)?;
         }
         Ok(())
     }
@@ -2768,12 +3055,12 @@ where
         for index in &self.indexes {
             let n = index.n_children();
             match index.find_row(self.row) {
-                Some(i) => {
+                Ok(i) => {
                     let min_row = index.get_row_bound(i * 2);
                     let max_row = index.get_row_bound(i * 2 + 1);
                     write!(f, "\n[child {i} of {n}: rows {min_row}..={max_row}]",)?;
                 }
-                None => {
+                Err(_) => {
                     // This should not be possible because it indicates an
                     // invariant violation.  Possibly we should panic.
                     write!(f, " [unknown child of {n}]")?

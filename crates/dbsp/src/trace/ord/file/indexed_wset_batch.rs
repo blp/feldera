@@ -7,17 +7,17 @@ use crate::{
     storage::{
         buffer_cache::CacheStats,
         file::{
-            reader::{Cursor as FileCursor, Error as ReaderError, Reader},
+            reader::{BulkRows, Cursor as FileCursor, Error as ReaderError, Reader},
             writer::Writer2,
             Factories as FileFactories,
         },
     },
     trace::{
-        cursor::{CursorFactory, CursorFactoryWrapper},
+        cursor::{CursorFactory, CursorFactoryWrapper, Pending, PushCursor},
         merge_batches_by_reference,
         ord::merge_batcher::MergeBatcher,
         Batch, BatchFactories, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor,
-        TupleBuilder, VecIndexedWSet, VecIndexedWSetFactories, WeightedItem,
+        VecIndexedWSetFactories, WeightedItem,
     },
     DBData, DBWeight, NumEntries, Runtime,
 };
@@ -28,7 +28,7 @@ use rkyv::{ser::Serializer, Archive, Archived, Deserialize, Fallible, Serialize}
 use size_of::SizeOf;
 use std::{
     fmt::{self, Debug},
-    ops::Neg,
+    ops::{Neg, Range},
     sync::Arc,
 };
 
@@ -266,7 +266,7 @@ where
         }
         Self {
             factories: self.factories.clone(),
-            file: Arc::new(writer.into_reader().unwrap()),
+            file: Arc::new(writer.into_reader(Runtime::buffer_cache).unwrap()),
         }
     }
 }
@@ -332,6 +332,12 @@ where
         self.factories.clone()
     }
 
+    fn push_cursor(
+        &self,
+    ) -> Box<dyn PushCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_> {
+        Box::new(FileIndexedWSetPushCursor::new(self))
+    }
+
     #[inline]
     fn cursor(&self) -> Self::Cursor<'_> {
         FileIndexedWSetCursor::new(self)
@@ -394,52 +400,27 @@ where
         keys: &B,
     ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
     where
-        B: Batch<Key = Self::Key>,
+        B: BatchReader<Key = Self::Key>,
     {
-        let context = self.file.new_async_context();
-        let mut tasks = Vec::new();
-        let mut keys = keys.cursor();
-        while let Some(key) = keys.get_key() {
-            let key = clone_box(key);
-            tasks.push(async {
-                let key = key; // Force moving `key`.
-                let mut output = self.factories.weighted_items_factory().default_box();
-
-                let key_rows = self.file.rows_async(&context);
-                if let Some(key_cursor) = unsafe { key_rows.find_exact(&key) }.await.unwrap() {
-                    let value_rows = key_cursor.next_column().await.unwrap();
-                    output.reserve(value_rows.len() as usize);
-                    let mut value_cursor = value_rows.first().await.unwrap();
-                    let mut item = self.factories.weighted_item_factory().default_box();
-                    while value_cursor.has_value() {
-                        let (kv, weight) = item.split_mut();
-                        let (k, v) = kv.split_mut();
-                        key.clone_to(k);
-                        unsafe { value_cursor.key(v) };
-                        unsafe { value_cursor.aux(weight) };
-                        output.push_val(&mut *item);
-                        value_cursor.move_next().await.unwrap();
-                    }
-                }
-                output
-            });
-            keys.step_key();
+        // If `B` is `VecIndexedWSet` or `VecWSet`, we could get a reference to
+        // their existing internal vector instead.
+        let mut keys_vec = self.factories.factories0.keys_factory.default_box();
+        keys_vec.reserve(keys.len());
+        let mut cursor = keys.cursor();
+        while cursor.key_valid() {
+            keys_vec.push_ref(cursor.key());
+            cursor.step_key();
         }
 
-        let outputs = context.execute_tasks(self.file.file_handle(), tasks).await;
+        let results = self
+            .file
+            .fetch_indexed_zset(&*keys_vec)
+            .unwrap()
+            .async_results(self.factories.vec_indexed_wset_factory.clone())
+            .await
+            .unwrap();
 
-        let builder =
-            <VecIndexedWSet<Self::Key, Self::Val, Self::R> as Batch>::Builder::with_capacity(
-                &self.factories.vec_indexed_wset_factory,
-                outputs.len(),
-            );
-        let mut builder = TupleBuilder::new(&self.factories.vec_indexed_wset_factory, builder);
-        for mut output in outputs {
-            for update in output.dyn_iter_mut() {
-                builder.push(update);
-            }
-        }
-        Some(Box::new(CursorFactoryWrapper(builder.done())))
+        Some(Box::new(CursorFactoryWrapper(results)))
     }
 }
 
@@ -470,6 +451,134 @@ where
             factories: factories.clone(),
             file,
         })
+    }
+}
+
+type KeyBulkRows<'s, K, V, R> = BulkRows<
+    's,
+    K,
+    DynUnit,
+    (&'static V, &'static R, ()),
+    (&'static K, &'static DynUnit, (&'static V, &'static R, ())),
+>;
+
+type ValBulkRows<'s, K, V, R> =
+    BulkRows<'s, V, R, (), (&'static K, &'static DynUnit, (&'static V, &'static R, ()))>;
+
+/// A [PushCursor] for [FileIndexedWSet].
+#[derive(Debug)]
+pub struct FileIndexedWSetPushCursor<'s, K, V, R>
+where
+    K: DataTrait + ?Sized,
+    V: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+{
+    key_bulk_rows: KeyBulkRows<'s, K, V, R>,
+    key: Box<K>,
+    row_group: Range<u64>,
+
+    val_bulk_rows: ValBulkRows<'s, K, V, R>,
+    val: Box<V>,
+    diff: Box<R>,
+}
+
+impl<'s, K, V, R> FileIndexedWSetPushCursor<'s, K, V, R>
+where
+    K: DataTrait + ?Sized,
+    V: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+{
+    fn new(indexed_wset: &'s FileIndexedWSet<K, V, R>) -> Self {
+        let key_bulk_rows = indexed_wset.file.bulk_rows().unwrap();
+
+        let val_bulk_rows = key_bulk_rows.next_column().unwrap();
+        let mut this = Self {
+            key_bulk_rows,
+            key: indexed_wset.factories.key_factory().default_box(),
+            row_group: Range::default(),
+            val_bulk_rows,
+            val: indexed_wset.factories.val_factory().default_box(),
+            diff: indexed_wset.factories.weight_factory().default_box(),
+        };
+        this.fetch_key();
+        this
+    }
+
+    fn fetch_key(&mut self) {
+        if unsafe { self.key_bulk_rows.key(&mut self.key) }.is_some() {
+            self.row_group = self.key_bulk_rows.row_group().unwrap().unwrap();
+            if self.val_bulk_rows.step_to(self.row_group.start) {
+                if unsafe { self.val_bulk_rows.item((&mut self.val, &mut self.diff)) }.is_none() {
+                    debug_assert!(!self.val_bulk_rows.is_readable());
+                }
+            }
+        }
+    }
+
+    fn assert_val_valid(&self) {
+        debug_assert!(self.key_bulk_rows.is_readable());
+        debug_assert!(self.val_bulk_rows.is_readable());
+        debug_assert!(self.row_group.contains(&self.val_bulk_rows.row()));
+    }
+}
+
+impl<'s, K, V, R> PushCursor<K, V, (), R> for FileIndexedWSetPushCursor<'s, K, V, R>
+where
+    K: DataTrait + ?Sized,
+    V: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+{
+    fn key(&self) -> Result<Option<&K>, Pending> {
+        if self.key_bulk_rows.is_readable() {
+            Ok(Some(self.key.as_ref()))
+        } else if self.key_bulk_rows.at_eof() {
+            Ok(None)
+        } else {
+            Err(Pending)
+        }
+    }
+
+    fn val(&self) -> Result<Option<&V>, Pending> {
+        if self.val_bulk_rows.row() < self.row_group.start {
+            Err(Pending)
+        } else if self.val_bulk_rows.row() >= self.row_group.end {
+            Ok(None)
+        } else if self.val_bulk_rows.is_readable() {
+            Ok(Some(self.val.as_ref()))
+        } else {
+            Err(Pending)
+        }
+    }
+
+    fn map_times(&mut self, logic: &mut dyn FnMut(&(), &R)) {
+        self.assert_val_valid();
+        logic(&(), self.diff.as_ref());
+    }
+
+    fn weight(&mut self) -> &R {
+        self.assert_val_valid();
+        self.diff.as_ref()
+    }
+
+    fn step_key(&mut self) {
+        self.key_bulk_rows.step();
+        self.fetch_key();
+    }
+
+    fn step_val(&mut self) {
+        self.assert_val_valid();
+        self.val_bulk_rows.step();
+        if self.row_group.contains(&self.val_bulk_rows.row())
+            && unsafe { self.val_bulk_rows.item((&mut self.val, &mut self.diff)) }.is_none()
+        {
+            debug_assert!(!self.val_bulk_rows.is_readable());
+        }
+    }
+
+    fn prime(&mut self) {
+        self.key_bulk_rows.work().unwrap();
+        self.val_bulk_rows.work().unwrap();
+        self.fetch_key();
     }
 }
 
@@ -734,7 +843,7 @@ where
     fn done(self) -> FileIndexedWSet<K, V, R> {
         FileIndexedWSet {
             factories: self.factories,
-            file: Arc::new(self.writer.into_reader().unwrap()),
+            file: Arc::new(self.writer.into_reader(Runtime::buffer_cache).unwrap()),
         }
     }
 

@@ -7,12 +7,13 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::ops::{Add, AddAssign};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{collections::BTreeMap, ops::Range};
 
-use enum_map::{Enum, EnumMap};
+use enum_map::{enum_map, Enum, EnumMap};
 use futures::{
     future::{self, Either},
     pin_mut,
@@ -69,9 +70,21 @@ struct CacheValue {
     serial: u64,
 }
 
-pub trait CacheEntry: Send + Sync + Debug {
+fn is_locked(serial: u64) -> bool {
+    serial > u64::MAX / 2
+}
+
+pub trait CacheEntry: Any + Send + Sync + Debug {
     fn cost(&self) -> usize;
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
+}
+
+impl dyn CacheEntry {
+    pub fn downcast<T>(self: Arc<Self>) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        (self as Arc<dyn Any + Send + Sync>).downcast().ok()
+    }
 }
 
 struct CacheInner {
@@ -83,7 +96,7 @@ struct CacheInner {
     lru: BTreeMap<u64, CacheKey>,
 
     /// Serial number to use the next time we touch a block.
-    next_serial: u64,
+    next_serial: EnumMap<bool, u64>,
 
     /// Sum over `cache[*].block.cost()`.
     cur_cost: usize,
@@ -97,7 +110,7 @@ impl CacheInner {
         Self {
             cache: BTreeMap::new(),
             lru: BTreeMap::new(),
-            next_serial: 0,
+            next_serial: enum_map! { false => 0, true => u64::MAX / 2 },
             cur_cost: 0,
             max_cost,
         }
@@ -142,10 +155,11 @@ impl CacheInner {
 
     fn get(&mut self, key: CacheKey) -> Option<Arc<dyn CacheEntry>> {
         if let Some(value) = self.cache.get_mut(&key) {
+            let is_locked = is_locked(value.serial);
             self.lru.remove(&value.serial);
-            value.serial = self.next_serial;
+            value.serial = self.next_serial[is_locked];
             self.lru.insert(value.serial, key);
-            self.next_serial += 1;
+            self.next_serial[is_locked] += 1;
             Some(value.aux.clone())
         } else {
             None
@@ -161,22 +175,23 @@ impl CacheInner {
         self.debug_check_invariants();
     }
 
-    fn insert(&mut self, key: CacheKey, aux: Arc<dyn CacheEntry>) {
+    fn insert(&mut self, key: CacheKey, aux: Arc<dyn CacheEntry>, lock: bool) {
+        //println!("insert {key:?}");
         let cost = aux.cost();
         self.evict_to(self.max_cost.saturating_sub(cost));
         if let Some(old_value) = self.cache.insert(
             key,
             CacheValue {
                 aux,
-                serial: self.next_serial,
+                serial: self.next_serial[lock],
             },
         ) {
             self.lru.remove(&old_value.serial);
             self.cur_cost -= old_value.aux.cost();
         }
-        self.lru.insert(self.next_serial, key);
+        self.lru.insert(self.next_serial[lock], key);
         self.cur_cost += cost;
-        self.next_serial += 1;
+        self.next_serial[lock] += 1;
         self.debug_check_invariants();
     }
 }
@@ -218,11 +233,30 @@ impl BufferCache {
             .clone()
     }
 
-    pub fn insert(&self, file_id: FileId, offset: u64, aux: Arc<dyn CacheEntry>) {
+    pub fn missing<L>(&self, file: &dyn FileReader, locations: L) -> u64
+    where
+        L: Iterator<Item = BlockLocation> + ExactSizeIterator,
+    {
+        let inner = self.inner.lock().unwrap();
+        let mut result = 0;
+        let file_id = file.file_id();
+        debug_assert!(locations.len() < u64::BITS as usize);
+        for (index, location) in locations.enumerate() {
+            if !inner.cache.contains_key(&CacheKey {
+                file_id,
+                offset: location.offset,
+            }) {
+                result |= 1u64 << index;
+            }
+        }
+        result
+    }
+
+    pub fn insert(&self, file_id: FileId, offset: u64, aux: Arc<dyn CacheEntry>, lock: bool) {
         self.inner
             .lock()
             .unwrap()
-            .insert(CacheKey::new(file_id, offset), aux);
+            .insert(CacheKey::new(file_id, offset), aux, lock);
     }
 
     pub fn evict(&self, file: &dyn FileReader) {
@@ -422,16 +456,18 @@ pub struct AsyncCacheContext {
 struct AsyncCacheTask {
     parse: Box<dyn FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error> + 'static>,
     send_replies: Vec<oneshot::Sender<Result<Arc<dyn CacheEntry>, Error>>>,
+    lock: bool,
 }
 
 impl AsyncCacheTask {
-    fn new<F>(parse: F) -> Self
+    fn new<F>(parse: F, lock: bool) -> Self
     where
         F: FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error> + 'static,
     {
         Self {
             parse: Box::new(parse),
             send_replies: Vec::new(),
+            lock,
         }
     }
 }
@@ -453,6 +489,7 @@ impl AsyncCacheContext {
         &self,
         location: BlockLocation,
         parse: F,
+        lock: bool,
     ) -> Result<Arc<dyn CacheEntry>, Error>
     where
         F: FnOnce(Arc<FBuf>) -> Result<Arc<dyn CacheEntry>, Error> + 'static,
@@ -461,14 +498,16 @@ impl AsyncCacheContext {
         if let Some(aux) = self.cache.inner.lock().unwrap().get(key) {
             return Ok(aux.clone());
         }
+        //println!("wait for {key:?}");
 
         let (sender, receiver) = oneshot::channel();
 
+        //dbg!();
         self.requests
             .lock()
             .unwrap()
             .entry(location)
-            .or_insert_with(|| AsyncCacheTask::new(parse))
+            .or_insert_with(|| AsyncCacheTask::new(parse, lock))
             .send_replies
             .push(sender);
 
@@ -486,7 +525,7 @@ impl AsyncCacheContext {
     }
 
     /// Runs all of the pending I/O and wakes up threads blocked in [Self::read].
-    pub async fn run_io_batch<R>(&self, file: &R)
+    async fn run_io_batch<R>(&self, file: &R)
     where
         R: FileReader + ?Sized,
     {
@@ -511,6 +550,7 @@ impl AsyncCacheContext {
                 self.cache.inner.lock().unwrap().insert(
                     CacheKey::new(self.file_id, location.offset),
                     cache_entry.clone(),
+                    task.lock,
                 );
             }
             for send_reply in task.send_replies {
@@ -535,34 +575,113 @@ impl AsyncCacheContext {
         F: Future<Output = T>,
         R: FileReader + ?Sized,
     {
-        let mut tasks = tasks
-            .into_iter()
-            .enumerate()
-            .map(|(index, future)| async move { (index, future.await) })
-            .collect::<FuturesUnordered<_>>();
-        let mut outputs = Vec::with_capacity(tasks.len());
-        for _ in 0..tasks.len() {
-            outputs.push(None);
-        }
-        while !tasks.is_empty() {
-            let wait = self.wait(tasks.len());
+        let mut futures = FuturesUnordered::new();
+        let mut outputs = Vec::new();
+        for task in tasks.into_iter() {
+            let wait = self.wait(futures.len() + 1);
             pin_mut!(wait);
-            match future::select(tasks.next(), wait).await {
+            let task = Box::pin(task);
+            match future::select(task, wait).await {
+                Either::Left((output, _)) => {
+                    outputs.push(Some(output));
+                }
+                Either::Right((_, task)) => {
+                    futures.push({
+                        let index = outputs.len();
+                        async move { (index, task.await) }
+                    });
+                    outputs.push(None);
+                }
+            }
+        }
+
+        while !futures.is_empty() {
+            let wait = self.wait(futures.len());
+            pin_mut!(wait);
+            match future::select(futures.next(), wait).await {
                 Either::Left((Some((index, output)), _)) => {
                     // A task has completed.
                     outputs[index] = Some(output);
                 }
                 Either::Left((None, _)) => {
-                    // Unreachable because we know that `tasks` is not empty.
+                    // Unreachable because we know that `futures` is not empty.
                     unreachable!()
                 }
                 Either::Right((_, _)) => {
-                    // All of the tasks we launched have blocked on I/O. Launch a batch
+                    // All of the futures we launched have blocked on I/O. Launch a batch
                     // of I/O and wait for it to complete.
                     self.run_io_batch(file).await;
                 }
             }
         }
         outputs.into_iter().map(|output| output.unwrap()).collect()
+    }
+
+    pub fn tasks<F, R>(&self) -> AsyncTasks<F, R> {
+        AsyncTasks {
+            context: self,
+            futures: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+}
+
+pub struct AsyncTasks<'a, F, T> {
+    context: &'a AsyncCacheContext,
+    futures: Vec<(usize, Pin<Box<F>>)>,
+    outputs: Vec<Option<T>>,
+}
+
+impl<'a, F, T> AsyncTasks<'a, F, T>
+where
+    F: Future<Output = T>,
+{
+    pub async fn push(&mut self, future: F) {
+        let wait = self.context.wait(self.futures.len() + 1);
+        pin_mut!(wait);
+        let future = Box::pin(future);
+        match future::select(future, wait).await {
+            Either::Left((output, _)) => {
+                self.outputs.push(Some(output));
+            }
+            Either::Right((_, future)) => {
+                self.futures.push((self.outputs.len(), future));
+                self.outputs.push(None);
+            }
+        }
+    }
+    pub async fn run<R>(mut self, file: &R) -> Vec<T>
+    where
+        R: FileReader + ?Sized,
+    {
+        let mut futures = self
+            .futures
+            .into_iter()
+            .map(|(index, future)| async move { (index, future.await) })
+            .collect::<FuturesUnordered<_>>();
+
+        while !futures.is_empty() {
+            let wait = self.context.wait(futures.len());
+            pin_mut!(wait);
+            match future::select(futures.next(), wait).await {
+                Either::Left((Some((index, output)), _)) => {
+                    // A task has completed.
+                    self.outputs[index] = Some(output);
+                }
+                Either::Left((None, _)) => {
+                    // Unreachable because we know that `futures` is not empty.
+                    unreachable!()
+                }
+                Either::Right((_, _)) => {
+                    // All of the futures we launched have blocked on I/O. Launch a batch
+                    // of I/O and wait for it to complete.
+                    self.context.run_io_batch(file).await;
+                }
+            }
+        }
+        self.outputs
+            .into_iter()
+            .map(|output| output.unwrap())
+            .collect()
     }
 }

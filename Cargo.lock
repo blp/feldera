@@ -3555,6 +3555,7 @@ dependencies = [
  "rkyv",
  "serde",
  "serde_json",
+ "smallvec",
  "snap",
  "static_assertions",
  "tar",

@@ -36,14 +36,12 @@
 //! value and for sequential reads.  It should be possible to disable indexing
 //! by data value for workloads that don't require it.[^0]
 //!
-//! Layer files should support approximate set membership query in `~O(1)`
-//! time.[^0]
+//! Layer files support approximate set membership query in `~O(1)` time using
+//! [a filter block](format::FilterBlock).
 //!
 //! Layer files should support 1 TB data size.
 //!
 //! Layer files should include data checksums to detect accidental corruption.
-//!
-//! [^0]: Not yet implemented.
 //!
 //! # Design
 //!
@@ -70,8 +68,10 @@
 // Warn about missing docs, but not for item declared with `#[cfg(test)]`.
 #![cfg_attr(not(test), warn(missing_docs))]
 
-use crate::dynamic::ArchivedDBData;
-use crate::storage::buffer_cache::{FBuf, FBufSerializer};
+use crate::{
+    dynamic::{ArchivedDBData, DynVec, LeanVec},
+    storage::buffer_cache::{FBuf, FBufSerializer},
+};
 use rkyv::de::deserializers::SharedDeserializeMap;
 use rkyv::{
     ser::{
@@ -112,6 +112,12 @@ where
 
     /// Factory for creating instances of `Item<K, A>`.
     pub item_factory: &'static dyn ItemFactory<K, A>,
+
+    /// Factory for creating instances of `Vector<K>`.
+    pub keys_factory: &'static dyn Factory<DynVec<K>>,
+
+    /// Factory for creating instances of `Vector<A>`.
+    pub auxes_factory: &'static dyn Factory<DynVec<A>>,
 }
 
 impl<K, A> Clone for Factories<K, A>
@@ -123,6 +129,8 @@ where
         Self {
             key_factory: self.key_factory,
             item_factory: self.item_factory,
+            keys_factory: self.keys_factory,
+            auxes_factory: self.auxes_factory,
         }
     }
 }
@@ -142,6 +150,8 @@ where
         Self {
             key_factory: WithFactory::<KType>::FACTORY,
             item_factory: <RefTup2Factory<KType, AType> as WithItemFactory<K, A>>::ITEM_FACTORY,
+            keys_factory: WithFactory::<LeanVec<KType>>::FACTORY,
+            auxes_factory: WithFactory::<LeanVec<AType>>::FACTORY,
         }
     }
 
@@ -154,6 +164,8 @@ where
         AnyFactories {
             key_factory: Arc::new(self.key_factory),
             item_factory: Arc::new(self.item_factory),
+            keys_factory: Arc::new(self.keys_factory),
+            auxes_factory: Arc::new(self.auxes_factory),
         }
     }
 }
@@ -170,6 +182,8 @@ where
 pub struct AnyFactories {
     key_factory: Arc<(dyn Any + Send + Sync + 'static)>,
     item_factory: Arc<(dyn Any + Send + Sync + 'static)>,
+    keys_factory: Arc<(dyn Any + Send + Sync + 'static)>,
+    auxes_factory: Arc<(dyn Any + Send + Sync + 'static)>,
 }
 
 impl Debug for AnyFactories {
@@ -202,6 +216,28 @@ impl AnyFactories {
             .unwrap()
     }
 
+    fn keys_factory<K>(&self) -> &'static dyn Factory<DynVec<K>>
+    where
+        K: DataTrait + ?Sized,
+    {
+        *self
+            .keys_factory
+            .as_ref()
+            .downcast_ref::<&'static dyn Factory<DynVec<K>>>()
+            .unwrap()
+    }
+
+    fn auxes_factory<K>(&self) -> &'static dyn Factory<DynVec<K>>
+    where
+        K: DataTrait + ?Sized,
+    {
+        *self
+            .auxes_factory
+            .as_ref()
+            .downcast_ref::<&'static dyn Factory<DynVec<K>>>()
+            .unwrap()
+    }
+
     fn factories<K, A>(&self) -> Factories<K, A>
     where
         K: DataTrait + ?Sized,
@@ -210,6 +246,8 @@ impl AnyFactories {
         Factories {
             key_factory: self.key_factory(),
             item_factory: self.item_factory(),
+            keys_factory: self.keys_factory(),
+            auxes_factory: self.auxes_factory(),
         }
     }
 }
@@ -293,16 +331,24 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    use std::{marker::PhantomData, sync::Arc};
 
     use crate::{
+        dynamic::{DynWeight, Factory, LeanVec, Vector, WithFactory},
         storage::{
             backend::StorageBackend,
             buffer_cache::BufferCache,
-            file::{format::Compression, reader::Reader},
+            file::{
+                format::Compression,
+                reader::{BulkRows, Reader},
+            },
             test::init_test_logger,
         },
-        Runtime,
+        trace::{
+            ord::vec::{indexed_wset_batch::VecIndexedWSetBuilder, wset_batch::VecWSetBuilder},
+            BatchReaderFactories, Builder, VecIndexedWSetFactories, VecWSetFactories,
+        },
+        DBWeight,
     };
 
     use super::{
@@ -320,6 +366,13 @@ mod test {
     use rand::{seq::SliceRandom, thread_rng, Rng};
     use tempfile::tempdir;
 
+    fn test_buffer_cache() -> Arc<BufferCache> {
+        thread_local! {
+            static BUFFER_CACHE: Arc<BufferCache> = Arc::new(BufferCache::new(1024 * 1024));
+        }
+        BUFFER_CACHE.with(|cache| cache.clone())
+    }
+
     fn for_each_compression_type<F>(parameters: Parameters, f: F)
     where
         F: Fn(Parameters),
@@ -334,7 +387,7 @@ mod test {
         type K0: DBData;
         type A0: DBData;
         type K1: DBData;
-        type A1: DBData;
+        type A1: DBWeight;
 
         fn n0() -> usize;
         fn key0(row0: usize) -> Self::K0;
@@ -345,6 +398,77 @@ mod test {
         fn key1(row0: usize, row1: usize) -> Self::K1;
         fn near1(row0: usize, row1: usize) -> (Self::K1, Self::K1);
         fn aux1(row0: usize, row1: usize) -> Self::A1;
+    }
+
+    struct Column0<T> {
+        row: usize,
+        _phantom: PhantomData<T>,
+    }
+
+    impl<T> Column0<T> {
+        pub fn new() -> Self {
+            Self {
+                row: 0,
+                _phantom: PhantomData,
+            }
+        }
+    }
+
+    impl<T> Iterator for Column0<T>
+    where
+        T: TwoColumns,
+    {
+        type Item = (T::K0, T::A0);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.row >= T::n0() {
+                None
+            } else {
+                let retval = Some((T::key0(self.row), T::aux0(self.row)));
+                self.row += 1;
+                retval
+            }
+        }
+    }
+
+    struct Column1<T> {
+        row0: usize,
+        row1: usize,
+        _phantom: PhantomData<T>,
+    }
+
+    impl<T> Column1<T>
+    where
+        T: TwoColumns,
+    {
+        fn new() -> Self {
+            Self {
+                row0: 0,
+                row1: 0,
+                _phantom: PhantomData,
+            }
+        }
+    }
+
+    impl<T> Iterator for Column1<T>
+    where
+        T: TwoColumns,
+    {
+        type Item = (T::K1, T::A1);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.row0 >= T::n0() {
+                None
+            } else {
+                let retval = Some((T::key1(self.row0, self.row1), T::aux1(self.row0, self.row1)));
+                self.row1 += 1;
+                if self.row1 >= T::n1(self.row0) {
+                    self.row0 += 1;
+                    self.row1 = 0;
+                }
+                retval
+            }
+        }
     }
 
     fn test_find<K, A, N, T>(
@@ -718,6 +842,103 @@ mod test {
         })
     }
 
+    fn test_bulk_rows<K, A, N, T>(
+        mut bulk: BulkRows<DynData, DynData, N, T>,
+        mut expected: impl Iterator<Item = (K, A)>,
+    ) where
+        K: DBData,
+        A: DBData,
+        T: ColumnSpec,
+    {
+        let mut tmp_key = K::default();
+        let mut tmp_aux = A::default();
+        let (tmp_key, tmp_aux): (&mut DynData, &mut DynData) =
+            (tmp_key.erase_mut(), tmp_aux.erase_mut());
+
+        while !bulk.at_eof() {
+            bulk.wait().unwrap();
+            let (mut key, mut aux) = expected.next().unwrap();
+            assert_eq!(
+                unsafe { bulk.item((tmp_key, tmp_aux)) },
+                Some((key.erase_mut(), aux.erase_mut()))
+            );
+            bulk.step();
+        }
+        assert!(expected.next().is_none());
+    }
+
+    fn test_multifetch_zset<K, A, N>(
+        reader: &Reader<(&'static DynData, &'static DynWeight, N)>,
+        n: usize,
+        expected_fn: impl Fn(usize) -> (K, K, K, A),
+    ) where
+        K: DBData,
+        A: DBWeight,
+        N: ColumnSpec,
+    {
+        let keys_factory: &dyn Factory<dyn Vector<DynData>> = WithFactory::<LeanVec<K>>::FACTORY;
+
+        let vec_wset_factories = VecWSetFactories::new::<K, (), A>();
+        let mut expected = VecWSetBuilder::new_builder(&vec_wset_factories);
+
+        let mut keys = keys_factory.default_box();
+        for i in 0..n {
+            if rand::random() {
+                let (_before, key, _after, diff) = (expected_fn)(i);
+                keys.push_ref(&key);
+                expected.push_val_diff(().erase(), diff.erase());
+                expected.push_key(key.erase());
+            }
+        }
+        let expected = expected.done();
+
+        let mut multifetch = reader.fetch_zset(&*keys).unwrap();
+        while !multifetch.is_done() {
+            multifetch.wait().unwrap();
+        }
+        let output = multifetch.results(vec_wset_factories);
+        assert_eq!(&output, &expected);
+    }
+
+    fn test_multifetch_two_columns<T>(
+        reader: &Reader<(
+            &'static DynData,
+            &'static DynData,
+            (&'static DynData, &'static DynWeight, ()),
+        )>,
+    ) where
+        T: TwoColumns,
+    {
+        let keys_factory: &dyn Factory<dyn Vector<DynData>> =
+            WithFactory::<LeanVec<T::K0>>::FACTORY;
+
+        let vec_indexed_wset_factories = VecIndexedWSetFactories::new::<T::K0, T::K1, T::A1>();
+        let mut expected = VecIndexedWSetBuilder::new_builder(&vec_indexed_wset_factories);
+
+        let mut keys = keys_factory.default_box();
+        for i in 0..T::n0() {
+            if rand::random() {
+                keys.push_ref(&T::key0(i));
+
+                for j in 0..T::n1(i) {
+                    let val = T::key1(i, j);
+                    let weight = T::aux1(i, j);
+                    expected.push_val_diff(val.erase(), weight.erase());
+                }
+                let key = T::key0(i);
+                expected.push_key(key.erase());
+            }
+        }
+        let expected = expected.done();
+
+        let mut multifetch = reader.fetch_indexed_zset(&*keys).unwrap();
+        while !multifetch.is_done() {
+            multifetch.wait().unwrap();
+        }
+        let output = multifetch.results(vec_indexed_wset_factories);
+        assert_eq!(&output, &expected);
+    }
+
     fn test_bloom<K, A, N>(
         reader: &Reader<(&'static DynData, &'static DynData, N)>,
         n: usize,
@@ -776,7 +997,6 @@ mod test {
         let factories0 = Factories::<DynData, DynData>::new::<T::K0, T::A0>();
         let factories1 = Factories::<DynData, DynData>::new::<T::K1, T::A1>();
 
-        let cache = Arc::new(BufferCache::new(1024 * 1024));
         let tempdir = tempdir().unwrap();
         let storage_backend = <dyn StorageBackend>::new(
             &StorageConfig {
@@ -789,7 +1009,7 @@ mod test {
         let mut layer_file = Writer2::new(
             &factories0,
             &factories1,
-            cache.clone(),
+            test_buffer_cache(),
             &*storage_backend,
             parameters,
             T::n0(),
@@ -805,7 +1025,7 @@ mod test {
             layer_file.write0((&T::key0(row0), &T::aux0(row0))).unwrap();
         }
 
-        let reader = layer_file.into_reader().unwrap();
+        let reader = layer_file.into_reader(test_buffer_cache).unwrap();
         reader.evict();
         let rows0 = reader.rows();
         let expected0 = |row0| {
@@ -828,7 +1048,11 @@ mod test {
             let n1 = T::n1(row0);
             test_cursor(&rows1, n1, |row1| expected1(row0, row1));
         }
-
+        test_bulk_rows(reader.bulk_rows().unwrap(), Column0::<T>::new());
+        test_bulk_rows(
+            reader.bulk_rows().unwrap().next_column().unwrap(),
+            Column1::<T>::new(),
+        );
         TOKIO.block_on(async {
             // Force some blocking due to I/O, to test those cases in
             // [AsyncCacheContext].
@@ -856,7 +1080,47 @@ mod test {
                     }],
                 )
                 .await;
-        });
+        })
+    }
+
+    fn test_two_columns_multifetch<T>(parameters: Parameters)
+    where
+        T: TwoColumns,
+    {
+        let factories0 = Factories::<DynData, DynData>::new::<T::K0, T::A0>();
+        let factories1 = Factories::<DynData, DynWeight>::new::<T::K1, T::A1>();
+
+        let tempdir = tempdir().unwrap();
+        let storage_backend = <dyn StorageBackend>::new(
+            &StorageConfig {
+                path: tempdir.path().to_string_lossy().to_string(),
+                cache: Default::default(),
+            },
+            &StorageOptions::default(),
+        )
+        .unwrap();
+        let mut layer_file = Writer2::new(
+            &factories0,
+            &factories1,
+            test_buffer_cache(),
+            &*storage_backend,
+            parameters,
+            T::n0(),
+        )
+        .unwrap();
+        let n0 = T::n0();
+        for row0 in 0..n0 {
+            for row1 in 0..T::n1(row0) {
+                layer_file
+                    .write1((&T::key1(row0, row1), &T::aux1(row0, row1)))
+                    .unwrap();
+            }
+            layer_file.write0((&T::key0(row0), &T::aux0(row0))).unwrap();
+        }
+
+        let reader = layer_file.into_reader(test_buffer_cache).unwrap();
+        reader.evict();
+        test_multifetch_two_columns::<T>(&reader);
     }
 
     fn test_2_columns_helper(parameters: Parameters) {
@@ -895,22 +1159,74 @@ mod test {
                 0x2222
             }
         }
-
-        for_each_compression_type(parameters, |parameters| {
-            test_two_columns::<TwoInts>(parameters)
-        });
+        test_two_columns::<TwoInts>(parameters.clone());
+        test_two_columns_multifetch::<TwoInts>(parameters);
     }
 
     #[test]
-    fn test_2_columns() {
+    fn two_columns_uncompressed() {
         init_test_logger();
-        test_2_columns_helper(Parameters::default());
+        test_2_columns_helper(Parameters::default().with_compression(None));
     }
 
     #[test]
-    fn test_2_columns_max_branch_2() {
+    fn two_columns_snappy() {
         init_test_logger();
-        test_2_columns_helper(Parameters::default().with_max_branch(2));
+        test_2_columns_helper(Parameters::default().with_compression(Some(Compression::Snappy)));
+    }
+
+    #[test]
+    fn two_columns_max_branch_2_uncompressed() {
+        init_test_logger();
+        test_2_columns_helper(
+            Parameters::default()
+                .with_max_branch(2)
+                .with_compression(None),
+        );
+    }
+
+    #[test]
+    fn two_columns_max_branch_2_snappy() {
+        init_test_logger();
+        test_2_columns_helper(
+            Parameters::default()
+                .with_max_branch(2)
+                .with_compression(Some(Compression::Snappy)),
+        );
+    }
+
+    struct OneColumn<'a, T> {
+        expected: &'a T,
+        row: usize,
+        n: usize,
+    }
+
+    impl<'a, T> OneColumn<'a, T> {
+        pub fn new(expected: &'a T, n: usize) -> Self {
+            Self {
+                expected,
+                row: 0,
+                n,
+            }
+        }
+    }
+
+    impl<'a, T, K, A> Iterator for OneColumn<'a, T>
+    where
+        T: Fn(usize) -> (K, K, K, A),
+    {
+        type Item = (K, A);
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.row >= self.n {
+                None
+            } else {
+                let (_before, key, _after, aux) = (self.expected)(self.row);
+                let retval = Some((key, aux));
+                self.row += 1;
+                retval
+            }
+        }
     }
 
     fn test_one_column<K, A>(
@@ -921,69 +1237,119 @@ mod test {
         K: DBData,
         A: DBData,
     {
-        for_each_compression_type(parameters, |parameters| {
-            for reopen in [false, true] {
-                let factories = Factories::<DynData, DynData>::new::<K, A>();
-                let cache = Arc::new(BufferCache::new(1024 * 1024));
-                let tempdir = tempdir().unwrap();
-                let storage_backend = <dyn StorageBackend>::new(
-                    &StorageConfig {
-                        path: tempdir.path().to_string_lossy().to_string(),
-                        cache: Default::default(),
-                    },
-                    &StorageOptions::default(),
-                )
-                .unwrap();
-                let mut writer = Writer1::new(
-                    &factories,
-                    cache.clone(),
-                    &*storage_backend,
-                    parameters.clone(),
-                    n,
-                )
-                .unwrap();
-                for row in 0..n {
-                    let (_before, key, _after, aux) = expected(row);
-                    writer.write0((&key, &aux)).unwrap();
-                }
-
-                let reader = if reopen {
-                    println!("closing writer and reopening as reader");
-                    let (_file_handle, path, _bloom_filter) = writer.close().unwrap();
-                    Reader::open(
-                        &[&factories.any_factories()],
-                        Runtime::buffer_cache,
-                        &*storage_backend,
-                        &path,
-                    )
-                    .unwrap()
-                } else {
-                    println!("transforming writer into reader");
-                    writer.into_reader().unwrap()
-                };
-                reader.evict();
-                assert_eq!(reader.rows().len(), n as u64);
-                test_cursor(&reader.rows(), n, &expected);
-                test_bloom(&reader, n, &expected);
-
-                TOKIO.block_on(async {
-                    // Force some blocking due to I/O, to test those cases in
-                    // [AsyncCacheContext].
-                    reader.evict();
-
-                    let context = reader.new_async_context();
-                    context
-                        .execute_tasks(
-                            reader.file_handle(),
-                            [async {
-                                let row_group = reader.rows_async(&context);
-                                test_cursor_async(&row_group, n, &expected).await;
-                            }],
-                        )
-                        .await;
-                });
+        for reopen in [false, true] {
+            let factories = Factories::<DynData, DynData>::new::<K, A>();
+            let tempdir = tempdir().unwrap();
+            let storage_backend = <dyn StorageBackend>::new(
+                &StorageConfig {
+                    path: tempdir.path().to_string_lossy().to_string(),
+                    cache: Default::default(),
+                },
+                &StorageOptions::default(),
+            )
+            .unwrap();
+            let mut writer = Writer1::new(
+                &factories,
+                test_buffer_cache(),
+                &*storage_backend,
+                parameters.clone(),
+                n,
+            )
+            .unwrap();
+            for row in 0..n {
+                let (_before, key, _after, aux) = expected(row);
+                writer.write0((&key, &aux)).unwrap();
             }
-        });
+
+            let reader = if reopen {
+                println!("closing writer and reopening as reader");
+                let (_file_handle, path, _bloom_filter) = writer.close().unwrap();
+                Reader::open(
+                    &[&factories.any_factories()],
+                    test_buffer_cache,
+                    &*storage_backend,
+                    &path,
+                )
+                .unwrap()
+            } else {
+                println!("transforming writer into reader");
+                writer.into_reader(test_buffer_cache).unwrap()
+            };
+            reader.evict();
+            assert_eq!(reader.rows().len(), n as u64);
+            test_cursor(&reader.rows(), n, &expected);
+            test_bloom(&reader, n, &expected);
+            test_bulk_rows(reader.bulk_rows().unwrap(), OneColumn::new(&expected, n));
+
+            TOKIO.block_on(async {
+                // Force some blocking due to I/O, to test those cases in
+                // [AsyncCacheContext].
+                reader.evict();
+
+                let context = reader.new_async_context();
+                context
+                    .execute_tasks(
+                        reader.file_handle(),
+                        [async {
+                            let row_group = reader.rows_async(&context);
+                            test_cursor_async(&row_group, n, &expected).await;
+                        }],
+                    )
+                    .await;
+            });
+        }
+    }
+
+    fn test_one_column_zset<K, A>(
+        n: usize,
+        expected: impl Fn(usize) -> (K, K, K, A),
+        parameters: Parameters,
+    ) where
+        K: DBData,
+        A: DBWeight,
+    {
+        for reopen in [false, true] {
+            let factories = Factories::<DynData, DynWeight>::new::<K, A>();
+            let tempdir = tempdir().unwrap();
+            let storage_backend = <dyn StorageBackend>::new(
+                &StorageConfig {
+                    path: tempdir.path().to_string_lossy().to_string(),
+                    cache: Default::default(),
+                },
+                &StorageOptions::default(),
+            )
+            .unwrap();
+            let mut writer = Writer1::new(
+                &factories,
+                test_buffer_cache(),
+                &*storage_backend,
+                parameters.clone(),
+                n,
+            )
+            .unwrap();
+            for row in 0..n {
+                let (_before, key, _after, aux) = expected(row);
+                writer.write0((&key, &aux)).unwrap();
+            }
+
+            let reader = if reopen {
+                println!("closing writer and reopening as reader");
+                let (_file_handle, path, _bloom_filter) = writer.close().unwrap();
+                Reader::open(
+                    &[&factories.any_factories()],
+                    test_buffer_cache,
+                    &*storage_backend,
+                    &path,
+                )
+                .unwrap()
+            } else {
+                println!("transforming writer into reader");
+                writer.into_reader(test_buffer_cache).unwrap()
+            };
+            reader.evict();
+            assert_eq!(reader.rows().len(), n as u64);
+            test_multifetch_zset(&reader, n, &expected);
+        }
     }
 
     fn test_i64_helper(parameters: Parameters) {
@@ -997,22 +1363,48 @@ mod test {
 
     #[test]
     fn test_i64() {
-        test_i64_helper(Parameters::default());
+        for_each_compression_type(Parameters::default(), test_i64_helper);
     }
 
     #[test]
     fn test_i64_max_branch_32() {
-        test_i64_helper(Parameters::default().with_max_branch(32));
+        for_each_compression_type(Parameters::default().with_max_branch(32), test_i64_helper);
     }
 
     #[test]
-    fn test_i64_max_branch_3() {
-        test_i64_helper(Parameters::default().with_max_branch(3));
+    fn test_i64_max_branch_3_uncompressed() {
+        test_i64_helper(
+            Parameters::default()
+                .with_max_branch(3)
+                .with_compression(None),
+        );
     }
 
     #[test]
-    fn test_i64_max_branch_2() {
-        test_i64_helper(Parameters::default().with_max_branch(2));
+    fn test_i64_max_branch_3_snappy() {
+        test_i64_helper(
+            Parameters::default()
+                .with_max_branch(3)
+                .with_compression(Some(Compression::Snappy)),
+        );
+    }
+
+    #[test]
+    fn test_i64_max_branch_2_uncompressed() {
+        test_i64_helper(
+            Parameters::default()
+                .with_max_branch(2)
+                .with_compression(None),
+        );
+    }
+
+    #[test]
+    fn test_i64_max_branch_2_snappy() {
+        test_i64_helper(
+            Parameters::default()
+                .with_max_branch(2)
+                .with_compression(Some(Compression::Snappy)),
+        );
     }
 
     #[test]
@@ -1022,28 +1414,30 @@ mod test {
         }
 
         init_test_logger();
-        test_one_column(
-            1000,
-            |row| (f(row * 2), f(row * 2 + 1), f(row * 2 + 2), ()),
-            Parameters::default(),
-        );
+        for_each_compression_type(Parameters::default(), |parameters| {
+            test_one_column(
+                1000,
+                |row| (f(row * 2), f(row * 2 + 1), f(row * 2 + 2), ()),
+                parameters,
+            )
+        });
     }
 
     #[test]
     fn test_tuple() {
         init_test_logger();
-        test_one_column(
-            1000,
-            |row| {
+        for_each_compression_type(Parameters::default(), |parameters| {
+            let expected = |row| {
                 (
                     (row as u64, 0),
                     (row as u64, 1),
                     (row as u64, 2),
-                    row as u64,
+                    row as u64 + 1,
                 )
-            },
-            Parameters::default(),
-        );
+            };
+            test_one_column(1000, &expected, parameters.clone());
+            test_one_column_zset(1000, &expected, parameters);
+        });
     }
 
     #[test]
@@ -1052,10 +1446,12 @@ mod test {
             (0..row as i64).collect()
         }
         init_test_logger();
-        test_one_column(
-            500,
-            |row| (v(row * 2), v(row * 2 + 1), v(row * 2 + 2), ()),
-            Parameters::default(),
-        );
+        for_each_compression_type(Parameters::default(), |parameters| {
+            test_one_column(
+                500,
+                |row| (v(row * 2), v(row * 2 + 1), v(row * 2 + 2), ()),
+                parameters,
+            )
+        });
     }
 }
