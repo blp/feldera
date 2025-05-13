@@ -7,13 +7,14 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::ops::{Add, AddAssign};
+use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use std::{collections::BTreeMap, ops::Range};
 
 use enum_map::{enum_map, Enum, EnumMap};
-use futures::poll;
 use futures::{
     future::{self, Either},
     pin_mut,
@@ -549,31 +550,34 @@ impl AsyncCacheContext {
         F: Future<Output = T>,
         R: FileReader + ?Sized,
     {
-        let mut tasks = tasks
-            .into_iter()
-            .enumerate()
-            .map(|(index, future)| async move { (index, future.await) })
-            .collect::<FuturesUnordered<_>>();
-        let n = tasks.len();
-        let mut outputs = Vec::with_capacity(tasks.len());
-        for _ in 0..tasks.len() {
-            outputs.push(None);
+        let mut futures = FuturesUnordered::new();
+        let mut outputs = Vec::new();
+        for (index, task) in tasks.into_iter().enumerate() {
+            let mut task = pin!(task);
+            match task.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(output) => outputs.push(Some(output)),
+                Poll::Pending => {
+                    //futures.push(async move { (index, task.await) });
+                    outputs.push(None);
+                }
+            }
         }
+        let n = futures.len();
         let mut x = 0;
-        while !tasks.is_empty() {
-            let wait = self.wait(tasks.len());
+        while !futures.is_empty() {
+            let wait = self.wait(futures.len());
             pin_mut!(wait);
-            match future::select(tasks.next(), wait).await {
+            match future::select(futures.next(), wait).await {
                 Either::Left((Some((index, output)), _)) => {
                     // A task has completed.
                     outputs[index] = Some(output);
                 }
                 Either::Left((None, _)) => {
-                    // Unreachable because we know that `tasks` is not empty.
+                    // Unreachable because we know that `futures` is not empty.
                     unreachable!()
                 }
                 Either::Right((_, _)) => {
-                    // All of the tasks we launched have blocked on I/O. Launch a batch
+                    // All of the futures we launched have blocked on I/O. Launch a batch
                     // of I/O and wait for it to complete.
                     self.run_io_batch(file).await;
                     x += 1;
