@@ -87,7 +87,7 @@ impl FileReader for PosixReader {
     }
 
     fn read_block(&self, location: BlockLocation) -> Result<Arc<FBuf>, StorageError> {
-        //busy_wait(Duration::from_millis(2));
+        busy_wait(Duration::from_millis(2));
         let mut buffer = FBuf::with_capacity(location.size);
 
         match buffer.read_exact_at(&self.file, location.offset, location.size) {
@@ -105,11 +105,7 @@ impl FileReader for PosixReader {
             //self.async_threads {
             let file = self.file.clone();
             TOKIO.spawn_blocking(move || {
-                /*
-                busy_wait(
-                    Duration::from_millis(2) + Duration::from_micros(100) * blocks.len() as u32,
-                );*/
-                println!("{}", blocks.len());
+                busy_wait(Duration::from_millis(2));
                 callback(
                     blocks
                         .into_iter()

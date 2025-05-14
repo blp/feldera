@@ -552,16 +552,24 @@ impl AsyncCacheContext {
     {
         let mut futures = FuturesUnordered::new();
         let mut outputs = Vec::new();
-        for (index, task) in tasks.into_iter().enumerate() {
-            let mut task = pin!(task);
-            match task.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-                Poll::Ready(output) => outputs.push(Some(output)),
-                Poll::Pending => {
-                    //futures.push(async move { (index, task.await) });
+        for task in tasks.into_iter() {
+            let wait = self.wait(futures.len() + 1);
+            pin_mut!(wait);
+            let task = Box::pin(task);
+            match future::select(task, wait).await {
+                Either::Left((output, _)) => {
+                    outputs.push(Some(output));
+                }
+                Either::Right((_, task)) => {
+                    futures.push({
+                        let index = outputs.len();
+                        async move { (index, task.await) }
+                    });
                     outputs.push(None);
                 }
             }
         }
+
         let n = futures.len();
         let mut x = 0;
         while !futures.is_empty() {

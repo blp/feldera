@@ -424,6 +424,7 @@ where
                 }
                 output
             });
+
             if tasks.len() >= 100 {
                 outputs.append(&mut context.execute_tasks(self.file.file_handle(), tasks).await);
                 tasks = Vec::new();
