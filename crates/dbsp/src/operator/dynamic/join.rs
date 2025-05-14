@@ -1311,7 +1311,7 @@ where
         let mut index_cursor = index.cursor();
 
         let fetched = trace.fetch(index).await;
-        let mut trace_cursor = if let Some(fetched) = fetched.as_ref() {
+        let mut trace_cursor = if let Some(fetched) = &fetched {
             fetched.get_cursor()
         } else {
             Box::new(trace.cursor())

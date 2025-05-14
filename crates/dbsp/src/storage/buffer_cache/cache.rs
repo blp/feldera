@@ -7,10 +7,9 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::ops::{Add, AddAssign};
-use std::pin::{pin, Pin};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use std::{collections::BTreeMap, ops::Range};
 
@@ -596,5 +595,79 @@ impl AsyncCacheContext {
             println!("{n} in {x} rounds");
         }
         outputs.into_iter().map(|output| output.unwrap()).collect()
+    }
+
+    pub fn tasks<F, R>(&self) -> AsyncTasks<F, R> {
+        AsyncTasks {
+            context: self,
+            futures: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+}
+
+pub struct AsyncTasks<'a, F, T> {
+    context: &'a AsyncCacheContext,
+    futures: Vec<(usize, Pin<Box<F>>)>,
+    outputs: Vec<Option<T>>,
+}
+
+impl<'a, F, T> AsyncTasks<'a, F, T>
+where
+    F: Future<Output = T>,
+{
+    pub async fn push(&mut self, future: F) {
+        let wait = self.context.wait(self.futures.len() + 1);
+        pin_mut!(wait);
+        let future = Box::pin(future);
+        match future::select(future, wait).await {
+            Either::Left((output, _)) => {
+                self.outputs.push(Some(output));
+            }
+            Either::Right((_, future)) => {
+                self.futures.push((self.outputs.len(), future));
+                self.outputs.push(None);
+            }
+        }
+    }
+    pub async fn run<R>(mut self, file: &R) -> Vec<T>
+    where
+        R: FileReader + ?Sized,
+    {
+        let mut futures = self
+            .futures
+            .into_iter()
+            .map(|(index, future)| async move { (index, future.await) })
+            .collect::<FuturesUnordered<_>>();
+
+        let n = futures.len();
+        let mut x = 0;
+        while !futures.is_empty() {
+            let wait = self.context.wait(futures.len());
+            pin_mut!(wait);
+            match future::select(futures.next(), wait).await {
+                Either::Left((Some((index, output)), _)) => {
+                    // A task has completed.
+                    self.outputs[index] = Some(output);
+                }
+                Either::Left((None, _)) => {
+                    // Unreachable because we know that `futures` is not empty.
+                    unreachable!()
+                }
+                Either::Right((_, _)) => {
+                    // All of the futures we launched have blocked on I/O. Launch a batch
+                    // of I/O and wait for it to complete.
+                    self.context.run_io_batch(file).await;
+                    x += 1;
+                }
+            }
+        }
+        if n > 0 {
+            println!("{n} in {x} rounds");
+        }
+        self.outputs
+            .into_iter()
+            .map(|output| output.unwrap())
+            .collect()
     }
 }
