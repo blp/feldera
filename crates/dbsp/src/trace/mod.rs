@@ -529,7 +529,7 @@ where
         keys: &B,
     ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
     where
-        B: Batch<Key = Self::Key, Time = ()>,
+        B: BatchReader<Key = Self::Key, Time = ()>,
     {
         let _ = keys;
         None
@@ -599,7 +599,7 @@ where
         keys: &KB,
     ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
     where
-        KB: Batch<Key = Self::Key, Time = ()>,
+        KB: BatchReader<Key = Self::Key, Time = ()>,
     {
         (**self).fetch(keys).await
     }

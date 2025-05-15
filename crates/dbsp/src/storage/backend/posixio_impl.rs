@@ -18,7 +18,7 @@ use metrics::counter;
 use std::ffi::OsString;
 use std::fs::{create_dir_all, DirEntry};
 use std::io::{ErrorKind, IoSlice, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     fs::{self, File, OpenOptions},
     io::Error as IoError,

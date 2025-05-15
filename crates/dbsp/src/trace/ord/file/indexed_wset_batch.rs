@@ -394,12 +394,11 @@ where
         keys: &B,
     ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
     where
-        B: Batch<Key = Self::Key>,
+        B: BatchReader<Key = Self::Key>,
     {
         let context = self.file.new_async_context();
         let mut tasks = context.tasks();
         let mut keys = keys.cursor();
-        let mut outputs = Vec::new();
         while let Some(key) = keys.get_key() {
             let key = clone_box(key);
             tasks
@@ -429,7 +428,7 @@ where
             keys.step_key();
         }
 
-        outputs.append(&mut tasks.run(self.file.file_handle()).await);
+        let outputs = tasks.run(self.file.file_handle()).await;
 
         let builder =
             <VecIndexedWSet<Self::Key, Self::Val, Self::R> as Batch>::Builder::with_capacity(

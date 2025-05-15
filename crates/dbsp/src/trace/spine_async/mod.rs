@@ -16,8 +16,9 @@ use crate::{
     storage::buffer_cache::CacheStats,
     time::Timestamp,
     trace::{
-        cursor::CursorList, merge_batches, ord::fallback::pick_merge_destination, Batch,
-        BatchReader, BatchReaderFactories, Builder, Cursor, Filter, Trace,
+        cursor::CursorList, merge_batches, ord::fallback::pick_merge_destination,
+        spine_async::snapshot::FetchList, Batch, BatchReader, BatchReaderFactories, Builder,
+        Cursor, Filter, Trace,
     },
     Error, NumEntries, Runtime,
 };
@@ -27,7 +28,6 @@ pub use crate::trace::spine_async::snapshot::SpineSnapshot;
 use crate::trace::CommittedSpine;
 use enum_map::EnumMap;
 use feldera_storage::StoragePath;
-use futures::{stream::FuturesUnordered, StreamExt};
 use list_merger::ArcMerger;
 use metrics::counter;
 use ouroboros::self_referencing;
@@ -924,52 +924,16 @@ where
         keys: &KR,
     ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
     where
-        KR: Batch<Key = Self::Key, Time = ()>,
+        KR: BatchReader<Key = Self::Key, Time = ()>,
     {
-        let mut batches = Vec::new();
-        let mut fetched = Vec::new();
-        let mut futures = self
-            .merger
-            .get_batches()
-            .into_iter()
-            .map(|b| async move { (b.clone(), b.fetch(keys).await) })
-            .collect::<FuturesUnordered<_>>();
-        while let Some((batch, fetch)) = futures.next().await {
-            if let Some(fetch) = fetch {
-                fetched.push(fetch);
-            } else {
-                batches.push(batch);
-            }
-        }
-
-        Some(Box::new(Fetch {
-            weight_factory: self.factories.weight_factory(),
-            batches,
-            fetched,
-        }))
-    }
-}
-
-pub struct Fetch<B: Batch> {
-    weight_factory: &'static dyn Factory<B::R>,
-    batches: Vec<Arc<B>>,
-    fetched: Vec<Box<dyn CursorFactory<B::Key, B::Val, B::Time, B::R>>>,
-}
-
-impl<B> CursorFactory<B::Key, B::Val, B::Time, B::R> for Fetch<B>
-where
-    B: Batch,
-{
-    fn get_cursor<'a>(&'a self) -> Box<dyn Cursor<B::Key, B::Val, B::Time, B::R> + 'a> {
-        let cursors =
-            self.fetched
-                .iter()
-                .map(|hc| hc.get_cursor())
-                .chain(self.batches.iter().map(|b| {
-                    Box::new(b.cursor()) as Box<dyn Cursor<B::Key, B::Val, B::Time, B::R>>
-                }))
-                .collect::<Vec<_>>();
-        Box::new(CursorList::new(self.weight_factory, cursors))
+        Some(Box::new(
+            FetchList::new(
+                self.merger.get_batches(),
+                keys,
+                self.factories.weight_factory(),
+            )
+            .await,
+        ))
     }
 }
 

@@ -298,7 +298,7 @@ where
         keys: &B,
     ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
     where
-        B: Batch<Key = Self::Key, Time = ()>,
+        B: BatchReader<Key = Self::Key, Time = ()>,
     {
         match &self.inner {
             Inner::Vec(vec) => vec.fetch(keys).await,
