@@ -225,6 +225,25 @@ impl BufferCache {
             .clone()
     }
 
+    pub fn missing<L>(&self, file: &dyn FileReader, locations: L) -> u64
+    where
+        L: Iterator<Item = BlockLocation> + ExactSizeIterator,
+    {
+        let inner = self.inner.lock().unwrap();
+        let mut result = 0;
+        let file_id = file.file_id();
+        debug_assert!(locations.len() < u64::BITS as usize);
+        for (index, location) in locations.enumerate() {
+            if !inner.cache.contains_key(&CacheKey {
+                file_id,
+                offset: location.offset,
+            }) {
+                result |= 1u64 << index;
+            }
+        }
+        result
+    }
+
     pub fn insert(&self, file_id: FileId, offset: u64, aux: Arc<dyn CacheEntry>, lock: bool) {
         self.inner
             .lock()

@@ -30,6 +30,7 @@ use crc32c::crc32c;
 use fastbloom::BloomFilter;
 use feldera_storage::StoragePath;
 use futures::future::Either;
+use smallvec::SmallVec;
 use snap::raw::{decompress_len, Decoder};
 use std::any::Any;
 use std::mem::replace;
@@ -46,6 +47,7 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error as ThisError;
+use tokio::sync::oneshot;
 
 /// Any kind of error encountered reading a layer file.
 #[derive(ThisError, Clone, Debug)]
@@ -752,14 +754,87 @@ struct TreeNode {
 }
 
 impl TreeNode {
-    fn read_blocking<K, A>(self, file: &ImmutableFileRef) -> Result<TreeBlock<K, A>, Error>
+    fn read_blocking<K, A>(&self, file: &ImmutableFileRef) -> Result<TreeBlock<K, A>, Error>
     where
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
         match self.node_type {
-            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new_blocking(file, &self)?)),
-            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new_blocking(file, &self)?)),
+            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new_blocking(file, self)?)),
+            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new_blocking(file, self)?)),
+        }
+    }
+    fn read_blocking_multiple<K, A, const N: usize>(
+        mut nodes: SmallVec<[TreeNode; N]>,
+        file: &ImmutableFileRef,
+    ) -> Result<TreeBlock<K, A>, Error>
+    where
+        K: DataTrait + ?Sized,
+        A: DataTrait + ?Sized,
+    {
+        if nodes.len() == 1 {
+            nodes[0].read_blocking(file)
+        } else {
+            let cache = (file.cache)();
+            let mut missing =
+                cache.missing(&*file.file_handle, nodes.iter().map(|node| node.location));
+            if (missing & 1) == 0 || missing == 1 {
+                nodes[0].read_blocking(file)
+            } else {
+                nodes.retain(|_| {
+                    let retain = (missing & 1) != 0;
+                    missing >>= 1;
+                    retain
+                });
+                dbg!(nodes.len());
+                let (sender, receiver) = oneshot::channel();
+                file.file_handle.read_async(
+                    nodes.iter().map(|node| node.location).collect(),
+                    Box::new(|result| sender.send(result).unwrap()),
+                );
+                let mut retval = None;
+                for (result, node) in receiver
+                    .blocking_recv()
+                    .unwrap()
+                    .into_iter()
+                    .zip(nodes.iter())
+                {
+                    let raw = decompress(file.compression, node.location, result?)?;
+                    match node.node_type {
+                        NodeType::Data => {
+                            let entry =
+                                Arc::new(DataBlock::from_raw(raw, node.location, node.rows.start)?);
+                            cache.insert(
+                                file.file_handle.file_id(),
+                                node.location.offset,
+                                entry.clone(),
+                                false,
+                            );
+                            if retval.is_none() {
+                                retval = Some(TreeBlock::Data(entry));
+                            }
+                        }
+                        NodeType::Index => {
+                            let entry = Arc::new(IndexBlock::from_raw(
+                                raw,
+                                node.location,
+                                node.rows.start,
+                            )?);
+                            cache.insert(
+                                file.file_handle.file_id(),
+                                node.location.offset,
+                                entry.clone(),
+                                true,
+                            );
+                            if retval.is_none() {
+                                retval = Some(TreeBlock::Index(entry));
+                            }
+                        }
+                    };
+                }
+
+                Ok(retval.unwrap())
+            }
         }
     }
     async fn read_async<K, A>(
@@ -793,19 +868,24 @@ where
     A: DataTrait + ?Sized,
 {
     fn lookup_row(&self, row: u64) -> Result<Option<TreeNode>, Error> {
+        self.lookup_row_and_successors::<1>(row)
+            .map(|mut vec| vec.pop())
+    }
+
+    fn lookup_row_and_successors<const N: usize>(
+        &self,
+        row: u64,
+    ) -> Result<SmallVec<[TreeNode; N]>, Error> {
         match self {
             Self::Data(data_block) => {
                 if data_block.rows().contains(&row) {
-                    return Ok(None);
+                    Ok(SmallVec::new())
+                } else {
+                    Err(CorruptionError::MissingRow(row).into())
                 }
             }
-            Self::Index(index_block) => {
-                if let Some(child_node) = index_block.get_child_by_row(row)? {
-                    return Ok(Some(child_node));
-                }
-            }
+            Self::Index(index_block) => Ok(index_block.get_children_by_row(row)?),
         }
-        Err(CorruptionError::MissingRow(row).into())
     }
 }
 
@@ -1039,10 +1119,22 @@ where
         })
     }
 
-    fn get_child_by_row(&self, row: u64) -> Result<Option<TreeNode>, Error> {
-        self.find_row(row)
-            .map(|child_idx| self.get_child(child_idx))
-            .transpose()
+    fn get_child_by_row(&self, row: u64) -> Result<TreeNode, Error> {
+        self.get_child(self.find_row(row)?)
+    }
+
+    fn get_children_by_row<const N: usize>(
+        &self,
+        row: u64,
+    ) -> Result<SmallVec<[TreeNode; N]>, Error> {
+        let mut nodes = SmallVec::new();
+        for index in self.find_row(row)?..self.n_children() {
+            if nodes.len() == nodes.inline_size() {
+                break;
+            }
+            nodes.push(self.get_child(index)?);
+        }
+        Ok(nodes)
     }
 
     fn get_rows(&self, index: usize) -> Range<u64> {
@@ -1065,7 +1157,7 @@ where
         }
     }
 
-    fn find_row(&self, row: u64) -> Option<usize> {
+    fn find_row(&self, row: u64) -> Result<usize, Error> {
         let mut indexes = 0..self.n_children();
         while !indexes.is_empty() {
             let mid = (indexes.start + indexes.end) / 2;
@@ -1075,10 +1167,10 @@ where
             } else if row >= rows.end {
                 indexes.start = mid + 1;
             } else {
-                return Some(mid);
+                return Ok(mid);
             }
         }
-        None
+        Err(CorruptionError::MissingRow(row).into())
     }
 
     unsafe fn get_bound(&self, index: usize, bound: &mut K) {
@@ -2400,12 +2492,12 @@ where
     fn for_row_from_ancestor_blocking<T>(
         reader: &Reader<T>,
         mut indexes: Vec<Arc<IndexBlock<K>>>,
-        mut node: TreeNode,
+        node: TreeNode,
         row: u64,
     ) -> Result<Self, Error> {
+        let mut block = node.read_blocking(&reader.file)?;
         loop {
-            let block = node.read_blocking(&reader.file)?;
-            let next = block.lookup_row(row)?;
+            let next = block.lookup_row_and_successors::<4>(row)?;
             match block {
                 TreeBlock::Data(data) => {
                     return Ok(Self { row, indexes, data });
@@ -2414,7 +2506,7 @@ where
                     push_index_block(&mut indexes, index)?;
                 }
             };
-            node = next.unwrap();
+            block = TreeNode::read_blocking_multiple(next, &reader.file)?;
         }
     }
     async fn for_row_from_ancestor_async(
@@ -2438,8 +2530,13 @@ where
     }
     fn find_ancestor(&self, row: u64) -> Result<(TreeNode, Vec<Arc<IndexBlock<K>>>), Error> {
         for (idx, index_block) in self.indexes.iter().enumerate().rev() {
-            if let Some(node) = index_block.get_child_by_row(row)? {
-                return Ok((node, self.indexes[0..=idx].to_vec()));
+            match index_block.get_child_by_row(row) {
+                Ok(node) => return Ok((node, self.indexes[0..=idx].to_vec())),
+                Err(Error::Corruption(CorruptionError::MissingRow(_))) => {
+                    // Ignore this because: we're moving upward looking until we
+                    // find `row`, and we just haven't found it yet.
+                }
+                Err(error) => return Err(error),
             }
         }
         Err(CorruptionError::MissingRow(row).into())
@@ -2778,12 +2875,12 @@ where
         for index in &self.indexes {
             let n = index.n_children();
             match index.find_row(self.row) {
-                Some(i) => {
+                Ok(i) => {
                     let min_row = index.get_row_bound(i * 2);
                     let max_row = index.get_row_bound(i * 2 + 1);
                     write!(f, "\n[child {i} of {n}: rows {min_row}..={max_row}]",)?;
                 }
-                None => {
+                Err(_) => {
                     // This should not be possible because it indicates an
                     // invariant violation.  Possibly we should panic.
                     write!(f, " [unknown child of {n}]")?
