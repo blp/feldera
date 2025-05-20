@@ -49,6 +49,7 @@ use std::{ops::RangeInclusive, sync::Mutex};
 use textwrap::indent;
 
 mod list_merger;
+mod push_merger;
 mod snapshot;
 use self::thread::{BackgroundThread, WorkerStatus};
 

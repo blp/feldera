@@ -95,8 +95,7 @@ where
         builder.done()
     }
 
-    /// Creates a new merger for `batches`, using `key_filter` and
-    /// `value_filter` to remove tuples.
+    /// Creates a new merger for `cursors`.
     pub fn new(factories: &B::Factories, cursors: Vec<C>) -> Self {
         // [IndexSet] supports a maximum of 64 batches.
         assert!(cursors.len() <= 64);
