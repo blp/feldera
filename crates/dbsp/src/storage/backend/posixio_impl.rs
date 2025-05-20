@@ -15,6 +15,7 @@ use feldera_types::config::{
     FileBackendConfig, StorageBackendConfig, StorageCacheConfig, StorageConfig,
 };
 use metrics::counter;
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fs::{create_dir_all, DirEntry};
 use std::io::{ErrorKind, IoSlice, Write};
@@ -81,12 +82,24 @@ fn busy_wait(duration: Duration) {
     while start.elapsed() < duration {}
 }
 
+thread_local! {
+    pub static STATS: RefCell<(usize, usize)> = RefCell::new((0, 0));
+}
+
+pub fn get_stats() -> (usize, usize) {
+    STATS.with_borrow(|stats| *stats)
+}
+
 impl FileReader for PosixReader {
     fn mark_for_checkpoint(&self) {
         self.drop.keep();
     }
 
     fn read_block(&self, location: BlockLocation) -> Result<Arc<FBuf>, StorageError> {
+        STATS.with_borrow_mut(|(reads, blocks)| {
+            *reads += 1;
+            *blocks += 1;
+        });
         busy_wait(Duration::from_millis(2));
         let mut buffer = FBuf::with_capacity(location.size);
 
@@ -101,11 +114,15 @@ impl FileReader for PosixReader {
         blocks: Vec<BlockLocation>,
         callback: Box<dyn FnOnce(Vec<Result<Arc<FBuf>, StorageError>>) + Send>,
     ) {
-        if true {
+        STATS.with_borrow_mut(|(reads, n_blocks)| {
+            *reads += 1;
+            *n_blocks += blocks.len();
+        });
+        busy_wait(Duration::from_millis(2));
+        if false {
             //self.async_threads {
             let file = self.file.clone();
             TOKIO.spawn_blocking(move || {
-                busy_wait(Duration::from_millis(2));
                 callback(
                     blocks
                         .into_iter()

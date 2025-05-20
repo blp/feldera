@@ -4,6 +4,7 @@
 
 use super::format::{Compression, FileTrailer};
 use super::{AnyFactories, Factories};
+use crate::circuit::runtime::ThreadType;
 use crate::storage::buffer_cache::AsyncCacheContext;
 use crate::storage::buffer_cache::{CacheAccess, CacheEntry};
 use crate::storage::file::format::FilterBlock;
@@ -30,10 +31,11 @@ use crc32c::crc32c;
 use fastbloom::BloomFilter;
 use feldera_storage::StoragePath;
 use futures::future::Either;
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 use snap::raw::{decompress_len, Decoder};
 use std::any::Any;
 use std::mem::replace;
+use std::sync::mpsc;
 use std::time::Instant;
 use std::{
     cmp::{
@@ -47,7 +49,6 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error as ThisError;
-use tokio::sync::oneshot;
 
 /// Any kind of error encountered reading a layer file.
 #[derive(ThisError, Clone, Debug)]
@@ -772,33 +773,31 @@ impl TreeNode {
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
-        if nodes.len() == 1 {
-            nodes[0].read_blocking(file)
-        } else {
+        if nodes.len() > 1 {
             let cache = (file.cache)();
             let mut missing =
                 cache.missing(&*file.file_handle, nodes.iter().map(|node| node.location));
-            if (missing & 1) == 0 || missing == 1 {
-                nodes[0].read_blocking(file)
-            } else {
+            if (missing & 1) == 0 {
+                return nodes[0].read_blocking(file);
+            }
+            if missing != 0 {
+                let mut retval = if (missing & 1) == 0 {
+                    Some(nodes[0].read_blocking(file)?)
+                } else {
+                    None
+                };
                 nodes.retain(|_| {
                     let retain = (missing & 1) != 0;
                     missing >>= 1;
                     retain
                 });
-                dbg!(nodes.len());
-                let (sender, receiver) = oneshot::channel();
+                //dbg!(nodes.len());
+                let (sender, receiver) = mpsc::channel();
                 file.file_handle.read_async(
                     nodes.iter().map(|node| node.location).collect(),
-                    Box::new(|result| sender.send(result).unwrap()),
+                    Box::new(move |result| sender.send(result).unwrap()),
                 );
-                let mut retval = None;
-                for (result, node) in receiver
-                    .blocking_recv()
-                    .unwrap()
-                    .into_iter()
-                    .zip(nodes.iter())
-                {
+                for (result, node) in receiver.recv().unwrap().into_iter().zip(nodes.iter()) {
                     let raw = decompress(file.compression, node.location, result?)?;
                     match node.node_type {
                         NodeType::Data => {
@@ -832,9 +831,12 @@ impl TreeNode {
                         }
                     };
                 }
-
                 Ok(retval.unwrap())
+            } else {
+                nodes[0].read_blocking(file)
             }
+        } else {
+            nodes[0].read_blocking(file)
         }
     }
     async fn read_async<K, A>(
@@ -2469,10 +2471,10 @@ where
         row_group: &RowGroup<'_, K, A, N, T>,
         row: u64,
     ) -> Result<Self, Error> {
-        Self::for_row_from_ancestor_blocking(
+        Self::for_row_from_ancestors_blocking::<_, 4>(
             row_group.reader,
             Vec::new(),
-            row_group.root_node().unwrap(),
+            smallvec![row_group.root_node().unwrap()],
             row,
         )
     }
@@ -2489,24 +2491,44 @@ where
         )
         .await
     }
-    fn for_row_from_ancestor_blocking<T>(
+    fn for_row_from_ancestors_blocking<T, const N: usize>(
         reader: &Reader<T>,
         mut indexes: Vec<Arc<IndexBlock<K>>>,
-        node: TreeNode,
+        nodes: SmallVec<[TreeNode; N]>,
         row: u64,
     ) -> Result<Self, Error> {
-        let mut block = node.read_blocking(&reader.file)?;
-        loop {
-            let next = block.lookup_row_and_successors::<4>(row)?;
-            match block {
-                TreeBlock::Data(data) => {
-                    return Ok(Self { row, indexes, data });
+        match ThreadType::current() {
+            ThreadType::Background => {
+                let mut block = TreeNode::read_blocking_multiple(nodes, &reader.file)?;
+                loop {
+                    let next = block.lookup_row_and_successors::<N>(row)?;
+                    match block {
+                        TreeBlock::Data(data) => {
+                            return Ok(Self { row, indexes, data });
+                        }
+                        TreeBlock::Index(index) => {
+                            push_index_block(&mut indexes, index)?;
+                        }
+                    };
+                    block = TreeNode::read_blocking_multiple(next, &reader.file)?;
                 }
-                TreeBlock::Index(index) => {
-                    push_index_block(&mut indexes, index)?;
+            }
+            ThreadType::Foreground => {
+                let mut node = nodes.into_iter().next().unwrap();
+                loop {
+                    let block = node.read_blocking(&reader.file)?;
+                    let next = block.lookup_row(row)?;
+                    match block {
+                        TreeBlock::Data(data) => {
+                            return Ok(Self { row, indexes, data });
+                        }
+                        TreeBlock::Index(index) => {
+                            push_index_block(&mut indexes, index)?;
+                        }
+                    };
+                    node = next.unwrap();
                 }
-            };
-            block = TreeNode::read_blocking_multiple(next, &reader.file)?;
+            }
         }
     }
     async fn for_row_from_ancestor_async(
@@ -2541,6 +2563,22 @@ where
         }
         Err(CorruptionError::MissingRow(row).into())
     }
+    fn find_ancestors<const N: usize>(
+        &self,
+        row: u64,
+    ) -> Result<(SmallVec<[TreeNode; N]>, Vec<Arc<IndexBlock<K>>>), Error> {
+        for (idx, index_block) in self.indexes.iter().enumerate().rev() {
+            match index_block.get_children_by_row(row) {
+                Ok(nodes) => return Ok((nodes, self.indexes[0..=idx].to_vec())),
+                Err(Error::Corruption(CorruptionError::MissingRow(_))) => {
+                    // Ignore this because: we're moving upward looking until we
+                    // find `row`, and we just haven't found it yet.
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(CorruptionError::MissingRow(row).into())
+    }
     fn for_row_from_hint_blocking<N, T>(
         row_group: &RowGroup<'_, K, A, N, T>,
         hint: Option<&Self>,
@@ -2556,7 +2594,12 @@ where
             });
         }
         let (node, indexes) = hint.find_ancestor(row)?;
-        Self::for_row_from_ancestor_blocking(row_group.reader, indexes, node, row)
+        Self::for_row_from_ancestors_blocking::<_, 4>(
+            row_group.reader,
+            indexes,
+            smallvec![node],
+            row,
+        )
     }
     async fn for_row_from_hint_async<N, T>(
         row_group: &AsyncRowGroup<'_, K, A, N, T>,
@@ -2602,8 +2645,8 @@ where
         if self.data.rows().contains(&row) {
             self.row = row;
         } else {
-            let (ancestor, indexes) = self.find_ancestor(row)?;
-            *self = Self::for_row_from_ancestor_blocking(reader, indexes, ancestor, row)?;
+            let (ancestors, indexes) = self.find_ancestors::<4>(row)?;
+            *self = Self::for_row_from_ancestors_blocking(reader, indexes, ancestors, row)?;
         }
         Ok(())
     }
