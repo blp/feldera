@@ -11,10 +11,7 @@ use crate::{
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum NoData {
-    Pending,
-    Eoi,
-}
+pub struct Pending;
 
 pub trait PushCursor<K, V, T, R>
 where
@@ -22,8 +19,8 @@ where
     V: ?Sized,
     R: ?Sized,
 {
-    fn key(&self) -> Result<&K, NoData>;
-    fn val(&self) -> Result<&V, NoData>;
+    fn key(&self) -> Result<Option<&K>, Pending>;
+    fn val(&self) -> Result<Option<&V>, Pending>;
     fn map_times(&mut self, logic: &mut dyn FnMut(&T, &R));
     fn weight(&mut self) -> &R
     where
@@ -49,26 +46,26 @@ where
     B: Batch,
 {
     fn is_done(&self) -> bool {
-        self.cursors
-            .iter()
-            .all(|cursor| cursor.key() == Err(NoData::Eoi))
+        self.cursors.iter().all(|cursor| cursor.key() == Ok(None))
     }
 
     fn work(&mut self, builder: &mut B::Builder, frontier: &B::Time) {
+        let _ = self.work_(builder, frontier);
+    }
+
+    fn work_(&mut self, builder: &mut B::Builder, frontier: &B::Time) -> Result<(), Pending> {
         // We can drop all the cursors whose keys are at EOI.  If that
         // eliminates all of them, we're all done.  If any keys are pending,
         // then we can't do any work.
         assert!(self.cursors.len() <= 64);
         let mut remaining_cursors = IndexSet::empty();
         for (index, cursor) in self.cursors.iter().enumerate() {
-            match cursor.key() {
-                Ok(_) => remaining_cursors.add(index),
-                Err(NoData::Pending) => return,
-                Err(NoData::Eoi) => (),
+            if cursor.key()?.is_some() {
+                remaining_cursors.add(index);
             }
         }
         if remaining_cursors.is_empty() {
-            return;
+            return Ok(());
         }
 
         let advance_func = |t: &mut DynDataTyped<B::Time>| t.join_assign(frontier);
@@ -107,10 +104,8 @@ where
                 // for which we've exhausted the values.
                 for index in min_vals {
                     self.cursors[index].step_val();
-                    match self.cursors[index].val() {
-                        Ok(_) => (),
-                        Err(NoData::Pending) => return,
-                        Err(NoData::Eoi) => min_keys.remove(index),
+                    if self.cursors[index].val()?.is_none() {
+                        min_keys.remove(index);
                     }
                 }
             }
@@ -122,10 +117,8 @@ where
                     self.any_values =
                         self.copy_times(builder, time_map_func, min_keys) || self.any_values;
                     self.cursors[index].step_val();
-                    match self.cursors[index].val() {
-                        Ok(_) => (),
-                        Err(NoData::Pending) => return,
-                        Err(NoData::Eoi) => break,
+                    if self.cursors[index].val()?.is_none() {
+                        break;
                     }
                 }
             }
@@ -133,7 +126,7 @@ where
             // If we wrote any values for these minimum keys, write the key.
             if self.any_values {
                 let index = orig_min_keys.first().unwrap();
-                builder.push_key(self.cursors[index].key().unwrap());
+                builder.push_key(self.cursors[index].key().unwrap().unwrap());
                 self.any_values = false;
             }
 
@@ -141,12 +134,8 @@ where
             // we've exhausted the data.
             for index in orig_min_keys {
                 self.cursors[index].step_key();
-                match self.cursors[index].key() {
-                    Ok(_) => (),
-                    Err(NoData::Pending) => {
-                        return;
-                    }
-                    Err(NoData::Eoi) => remaining_cursors.remove(index),
+                if self.cursors[index].key()?.is_none() {
+                    remaining_cursors.remove(index);
                 }
             }
         }
@@ -159,25 +148,22 @@ where
                     self.any_values = self.copy_times(builder, time_map_func, remaining_cursors)
                         || self.any_values;
                     self.cursors[index].step_val();
-                    match self.cursors[index].val() {
-                        Ok(_) => (),
-                        Err(NoData::Pending) => return,
-                        Err(NoData::Eoi) => break,
+                    if self.cursors[index].val()?.is_none() {
+                        break;
                     }
                 }
                 debug_assert!(time_map_func.is_some() || self.any_values, "This assertion should fail only if B::Cursor is a spine or a CursorList, but we shouldn't be merging those");
                 if self.any_values {
                     self.any_values = false;
-                    builder.push_key(self.cursors[index].key().unwrap());
+                    builder.push_key(self.cursors[index].key().unwrap().unwrap());
                 }
                 self.cursors[index].step_key();
-                match self.cursors[index].key() {
-                    Ok(_) => (),
-                    Err(NoData::Pending) => return,
-                    Err(NoData::Eoi) => break,
+                if self.cursors[index].key()?.is_none() {
+                    break;
                 }
             }
         }
+        Ok(())
     }
     fn copy_times(
         &mut self,
@@ -241,7 +227,7 @@ where
         }
 
         let index = indexes.first().unwrap();
-        builder.push_val(self.cursors[index].val().unwrap());
+        builder.push_val(self.cursors[index].val().unwrap().unwrap());
         true
     }
 }
