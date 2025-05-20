@@ -7,7 +7,7 @@ use crate::{
     algebra::Lattice,
     dynamic::{DynDataTyped, DynWeightedPairs, WeightTrait},
     time::Timestamp,
-    trace::{Batch, Builder, Weight},
+    trace::{Batch, BatchFactories, BatchReaderFactories, Builder, Weight},
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -45,8 +45,23 @@ where
     C: PushCursor<B::Key, B::Val, B::Time, B::R>,
     B: Batch,
 {
+    /// Creates a new merger for `cursors`.
+    pub fn new(factories: &B::Factories, cursors: Vec<C>) -> Self {
+        assert!(cursors.len() <= 64);
+        Self {
+            cursors,
+            any_values: false,
+            tmp_weight: factories.weight_factory().default_box(),
+            time_diffs: factories.time_diffs_factory().map(|f| f.default_box()),
+        }
+    }
+
     fn is_done(&self) -> bool {
         self.cursors.iter().all(|cursor| cursor.key() == Ok(None))
+    }
+
+    fn is_ready(&self) -> bool {
+        self.cursors.iter().all(|cursor| cursor.key().is_ok())
     }
 
     fn work(&mut self, builder: &mut B::Builder, frontier: &B::Time) {
