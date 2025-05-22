@@ -34,8 +34,9 @@ use futures::future::Either;
 use smallvec::{smallvec, SmallVec};
 use snap::raw::{decompress_len, Decoder};
 use std::any::Any;
+use std::collections::{BTreeMap, VecDeque};
 use std::mem::replace;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, channel, Receiver, Sender, TryRecvError};
 use std::time::Instant;
 use std::{
     cmp::{
@@ -1821,6 +1822,11 @@ where
         RowGroup::new(self, 0, 0..self.columns[0].n_rows)
     }
 
+    /// Returns a [`BulkRows`] for column 0.
+    pub fn bulk_rows(&self) -> BulkRows<K, A, N, (&'static K, &'static A, N)> {
+        BulkRows::new(self)
+    }
+
     /// Returns an [AsyncRowGroup] for all of the rows in column 0.
     ///
     /// Use [Reader::new_async_context] to create `context`.
@@ -3604,5 +3610,247 @@ where
             ),
             context: self.row_group.context,
         })
+    }
+}
+
+struct BlockMsg {
+    result: Result<Arc<FBuf>, StorageError>,
+    node: TreeNode,
+    level: usize,
+}
+
+pub struct BulkRows<'a, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+{
+    reader: &'a Reader<T>,
+    cache: Arc<BufferCache>,
+    factories: Factories<K, A>,
+    column: usize,
+    row: u64,
+    n_rows: u64,
+
+    receiver: Receiver<BlockMsg>,
+    sender: Sender<BlockMsg>,
+
+    /// If nonempty, then:
+    /// - `data_blocks[0]` contains `row`.
+    /// - `data_blocks[1..]` are subsequent blocks.
+    data_blocks: VecDeque<Arc<DataBlock<K, A>>>,
+
+    /// First row in the next block to be added to `data_blocks`.  If
+    /// `data_blocks` is nonempty, then this is
+    /// `data_blocks.last().unwrap().first_row`.
+    next_data: u64,
+
+    /// Blocks that have been received out of order.  They will be moved to
+    /// `blocks` when `next_data` catches up to their starting row.
+    out_of_order_data: BTreeMap<u64, Arc<DataBlock<K, A>>>,
+
+    indexes: Vec<IndexLevel<K>>,
+    _phantom: PhantomData<fn(&K, &A, N)>,
+}
+
+impl<'a, K, A, N, T> BulkRows<'a, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+{
+    fn new(reader: &'a Reader<T>) -> Self {
+        let (sender, receiver) = channel();
+        Self {
+            reader,
+            cache: (reader.file.cache)(),
+            factories: reader.columns[0].factories.factories(),
+            column: 0,
+            row: 0,
+            sender,
+            receiver,
+            n_rows: reader.columns[0].n_rows,
+            indexes: Vec::new(),
+            data_blocks: VecDeque::new(),
+            next_data: 0,
+            out_of_order_data: BTreeMap::new(),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn work(&mut self) -> Result<(), Error> {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(BlockMsg {
+                    result,
+                    node,
+                    level,
+                }) => {
+                    let block = decompress(self.reader.file.compression, node.location, result?)?;
+                    match node.node_type {
+                        NodeType::Data => {
+                            let data_block = Arc::new(DataBlock::from_raw(
+                                block,
+                                node.location,
+                                node.rows.start,
+                            )?);
+                            self.received_data(data_block);
+                        }
+                        NodeType::Index => {
+                            let index_block = Arc::new(IndexBlock::from_raw(
+                                block,
+                                node.location,
+                                node.rows.start,
+                            )?);
+                            self.indexes[level].received(index_block);
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // We hold our own copy of the sender, so this can't happen.
+                    unreachable!()
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds `block` to the collection of data blocks.
+    fn received_data(&mut self, block: Arc<DataBlock<K, A>>) {
+        if block.first_row == self.next_data {
+            self.next_data = block.rows().end;
+            self.data_blocks.push_back(block);
+            while let Some(entry) = self.out_of_order_data.first_entry() {
+                if *entry.key() != self.next_data {
+                    break;
+                }
+                let block = entry.remove();
+                self.next_data = block.rows().end;
+                self.data_blocks.push_back(block);
+            }
+        } else if block.first_row > self.next_data {
+            self.out_of_order_data.insert(block.first_row, block);
+        } else {
+            // File corruption or (more likely) a bug.
+            todo!()
+        }
+    }
+
+    fn n_readable(&self) -> usize {
+        self.data_blocks
+            .back()
+            .map_or(0, |last| last.rows().end - self.row) as usize
+    }
+
+    fn eof(&self) -> bool {
+        self.row >= self.n_rows
+    }
+
+    /// Returns the key in the current row, or `None` if we're at EOF or this
+    /// row isn't readable yet.
+    ///
+    /// # Safety
+    ///
+    /// Unsafe because `rkyv` deserialization is unsafe.
+    pub unsafe fn key(&self, key: &'a mut K) -> Option<&'a mut K> {
+        self.data_blocks.front().map(|block| {
+            block.key_for_row(&self.factories, self.row, key);
+            key
+        })
+    }
+
+    /// Returns the auxiliary data in the current row, or `None` if we're at EOF
+    /// or this row isn't readable yet.
+    ///
+    /// # Safety
+    ///
+    /// Unsafe because `rkyv` deserialization is unsafe.
+    pub unsafe fn aux<'b>(&self, aux: &'b mut A) -> Option<&'b mut A> {
+        self.data_blocks.front().map(|block| {
+            block.aux_for_row(&self.factories, self.row, aux);
+            aux
+        })
+    }
+
+    pub fn step(&mut self) {
+        debug_assert!(self.data_blocks[0].rows().contains(&self.row));
+        self.row += 1;
+        if self.row >= self.data_blocks[0].rows().end {
+            self.data_blocks.pop_front();
+        }
+    }
+}
+
+struct IndexLevel<K>
+where
+    K: DataTrait + ?Sized,
+{
+    /// Number of outstanding block reads pending completion for this level.
+    pending: usize,
+
+    /// Sequential blocks whose children need to be loaded.
+    blocks: VecDeque<Arc<IndexBlock<K>>>,
+
+    index: usize,
+
+    /// First row in the next block to be added to `blocks`.  If `blocks` is
+    /// nonempty, then this is `blocks.last().unwrap().first_row`.
+    next: u64,
+
+    /// Blocks that have been received out of order.  They will be moved to
+    /// `blocks` when `next` catches up to their starting row.
+    out_of_order: BTreeMap<u64, Arc<IndexBlock<K>>>,
+}
+
+impl<K> IndexLevel<K>
+where
+    K: DataTrait + ?Sized,
+{
+    fn new() -> Self {
+        Self {
+            pending: 0,
+            blocks: VecDeque::new(),
+            index: 0,
+            next: 0,
+            out_of_order: BTreeMap::new(),
+        }
+    }
+
+    /// Adds `block` to the collection of blocks in this level.
+    fn received(&mut self, block: Arc<IndexBlock<K>>) {
+        if block.first_row == self.next {
+            self.next = block.rows().end;
+            self.blocks.push_back(block);
+            while let Some(entry) = self.out_of_order.first_entry() {
+                if *entry.key() != self.next {
+                    break;
+                }
+                let block = entry.remove();
+                self.next = block.rows().end;
+                self.blocks.push_back(block);
+            }
+        } else if block.first_row > self.next {
+            self.out_of_order.insert(block.first_row, block);
+        } else {
+            // File corruption or (more likely) a bug.
+            todo!()
+        }
+    }
+
+    /// Returns the next [TreeNode] to read in the level below this one.
+    fn next_child(&mut self) -> Result<Option<TreeNode>, Error> {
+        if let Some(block) = self.blocks.front() {
+            let node = block.get_child(self.index)?;
+            self.index += 1;
+            if self.index >= block.n_children() {
+                self.blocks.pop_front();
+            }
+            Ok(Some(node))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn eof(&self, n_rows: u64) -> bool {
+        self.next >= n_rows
     }
 }
