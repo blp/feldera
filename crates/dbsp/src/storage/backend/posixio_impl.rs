@@ -118,11 +118,11 @@ impl FileReader for PosixReader {
             *reads += 1;
             *n_blocks += blocks.len();
         });
-        busy_wait(Duration::from_millis(2));
         if false {
             //self.async_threads {
             let file = self.file.clone();
             TOKIO.spawn_blocking(move || {
+                busy_wait(Duration::from_millis(2));
                 callback(
                     blocks
                         .into_iter()

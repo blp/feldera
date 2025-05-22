@@ -29,6 +29,7 @@ use binrw::{
 };
 use crc32c::crc32c;
 use fastbloom::BloomFilter;
+use feldera_storage::file::FileId;
 use feldera_storage::StoragePath;
 use futures::future::Either;
 use smallvec::{smallvec, SmallVec};
@@ -36,7 +37,7 @@ use snap::raw::{decompress_len, Decoder};
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::replace;
-use std::sync::mpsc::{self, channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, channel, Receiver, Sender};
 use std::time::Instant;
 use std::{
     cmp::{
@@ -501,9 +502,7 @@ impl<'a> DataBlockReader<'a> {
         K: DataTrait + ?Sized,
         A: DataTrait + ?Sized,
     {
-        let data_block = Arc::downcast::<DataBlock<K, A>>(cache_entry.as_any())
-            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(self.node.location)))?;
-
+        let data_block = DataBlock::from_cache_entry(cache_entry, self.node.location)?;
         self.file
             .stats
             .record(self.access, self.start.elapsed(), self.node.location);
@@ -551,18 +550,34 @@ where
             _phantom: PhantomData,
         })
     }
-
+    pub(super) fn from_raw_with_cache(
+        raw: Arc<FBuf>,
+        node: &TreeNode,
+        cache: &BufferCache,
+        file_id: FileId,
+    ) -> Result<Arc<Self>, Error> {
+        let block = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
+        cache.insert(file_id, node.location.offset, block.clone(), false);
+        Ok(block)
+    }
+    fn from_cache_entry(
+        cache_entry: Arc<dyn CacheEntry>,
+        location: BlockLocation,
+    ) -> Result<Arc<Self>, Error> {
+        cache_entry
+            .as_any()
+            .downcast()
+            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(location)))
+    }
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         match DataBlockReader::new(file, node)? {
             Either::Left(data_block_reader) => {
-                let raw = file.read_blocking(node.location)?;
-                let entry = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
-                data_block_reader.cache.insert(
+                let entry = Self::from_raw_with_cache(
+                    file.read_blocking(node.location)?,
+                    node,
+                    &data_block_reader.cache,
                     file.file_handle.file_id(),
-                    node.location.offset,
-                    entry.clone(),
-                    false,
-                );
+                )?;
                 data_block_reader.complete(entry)
             }
             Either::Right(data_block) => Ok(data_block),
@@ -749,10 +764,10 @@ where
 /// `_blocking`. Thus, an `async` function should not call a `_blocking`
 /// function.
 #[derive(Clone, Debug)]
-struct TreeNode {
-    location: BlockLocation,
-    node_type: NodeType,
-    rows: Range<u64>,
+pub(super) struct TreeNode {
+    pub location: BlockLocation,
+    pub node_type: NodeType,
+    pub rows: Range<u64>,
 }
 
 impl TreeNode {
@@ -802,30 +817,23 @@ impl TreeNode {
                     let raw = decompress(file.compression, node.location, result?)?;
                     match node.node_type {
                         NodeType::Data => {
-                            let entry =
-                                Arc::new(DataBlock::from_raw(raw, node.location, node.rows.start)?);
-                            cache.insert(
+                            let entry = DataBlock::from_raw_with_cache(
+                                raw,
+                                node,
+                                &cache,
                                 file.file_handle.file_id(),
-                                node.location.offset,
-                                entry.clone(),
-                                false,
-                            );
+                            )?;
                             if retval.is_none() {
                                 retval = Some(TreeBlock::Data(entry));
                             }
                         }
                         NodeType::Index => {
-                            let entry = Arc::new(IndexBlock::from_raw(
+                            let entry = IndexBlock::from_raw_with_cache(
                                 raw,
-                                node.location,
-                                node.rows.start,
-                            )?);
-                            cache.insert(
+                                node,
+                                &cache,
                                 file.file_handle.file_id(),
-                                node.location.offset,
-                                entry.clone(),
-                                true,
-                            );
+                            )?;
                             if retval.is_none() {
                                 retval = Some(TreeBlock::Index(entry));
                             }
@@ -965,8 +973,7 @@ impl<'a> IndexBlockReader<'a> {
     where
         K: DataTrait + ?Sized,
     {
-        let index_block = Arc::downcast::<IndexBlock<K>>(cache_entry.as_any())
-            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(self.node.location)))?;
+        let index_block = IndexBlock::from_cache_entry(cache_entry, self.node.location)?;
         if index_block.first_row != self.node.rows.start {
             return Err(Error::Corruption(CorruptionError::MultiplePaths(
                 self.node.location,
@@ -1052,18 +1059,35 @@ where
             _phantom: PhantomData,
         })
     }
+    pub(super) fn from_raw_with_cache(
+        raw: Arc<FBuf>,
+        node: &TreeNode,
+        cache: &BufferCache,
+        file_id: FileId,
+    ) -> Result<Arc<Self>, Error> {
+        let block = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
+        cache.insert(file_id, node.location.offset, block.clone(), true);
+        Ok(block)
+    }
+    fn from_cache_entry(
+        cache_entry: Arc<dyn CacheEntry>,
+        location: BlockLocation,
+    ) -> Result<Arc<Self>, Error> {
+        cache_entry
+            .as_any()
+            .downcast()
+            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(location)))
+    }
 
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         match IndexBlockReader::new(file, node)? {
             Either::Left(index_block_reader) => {
-                let raw = file.read_blocking(node.location)?;
-                let entry = Arc::new(Self::from_raw(raw, node.location, node.rows.start)?);
-                index_block_reader.cache.insert(
+                let entry = Self::from_raw_with_cache(
+                    file.read_blocking(node.location)?,
+                    &node,
+                    &index_block_reader.cache,
                     file.file_handle.file_id(),
-                    node.location.offset,
-                    entry.clone(),
-                    true,
-                );
+                )?;
                 index_block_reader.complete(entry)
             }
             Either::Right(index_block) => Ok(index_block),
@@ -1823,8 +1847,8 @@ where
     }
 
     /// Returns a [`BulkRows`] for column 0.
-    pub fn bulk_rows(&self) -> BulkRows<K, A, N, (&'static K, &'static A, N)> {
-        BulkRows::new(self)
+    pub fn bulk_rows(&self) -> Result<BulkRows<K, A, N, (&'static K, &'static A, N)>, Error> {
+        BulkRows::new(self, 0)
     }
 
     /// Returns an [AsyncRowGroup] for all of the rows in column 0.
@@ -3613,10 +3637,14 @@ where
     }
 }
 
-struct BlockMsg {
-    result: Result<Arc<FBuf>, StorageError>,
+struct Read {
     node: TreeNode,
     level: usize,
+}
+
+struct ReadResults {
+    reads: Vec<Read>,
+    results: Vec<Result<Arc<FBuf>, StorageError>>,
 }
 
 pub struct BulkRows<'a, K, A, N, T>
@@ -3631,8 +3659,8 @@ where
     row: u64,
     n_rows: u64,
 
-    receiver: Receiver<BlockMsg>,
-    sender: Sender<BlockMsg>,
+    receiver: Receiver<ReadResults>,
+    sender: Sender<ReadResults>,
 
     /// If nonempty, then:
     /// - `data_blocks[0]` contains `row`.
@@ -3648,8 +3676,44 @@ where
     /// `blocks` when `next_data` catches up to their starting row.
     out_of_order_data: BTreeMap<u64, Arc<DataBlock<K, A>>>,
 
+    data_pending: usize,
+
     indexes: Vec<IndexLevel<K>>,
     _phantom: PhantomData<fn(&K, &A, N)>,
+}
+
+impl<'a, K, A, NK, NA, NN, T> BulkRows<'a, K, A, (&'static NK, &'static NA, NN), T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+    NK: DataTrait + ?Sized,
+    NA: DataTrait + ?Sized,
+    T: ColumnSpec,
+{
+    pub fn next_column<'b>(&'b self) -> Result<BulkRows<'a, NK, NA, NN, T>, Error> {
+        let (sender, receiver) = channel();
+        let mut this = BulkRows {
+            reader: self.reader,
+            cache: self.cache.clone(),
+            factories: self.reader.columns[self.column + 1].factories.factories(),
+            column: self.column + 1,
+            row: 0,
+            sender,
+            receiver,
+            n_rows: self.reader.columns[self.column + 1].n_rows,
+            indexes: Vec::new(),
+            data_blocks: VecDeque::new(),
+            next_data: 0,
+            out_of_order_data: BTreeMap::new(),
+            data_pending: 0,
+            _phantom: PhantomData,
+        };
+        if let Some(node) = &self.reader.columns[self.column + 1].root {
+            let reads = this.start_block_read(&node, 0)?.into_iter().collect();
+            this.work_(reads)?;
+        }
+        Ok(this)
+    }
 }
 
 impl<'a, K, A, N, T> BulkRows<'a, K, A, N, T>
@@ -3657,61 +3721,154 @@ where
     K: DataTrait + ?Sized,
     A: DataTrait + ?Sized,
 {
-    fn new(reader: &'a Reader<T>) -> Self {
+    fn new(reader: &'a Reader<T>, column: usize) -> Result<Self, Error> {
         let (sender, receiver) = channel();
-        Self {
+        let mut this = Self {
             reader,
             cache: (reader.file.cache)(),
-            factories: reader.columns[0].factories.factories(),
-            column: 0,
+            factories: reader.columns[column].factories.factories(),
+            column,
             row: 0,
             sender,
             receiver,
-            n_rows: reader.columns[0].n_rows,
+            n_rows: reader.columns[column].n_rows,
             indexes: Vec::new(),
             data_blocks: VecDeque::new(),
             next_data: 0,
             out_of_order_data: BTreeMap::new(),
+            data_pending: 0,
             _phantom: PhantomData,
+        };
+        if let Some(node) = &reader.columns[column].root {
+            let reads = this.start_block_read(&node, 0)?.into_iter().collect();
+            this.work_(reads)?;
+        }
+        Ok(this)
+    }
+
+    pub fn start_index_read(
+        &mut self,
+        node: &TreeNode,
+        level: usize,
+    ) -> Result<Option<Read>, Error> {
+        if let Some(cache_entry) = self
+            .cache
+            .get(&*self.reader.file.file_handle, node.location)
+        {
+            self.indexes[level].received(IndexBlock::from_cache_entry(cache_entry, node.location)?);
+            Ok(None)
+        } else {
+            if level >= self.indexes.len() {
+                self.indexes.push(IndexLevel::new());
+            }
+            self.indexes[level].pending += 1;
+            Ok(Some(Read {
+                node: node.clone(),
+                level,
+            }))
+        }
+    }
+
+    pub fn start_data_read(&mut self, node: &TreeNode) -> Result<Option<Read>, Error> {
+        if let Some(cache_entry) = self
+            .cache
+            .get(&*self.reader.file.file_handle, node.location)
+        {
+            self.received_data(DataBlock::from_cache_entry(cache_entry, node.location)?);
+            Ok(None)
+        } else {
+            self.data_pending += 1;
+            Ok(Some(Read {
+                node: node.clone(),
+                level: 0,
+            }))
+        }
+    }
+
+    pub fn start_block_read(
+        &mut self,
+        node: &TreeNode,
+        level: usize,
+    ) -> Result<Option<Read>, Error> {
+        match node.node_type {
+            NodeType::Data => self.start_data_read(node),
+            NodeType::Index => self.start_index_read(node, level),
         }
     }
 
     pub fn work(&mut self) -> Result<(), Error> {
-        loop {
-            match self.receiver.try_recv() {
-                Ok(BlockMsg {
-                    result,
-                    node,
-                    level,
-                }) => {
-                    let block = decompress(self.reader.file.compression, node.location, result?)?;
-                    match node.node_type {
-                        NodeType::Data => {
-                            let data_block = Arc::new(DataBlock::from_raw(
-                                block,
-                                node.location,
-                                node.rows.start,
-                            )?);
-                            self.received_data(data_block);
-                        }
-                        NodeType::Index => {
-                            let index_block = Arc::new(IndexBlock::from_raw(
-                                block,
-                                node.location,
-                                node.rows.start,
-                            )?);
-                            self.indexes[level].received(index_block);
-                        }
+        self.work_(Vec::new())
+    }
+
+    fn work_(&mut self, mut reads: Vec<Read>) -> Result<(), Error> {
+        // First, catch up on all completed reads.
+        while let Ok(read_results) = self.receiver.try_recv() {
+            for (Read { node, level }, result) in read_results
+                .reads
+                .into_iter()
+                .zip(read_results.results.into_iter())
+            {
+                let raw = decompress(self.reader.file.compression, node.location, result?)?;
+                let file_id = self.reader.file.file_handle.file_id();
+                match node.node_type {
+                    NodeType::Data => {
+                        let data_block =
+                            DataBlock::from_raw_with_cache(raw, &node, &self.cache, file_id)?;
+                        self.received_data(data_block);
                     }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    // We hold our own copy of the sender, so this can't happen.
-                    unreachable!()
+                    NodeType::Index => {
+                        let index_block =
+                            IndexBlock::from_raw_with_cache(raw, &node, &self.cache, file_id)?;
+                        self.indexes[level].received(index_block);
+                    }
                 }
             }
         }
+
+        // Then schedule more reads.
+        let mut level = 0;
+        while level < self.indexes.len() {
+            while let Some(node) = self.indexes[level].child()? {
+                if self.is_level_full(node.node_type, level + 1) {
+                    break;
+                }
+                if let Some(read) = self.start_block_read(&node, level + 1)? {
+                    reads.push(read);
+                }
+            }
+            level += 1;
+        }
+
+        if !reads.is_empty() {
+            self.reader.file.file_handle.read_async(
+                reads.iter().map(|read| read.node.location).collect(),
+                {
+                    let sender = self.sender.clone();
+                    Box::new(move |results| {
+                        let _ = sender.send(ReadResults { reads, results });
+                    })
+                },
+            );
+        }
+
         Ok(())
+    }
+
+    fn is_level_full(&self, node_type: NodeType, level: usize) -> bool {
+        match node_type {
+            NodeType::Data => self.is_data_full(),
+            NodeType::Index => self.is_index_full(level),
+        }
+    }
+
+    fn is_data_full(&self) -> bool {
+        self.data_pending + self.data_blocks.len() + self.out_of_order_data.len() >= 100
+    }
+
+    fn is_index_full(&self, level: usize) -> bool {
+        self.indexes
+            .get(level + 1)
+            .is_some_and(|child| child.is_full(level + 1))
     }
 
     /// Adds `block` to the collection of data blocks.
@@ -3771,6 +3928,13 @@ where
         })
     }
 
+    pub fn row_group(&self) -> Result<Option<Range<u64>>, Error> {
+        self.data_blocks
+            .front()
+            .map(|block| block.row_group(self.row))
+            .transpose()
+    }
+
     pub fn step(&mut self) {
         debug_assert!(self.data_blocks[0].rows().contains(&self.row));
         self.row += 1;
@@ -3817,6 +3981,9 @@ where
 
     /// Adds `block` to the collection of blocks in this level.
     fn received(&mut self, block: Arc<IndexBlock<K>>) {
+        debug_assert!(self.pending > 0);
+        self.pending -= 1;
+
         if block.first_row == self.next {
             self.next = block.rows().end;
             self.blocks.push_back(block);
@@ -3836,21 +4003,29 @@ where
         }
     }
 
-    /// Returns the next [TreeNode] to read in the level below this one.
-    fn next_child(&mut self) -> Result<Option<TreeNode>, Error> {
-        if let Some(block) = self.blocks.front() {
-            let node = block.get_child(self.index)?;
-            self.index += 1;
-            if self.index >= block.n_children() {
-                self.blocks.pop_front();
-            }
-            Ok(Some(node))
-        } else {
-            Ok(None)
+    /// Returns the next [TreeNode] to read in the level below this one, or
+    /// `None` if we've exhausted this level or there are none to read yet.
+    /// (Use [eof](Self::eof) to distinguish the meanings of `None`.)
+    fn child(&self) -> Result<Option<TreeNode>, Error> {
+        self.blocks
+            .front()
+            .map(|block| block.get_child(self.index))
+            .transpose()
+    }
+
+    fn next_child(&mut self) {
+        let block = self.blocks.front().unwrap();
+        self.index += 1;
+        if self.index >= block.n_children() {
+            self.blocks.pop_front();
         }
     }
 
     fn eof(&self, n_rows: u64) -> bool {
         self.next >= n_rows
+    }
+
+    fn is_full(&self, level: usize) -> bool {
+        self.pending + self.blocks.len() + self.out_of_order.len() >= 1 << level
     }
 }
