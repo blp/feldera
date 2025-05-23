@@ -3691,28 +3691,7 @@ where
     T: ColumnSpec,
 {
     pub fn next_column<'b>(&'b self) -> Result<BulkRows<'a, NK, NA, NN, T>, Error> {
-        let (sender, receiver) = channel();
-        let mut this = BulkRows {
-            reader: self.reader,
-            cache: self.cache.clone(),
-            factories: self.reader.columns[self.column + 1].factories.factories(),
-            column: self.column + 1,
-            row: 0,
-            sender,
-            receiver,
-            n_rows: self.reader.columns[self.column + 1].n_rows,
-            indexes: Vec::new(),
-            data_blocks: VecDeque::new(),
-            next_data: 0,
-            out_of_order_data: BTreeMap::new(),
-            data_pending: 0,
-            _phantom: PhantomData,
-        };
-        if let Some(node) = &self.reader.columns[self.column + 1].root {
-            let reads = this.start_block_read(&node, 0)?.into_iter().collect();
-            this.work_(reads)?;
-        }
-        Ok(this)
+        BulkRows::new(&self.reader, self.column + 1)
     }
 }
 
@@ -3720,6 +3699,7 @@ impl<'a, K, A, N, T> BulkRows<'a, K, A, N, T>
 where
     K: DataTrait + ?Sized,
     A: DataTrait + ?Sized,
+    T: ColumnSpec,
 {
     fn new(reader: &'a Reader<T>, column: usize) -> Result<Self, Error> {
         let (sender, receiver) = channel();
@@ -3751,6 +3731,10 @@ where
         node: &TreeNode,
         level: usize,
     ) -> Result<Option<Read>, Error> {
+        if level >= self.indexes.len() {
+            self.indexes.push(IndexLevel::new());
+        }
+        self.indexes[level].pending += 1;
         if let Some(cache_entry) = self
             .cache
             .get(&*self.reader.file.file_handle, node.location)
@@ -3758,10 +3742,6 @@ where
             self.indexes[level].received(IndexBlock::from_cache_entry(cache_entry, node.location)?);
             Ok(None)
         } else {
-            if level >= self.indexes.len() {
-                self.indexes.push(IndexLevel::new());
-            }
-            self.indexes[level].pending += 1;
             Ok(Some(Read {
                 node: node.clone(),
                 level,
@@ -3770,6 +3750,7 @@ where
     }
 
     pub fn start_data_read(&mut self, node: &TreeNode) -> Result<Option<Read>, Error> {
+        self.data_pending += 1;
         if let Some(cache_entry) = self
             .cache
             .get(&*self.reader.file.file_handle, node.location)
@@ -3777,7 +3758,6 @@ where
             self.received_data(DataBlock::from_cache_entry(cache_entry, node.location)?);
             Ok(None)
         } else {
-            self.data_pending += 1;
             Ok(Some(Read {
                 node: node.clone(),
                 level: 0,
@@ -3790,6 +3770,7 @@ where
         node: &TreeNode,
         level: usize,
     ) -> Result<Option<Read>, Error> {
+        dbg!(&node, level);
         match node.node_type {
             NodeType::Data => self.start_data_read(node),
             NodeType::Index => self.start_index_read(node, level),
@@ -3800,38 +3781,45 @@ where
         self.work_(Vec::new())
     }
 
+    fn process_read_results(&mut self, read_results: ReadResults) -> Result<(), Error> {
+        for (Read { node, level }, result) in read_results
+            .reads
+            .into_iter()
+            .zip(read_results.results.into_iter())
+        {
+            let raw = decompress(self.reader.file.compression, node.location, result?)?;
+            let file_id = self.reader.file.file_handle.file_id();
+            match node.node_type {
+                NodeType::Data => {
+                    let data_block =
+                        DataBlock::from_raw_with_cache(raw, &node, &self.cache, file_id)?;
+                    self.received_data(data_block);
+                }
+                NodeType::Index => {
+                    let index_block =
+                        IndexBlock::from_raw_with_cache(raw, &node, &self.cache, file_id)?;
+                    self.indexes[level].received(index_block);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn work_(&mut self, mut reads: Vec<Read>) -> Result<(), Error> {
         // First, catch up on all completed reads.
         while let Ok(read_results) = self.receiver.try_recv() {
-            for (Read { node, level }, result) in read_results
-                .reads
-                .into_iter()
-                .zip(read_results.results.into_iter())
-            {
-                let raw = decompress(self.reader.file.compression, node.location, result?)?;
-                let file_id = self.reader.file.file_handle.file_id();
-                match node.node_type {
-                    NodeType::Data => {
-                        let data_block =
-                            DataBlock::from_raw_with_cache(raw, &node, &self.cache, file_id)?;
-                        self.received_data(data_block);
-                    }
-                    NodeType::Index => {
-                        let index_block =
-                            IndexBlock::from_raw_with_cache(raw, &node, &self.cache, file_id)?;
-                        self.indexes[level].received(index_block);
-                    }
-                }
-            }
+            self.process_read_results(read_results)?;
         }
 
         // Then schedule more reads.
         let mut level = 0;
         while level < self.indexes.len() {
             while let Some(node) = self.indexes[level].child()? {
+                dbg!(level, &node);
                 if self.is_level_full(node.node_type, level + 1) {
                     break;
                 }
+                self.indexes[level].next_child();
                 if let Some(read) = self.start_block_read(&node, level + 1)? {
                     reads.push(read);
                 }
@@ -3873,6 +3861,7 @@ where
 
     /// Adds `block` to the collection of data blocks.
     fn received_data(&mut self, block: Arc<DataBlock<K, A>>) {
+        dbg!(self.next_data, block.rows());
         if block.first_row == self.next_data {
             self.next_data = block.rows().end;
             self.data_blocks.push_back(block);
@@ -3888,18 +3877,31 @@ where
             self.out_of_order_data.insert(block.first_row, block);
         } else {
             // File corruption or (more likely) a bug.
+            dbg!((block.first_row, self.next_data));
             todo!()
         }
     }
 
-    fn n_readable(&self) -> usize {
+    pub fn n_readable(&self) -> usize {
         self.data_blocks
             .back()
             .map_or(0, |last| last.rows().end - self.row) as usize
     }
 
-    fn eof(&self) -> bool {
+    pub fn eof(&self) -> bool {
         self.row >= self.n_rows
+    }
+
+    pub fn readable(&self) -> bool {
+        !self.data_blocks.is_empty()
+    }
+
+    pub fn wait(&mut self) -> Result<(), Error> {
+        while !self.eof() && !self.readable() {
+            self.process_read_results(self.receiver.recv().unwrap())?;
+            self.work()?;
+        }
+        Ok(())
     }
 
     /// Returns the key in the current row, or `None` if we're at EOF or this
@@ -3908,7 +3910,7 @@ where
     /// # Safety
     ///
     /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn key(&self, key: &'a mut K) -> Option<&'a mut K> {
+    pub unsafe fn key<'b>(&self, key: &'b mut K) -> Option<&'b mut K> {
         self.data_blocks.front().map(|block| {
             block.key_for_row(&self.factories, self.row, key);
             key
@@ -3925,6 +3927,13 @@ where
         self.data_blocks.front().map(|block| {
             block.aux_for_row(&self.factories, self.row, aux);
             aux
+        })
+    }
+
+    pub unsafe fn item<'b>(&self, item: (&'b mut K, &'b mut A)) -> Option<(&'b mut K, &'b mut A)> {
+        self.data_blocks.front().map(|block| {
+            block.item_for_row(&self.factories, self.row, (item.0, item.1));
+            item
         })
     }
 
