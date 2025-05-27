@@ -294,7 +294,6 @@ mod test {
     use std::{marker::PhantomData, sync::Arc};
 
     use crate::{
-        dynamic::DataTrait,
         storage::{
             backend::StorageBackend,
             buffer_cache::BufferCache,
@@ -929,13 +928,11 @@ mod test {
             let n1 = T::n1(row0);
             test_cursor(&rows1, n1, |row1| expected1(row0, row1));
         }
-
         test_bulk_rows(reader.bulk_rows().unwrap(), Column0::<T>::new());
         test_bulk_rows(
             reader.bulk_rows().unwrap().next_column().unwrap(),
             Column1::<T>::new(),
         );
-
         TOKIO.block_on(async {
             // Force some blocking due to I/O, to test those cases in
             // [AsyncCacheContext].

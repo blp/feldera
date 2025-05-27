@@ -37,6 +37,7 @@ use snap::raw::{decompress_len, Decoder};
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::replace;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{self, channel, Receiver, Sender};
 use std::time::Instant;
 use std::{
@@ -3777,10 +3778,6 @@ where
         }
     }
 
-    pub fn work(&mut self) -> Result<(), Error> {
-        self.work_(Vec::new())
-    }
-
     fn process_read_results(&mut self, read_results: ReadResults) -> Result<(), Error> {
         for (Read { node, level }, result) in read_results
             .reads
@@ -3803,6 +3800,10 @@ where
             }
         }
         Ok(())
+    }
+
+    pub fn work(&mut self) -> Result<(), Error> {
+        self.work_(Vec::new())
     }
 
     fn work_(&mut self, mut reads: Vec<Read>) -> Result<(), Error> {
@@ -3828,12 +3829,16 @@ where
         }
 
         if !reads.is_empty() {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            println!("starting read {count}");
             self.reader.file.file_handle.read_async(
                 reads.iter().map(|read| read.node.location).collect(),
                 {
                     let sender = self.sender.clone();
                     Box::new(move |results| {
                         let _ = sender.send(ReadResults { reads, results });
+                        println!("finished read {count}");
                     })
                 },
             );
@@ -3844,24 +3849,19 @@ where
 
     fn is_level_full(&self, node_type: NodeType, level: usize) -> bool {
         match node_type {
-            NodeType::Data => self.is_data_full(),
-            NodeType::Index => self.is_index_full(level),
+            NodeType::Data => {
+                self.data_pending + self.data_blocks.len() + self.out_of_order_data.len() >= 100
+            }
+            NodeType::Index => self
+                .indexes
+                .get(level)
+                .is_some_and(|child| child.is_full(level)),
         }
-    }
-
-    fn is_data_full(&self) -> bool {
-        self.data_pending + self.data_blocks.len() + self.out_of_order_data.len() >= 100
-    }
-
-    fn is_index_full(&self, level: usize) -> bool {
-        self.indexes
-            .get(level + 1)
-            .is_some_and(|child| child.is_full(level + 1))
     }
 
     /// Adds `block` to the collection of data blocks.
     fn received_data(&mut self, block: Arc<DataBlock<K, A>>) {
-        dbg!(self.next_data, block.rows());
+        self.data_pending -= 1;
         if block.first_row == self.next_data {
             self.next_data = block.rows().end;
             self.data_blocks.push_back(block);
@@ -3877,7 +3877,6 @@ where
             self.out_of_order_data.insert(block.first_row, block);
         } else {
             // File corruption or (more likely) a bug.
-            dbg!((block.first_row, self.next_data));
             todo!()
         }
     }
@@ -3897,7 +3896,9 @@ where
     }
 
     pub fn wait(&mut self) -> Result<(), Error> {
+        self.work()?;
         while !self.eof() && !self.readable() {
+            for (level, child) in self.indexes.iter().enumerate() {}
             self.process_read_results(self.receiver.recv().unwrap())?;
             self.work()?;
         }
@@ -4027,6 +4028,7 @@ where
         self.index += 1;
         if self.index >= block.n_children() {
             self.blocks.pop_front();
+            self.index = 0;
         }
     }
 
