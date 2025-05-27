@@ -3648,6 +3648,10 @@ struct ReadResults {
     results: Vec<Result<Arc<FBuf>, StorageError>>,
 }
 
+/// Reads all of the data in a column in order.
+///
+/// `BulkRows` provides non-blocking access to all of the data in a [Reader]
+/// column.  It does all of the I/O asynchronously with heavy readahead.
 pub struct BulkRows<'a, K, A, N, T>
 where
     K: DataTrait + ?Sized,
@@ -3691,11 +3695,13 @@ where
     NA: DataTrait + ?Sized,
     T: ColumnSpec,
 {
+    /// Returns a [BulkRows] for the next column.
     pub fn next_column<'b>(&'b self) -> Result<BulkRows<'a, NK, NA, NN, T>, Error> {
         BulkRows::new(&self.reader, self.column + 1)
     }
 }
 
+#[allow(missing_docs)]
 impl<'a, K, A, N, T> BulkRows<'a, K, A, N, T>
 where
     K: DataTrait + ?Sized,
@@ -3794,6 +3800,9 @@ where
         Ok(())
     }
 
+    /// Initiates and continues background work for reading data in this column.
+    /// This must be called periodically to keep data flowing.  It limits the
+    /// amount of data buffered beyond the current read point.
     pub fn work(&mut self) -> Result<(), Error> {
         self.work_(Vec::new())
     }
@@ -4041,10 +4050,6 @@ where
             self.blocks.pop_front();
             self.index = 0;
         }
-    }
-
-    fn eof(&self, n_rows: u64) -> bool {
-        self.next >= n_rows
     }
 
     fn is_full(&self, level: usize) -> bool {
