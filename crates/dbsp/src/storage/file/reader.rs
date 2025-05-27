@@ -3727,11 +3727,7 @@ where
         Ok(this)
     }
 
-    pub fn start_index_read(
-        &mut self,
-        node: &TreeNode,
-        level: usize,
-    ) -> Result<Option<Read>, Error> {
+    fn start_index_read(&mut self, node: &TreeNode, level: usize) -> Result<Option<Read>, Error> {
         if level >= self.indexes.len() {
             self.indexes.push(IndexLevel::new());
         }
@@ -3750,7 +3746,7 @@ where
         }
     }
 
-    pub fn start_data_read(&mut self, node: &TreeNode) -> Result<Option<Read>, Error> {
+    fn start_data_read(&mut self, node: &TreeNode) -> Result<Option<Read>, Error> {
         self.data_pending += 1;
         if let Some(cache_entry) = self
             .cache
@@ -3766,11 +3762,7 @@ where
         }
     }
 
-    pub fn start_block_read(
-        &mut self,
-        node: &TreeNode,
-        level: usize,
-    ) -> Result<Option<Read>, Error> {
+    fn start_block_read(&mut self, node: &TreeNode, level: usize) -> Result<Option<Read>, Error> {
         dbg!(&node, level);
         match node.node_type {
             NodeType::Data => self.start_data_read(node),
