@@ -31,7 +31,9 @@ use crate::circuit::GlobalNodeId;
 use crate::dynamic::{ClonableTrait, DynDataTyped, DynUnit, Weight};
 use crate::storage::buffer_cache::CacheStats;
 pub use crate::storage::file::{Deserializable, Deserializer, Rkyv, Serializer};
-use crate::trace::cursor::{FilteredMergeCursor, UnfilteredMergeCursor};
+use crate::trace::cursor::{
+    DefaultPushCursor, FilteredMergeCursor, PushCursor, UnfilteredMergeCursor,
+};
 use crate::{dynamic::ArchivedDBData, storage::buffer_cache::FBuf};
 use cursor::CursorFactory;
 use dyn_clone::DynClone;
@@ -389,7 +391,14 @@ where
     /// Acquires a cursor to the batch's contents.
     fn cursor(&self) -> Self::Cursor<'_>;
 
-    /// Acquires a merge cursor for the batch's contents.
+    /// Acquires a [PushCursor] for the batch's contents.
+    fn push_cursor(
+        &self,
+    ) -> Box<dyn PushCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_> {
+        Box::new(DefaultPushCursor::new(self.cursor()))
+    }
+
+    /// Acquires a [MergeCursor] for the batch's contents.
     fn merge_cursor(
         &self,
         key_filter: Option<Filter<Self::Key>>,

@@ -5,29 +5,11 @@ use crate::{
     dynamic::{DynDataTyped, DynWeightedPairs, WeightTrait},
     time::Timestamp,
     trace::{
-        spine_async::index_set::IndexSet, Batch, BatchFactories, BatchReaderFactories, Builder,
-        Weight,
+        cursor::{Pending, PushCursor},
+        spine_async::index_set::IndexSet,
+        Batch, BatchFactories, BatchReaderFactories, Builder, Filter, Weight,
     },
 };
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Pending;
-
-pub trait PushCursor<K, V, T, R>
-where
-    K: ?Sized,
-    V: ?Sized,
-    R: ?Sized,
-{
-    fn key(&self) -> Result<Option<&K>, Pending>;
-    fn val(&self) -> Result<Option<&V>, Pending>;
-    fn map_times(&mut self, logic: &mut dyn FnMut(&T, &R));
-    fn weight(&mut self) -> &R
-    where
-        T: PartialEq<()>;
-    fn step_key(&mut self);
-    fn step_val(&mut self);
-}
 
 pub struct PushMerger<C, B>
 where
@@ -35,6 +17,8 @@ where
     B: Batch,
 {
     cursors: Vec<C>,
+    key_filter: Option<Filter<B::Key>>,
+    value_filter: Option<Filter<B::Val>>,
     any_values: bool,
     tmp_weight: Box<B::R>,
     time_diffs: Option<Box<DynWeightedPairs<DynDataTyped<B::Time>, B::R>>>,
@@ -46,10 +30,17 @@ where
     B: Batch,
 {
     /// Creates a new merger for `cursors`.
-    pub fn new(factories: &B::Factories, cursors: Vec<C>) -> Self {
+    pub fn new(
+        factories: &B::Factories,
+        cursors: Vec<C>,
+        key_filter: Option<Filter<B::Key>>,
+        value_filter: Option<Filter<B::Val>>,
+    ) -> Self {
         assert!(cursors.len() <= 64);
         Self {
             cursors,
+            key_filter,
+            value_filter,
             any_values: false,
             tmp_weight: factories.weight_factory().default_box(),
             time_diffs: factories.time_diffs_factory().map(|f| f.default_box()),
@@ -74,7 +65,8 @@ where
         // then we can't do any work.
         assert!(self.cursors.len() <= 64);
         let mut remaining_cursors = IndexSet::empty();
-        for (index, cursor) in self.cursors.iter().enumerate() {
+        for (index, cursor) in self.cursors.iter_mut().enumerate() {
+            skip_filtered_keys(cursor, &self.key_filter, &self.value_filter)?;
             if cursor.key()?.is_some() {
                 remaining_cursors.add(index);
             }
@@ -119,6 +111,7 @@ where
                 // for which we've exhausted the values.
                 for index in min_vals {
                     self.cursors[index].step_val();
+                    skip_filtered_values(&mut self.cursors[index], &self.value_filter)?;
                     if self.cursors[index].val()?.is_none() {
                         min_keys.remove(index);
                     }
@@ -132,6 +125,7 @@ where
                     self.any_values =
                         self.copy_times(builder, time_map_func, min_keys) || self.any_values;
                     self.cursors[index].step_val();
+                    skip_filtered_values(&mut self.cursors[index], &self.value_filter)?;
                     if self.cursors[index].val()?.is_none() {
                         break;
                     }
@@ -149,6 +143,11 @@ where
             // we've exhausted the data.
             for index in orig_min_keys {
                 self.cursors[index].step_key();
+                skip_filtered_keys(
+                    &mut self.cursors[index],
+                    &self.key_filter,
+                    &self.value_filter,
+                )?;
                 if self.cursors[index].key()?.is_none() {
                     remaining_cursors.remove(index);
                 }
@@ -163,6 +162,7 @@ where
                     self.any_values = self.copy_times(builder, time_map_func, remaining_cursors)
                         || self.any_values;
                     self.cursors[index].step_val();
+                    skip_filtered_values(&mut self.cursors[index], &self.value_filter)?;
                     if self.cursors[index].val()?.is_none() {
                         break;
                     }
@@ -173,6 +173,11 @@ where
                     builder.push_key(self.cursors[index].key().unwrap().unwrap());
                 }
                 self.cursors[index].step_key();
+                skip_filtered_keys(
+                    &mut self.cursors[index],
+                    &self.key_filter,
+                    &self.value_filter,
+                )?;
                 if self.cursors[index].key()?.is_none() {
                     break;
                 }
@@ -180,6 +185,7 @@ where
         }
         Ok(())
     }
+
     fn copy_times(
         &mut self,
         builder: &mut B::Builder,
@@ -267,4 +273,49 @@ where
         }
     }
     min_indexes
+}
+
+fn skip_filtered_keys<C, K, V, T, R>(
+    cursor: &mut C,
+    key_filter: &Option<Filter<K>>,
+    value_filter: &Option<Filter<V>>,
+) -> Result<(), Pending>
+where
+    C: PushCursor<K, V, T, R>,
+    K: ?Sized,
+    V: ?Sized,
+    R: ?Sized,
+{
+    if let Some(key_filter) = key_filter {
+        while cursor
+            .key()?
+            .is_some_and(|value| Filter::include(key_filter, value))
+        {
+            cursor.step_key();
+        }
+    }
+    Ok(())
+}
+
+fn skip_filtered_values<C, K, V, T, R>(
+    cursor: &mut C,
+    value_filter: &Option<Filter<V>>,
+) -> Result<bool, Pending>
+where
+    C: PushCursor<K, V, T, R>,
+    K: ?Sized,
+    V: ?Sized,
+    R: ?Sized,
+{
+    if value_filter.is_some() {
+        while let Some(value) = cursor.val()? {
+            if Filter::include(value_filter, value) {
+                return Ok(true);
+            }
+            cursor.step_val();
+        }
+        return Ok(false);
+    } else {
+        Ok(true)
+    }
 }
