@@ -555,7 +555,7 @@ where
         self.val_valid = Ok(false);
     }
 
-    fn work(&mut self) {
+    fn prime(&mut self) {
         self.bulk_rows.work().unwrap();
         if self.key_valid == Err(Pending) {
             self.fetch_item();

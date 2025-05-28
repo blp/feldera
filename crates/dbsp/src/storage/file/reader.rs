@@ -808,7 +808,6 @@ impl TreeNode {
                     missing >>= 1;
                     retain
                 });
-                //dbg!(nodes.len());
                 let (sender, receiver) = mpsc::channel();
                 file.file_handle.read_async(
                     nodes.iter().map(|node| node.location).collect(),
@@ -3786,7 +3785,6 @@ where
     }
 
     fn start_block_read(&mut self, node: &TreeNode, level: usize) -> Result<Option<Read>, Error> {
-        dbg!(&node, level);
         match node.node_type {
             NodeType::Data => self.start_data_read(node),
             NodeType::Index => self.start_index_read(node, level),
@@ -3834,7 +3832,6 @@ where
         let mut level = 0;
         while level < self.indexes.len() {
             while let Some(node) = self.indexes[level].child()? {
-                dbg!(level, &node);
                 if self.is_level_full(node.node_type, level + 1) {
                     break;
                 }
@@ -3847,16 +3844,12 @@ where
         }
 
         if !reads.is_empty() {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            println!("starting read {count}");
             self.reader.file.file_handle.read_async(
                 reads.iter().map(|read| read.node.location).collect(),
                 {
                     let sender = self.sender.clone();
                     Box::new(move |results| {
                         let _ = sender.send(ReadResults { reads, results });
-                        println!("finished read {count}");
                     })
                 },
             );

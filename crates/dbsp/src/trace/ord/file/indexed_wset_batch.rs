@@ -535,7 +535,9 @@ where
         if unsafe { self.key_bulk_rows.key(&mut self.key) }.is_some() {
             self.row_group = self.key_bulk_rows.row_group().unwrap().unwrap();
             if self.val_bulk_rows.step_to(self.row_group.start) {
-                unsafe { self.val_bulk_rows.item((&mut self.val, &mut self.diff)) }.unwrap();
+                if unsafe { self.val_bulk_rows.item((&mut self.val, &mut self.diff)) }.is_none() {
+                    debug_assert!(!self.val_bulk_rows.is_readable());
+                }
             }
         }
     }
@@ -593,10 +595,14 @@ where
     fn step_val(&mut self) {
         self.assert_val_valid();
         self.val_bulk_rows.step();
-        unsafe { self.val_bulk_rows.item((&mut self.val, &mut self.diff)) }.unwrap();
+        if self.row_group.contains(&self.val_bulk_rows.row())
+            && unsafe { self.val_bulk_rows.item((&mut self.val, &mut self.diff)) }.is_none()
+        {
+            debug_assert!(!self.val_bulk_rows.is_readable());
+        }
     }
 
-    fn work(&mut self) {
+    fn prime(&mut self) {
         self.key_bulk_rows.work().unwrap();
         self.val_bulk_rows.work().unwrap();
         self.fetch_key();

@@ -16,9 +16,11 @@ use crate::{
     storage::{backend::posixio_impl, buffer_cache::CacheStats},
     time::Timestamp,
     trace::{
-        cursor::CursorList, merge_batches, ord::fallback::pick_merge_destination,
-        spine_async::snapshot::FetchList, Batch, BatchReader, BatchReaderFactories, Builder,
-        Cursor, Filter, Trace,
+        cursor::{CursorList, Pending},
+        merge_batches,
+        ord::fallback::pick_merge_destination,
+        spine_async::{push_merger::ArcPushMerger, snapshot::FetchList},
+        Batch, BatchReader, BatchReaderFactories, Builder, Cursor, Filter, Trace,
     },
     Error, NumEntries, Runtime,
 };
@@ -28,7 +30,6 @@ pub use crate::trace::spine_async::snapshot::SpineSnapshot;
 use crate::trace::CommittedSpine;
 use enum_map::EnumMap;
 use feldera_storage::StoragePath;
-use list_merger::ArcMerger;
 use metrics::counter;
 use ouroboros::self_referencing;
 use rand::Rng;
@@ -389,7 +390,8 @@ struct AsyncMerge<B>
 where
     B: Batch,
 {
-    merger: ArcMerger<B>,
+    merger: ArcPushMerger<B>,
+    builder: B::Builder,
     elapsed: Duration,
     invocations: usize,
 }
@@ -406,10 +408,23 @@ where
         let factories = batches[0].factories();
         let builder = B::Builder::for_merge(&factories, &batches, None);
         Self {
-            merger: ArcMerger::new(&factories, builder, batches, &key_filter, &value_filter),
+            merger: ArcPushMerger::new(&factories, batches, &key_filter, &value_filter),
+            builder,
             elapsed: Duration::ZERO,
             invocations: 0,
         }
+    }
+
+    fn merge(&mut self, frontier: &B::Time) -> Result<(), Pending> {
+        self.merger.merge(&mut self.builder, frontier)
+    }
+
+    fn prime(&mut self) {
+        self.merger.prime();
+    }
+
+    fn done(self) -> B {
+        self.builder.done()
     }
 }
 
@@ -427,16 +442,7 @@ where
             let no_backpressure = Arc::clone(&no_backpressure);
             Box::new(|| {
                 let mut mergers = std::array::from_fn(|_| None);
-                let mut stored_fuel = std::array::from_fn(|_| 0);
-                Box::new(move || {
-                    Self::run(
-                        &mut stored_fuel,
-                        &mut mergers,
-                        &state,
-                        &idle,
-                        &no_backpressure,
-                    )
-                })
+                Box::new(move || Self::run(&mut mergers, &state, &idle, &no_backpressure))
             })
         });
         Self {
@@ -636,7 +642,6 @@ where
     }
 
     fn run(
-        stored_fuel: &mut [isize; MAX_LEVELS],
         mergers: &mut [Option<AsyncMerge<B>>; MAX_LEVELS],
         state: &Arc<Mutex<SharedState<B>>>,
         idle: &Arc<Condvar>,
@@ -650,23 +655,11 @@ where
 
         for (level, m) in mergers.iter_mut().enumerate() {
             if let Some(merger) = m.as_mut() {
-                // The following treatment of fuel works well for the test case
-                // used to tune it, but it is not theoretically sound or well
-                // principled. It is likely that it should be redone.
-                let starting_fuel = if level == 0 {
-                    isize::MAX
-                } else {
-                    stored_fuel[level].max(10_000)
-                };
-                let mut fuel = starting_fuel;
                 let start = Instant::now();
-                merger.merger.work(&frontier, &mut fuel);
+                let done = merger.merge(&frontier).is_ok();
                 merger.elapsed += start.elapsed();
                 merger.invocations += 1;
-                let fuel_consumed = starting_fuel - fuel;
-                stored_fuel[level] = (stored_fuel[level] - fuel_consumed).max(0);
-                stored_fuel[level + 1] += fuel_consumed;
-                if fuel > 0 {
+                if done {
                     let merger = m.take().unwrap();
                     thread_local! {
                         pub static TOTALS: RefCell<[(u32, Duration); MAX_LEVELS]> = RefCell::new([(0, Duration::ZERO); MAX_LEVELS]);
@@ -676,14 +669,18 @@ where
                         totals[level].1 += merger.elapsed;
                         totals[level].1 / totals[level].0
                     });
-                    let new_batch = Arc::new(merger.merger.done());
+                    let invocations = merger.invocations;
+                    let elapsed = merger.elapsed;
+                    let new_batch = Arc::new(merger.done());
                     state.lock().unwrap().merge_complete(
                         level,
                         new_batch,
-                        merger.invocations,
-                        merger.elapsed,
+                        invocations,
+                        elapsed,
                         mean,
                     );
+                } else {
+                    merger.prime();
                 }
             }
         }
@@ -702,7 +699,9 @@ where
             .filter_map(|(level, slot)| slot.try_start_merge(level).map(|batches| (level, batches)))
             .collect::<Vec<_>>();
         for (level, batches) in start_merges {
-            mergers[level] = Some(AsyncMerge::new(batches, &key_filter, &value_filter));
+            let mut merger = AsyncMerge::new(batches, &key_filter, &value_filter);
+            merger.prime();
+            mergers[level] = Some(merger);
         }
 
         let state = state.lock().unwrap();

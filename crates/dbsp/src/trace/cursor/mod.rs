@@ -961,7 +961,46 @@ where
         T: PartialEq<()>;
     fn step_key(&mut self);
     fn step_val(&mut self);
-    fn work(&mut self) {}
+    fn prime(&mut self) {}
+}
+
+impl<K, V, T, R, C> PushCursor<K, V, T, R> for Box<C>
+where
+    C: PushCursor<K, V, T, R> + ?Sized,
+    K: ?Sized,
+    V: ?Sized,
+    R: ?Sized,
+{
+    fn key(&self) -> Result<Option<&K>, Pending> {
+        (**self).key()
+    }
+
+    fn val(&self) -> Result<Option<&V>, Pending> {
+        (**self).val()
+    }
+
+    fn map_times(&mut self, logic: &mut dyn FnMut(&T, &R)) {
+        (**self).map_times(logic);
+    }
+
+    fn weight(&mut self) -> &R
+    where
+        T: PartialEq<()>,
+    {
+        (**self).weight()
+    }
+
+    fn step_key(&mut self) {
+        (**self).step_key();
+    }
+
+    fn step_val(&mut self) {
+        (**self).step_val();
+    }
+
+    fn prime(&mut self) {
+        (**self).prime();
+    }
 }
 
 pub struct DefaultPushCursor<K, V, T, R, C>

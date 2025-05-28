@@ -1,4 +1,7 @@
-use std::cmp::Ordering;
+use itertools::Itertools;
+use std::{cmp::Ordering, sync::Arc};
+
+use ouroboros::self_referencing;
 
 use crate::{
     algebra::Lattice,
@@ -10,6 +13,57 @@ use crate::{
         Batch, BatchFactories, BatchReaderFactories, Builder, Filter, Weight,
     },
 };
+
+pub struct ArcPushMerger<B>(ArcPushMergerInner<B>)
+where
+    B: Batch;
+
+#[self_referencing]
+struct ArcPushMergerInner<B>
+where
+    B: Batch,
+{
+    batches: Vec<Arc<B>>,
+    #[borrows(batches)]
+    #[not_covariant]
+    merger: PushMerger<Box<dyn PushCursor<B::Key, B::Val, B::Time, B::R> + Send + 'this>, B>,
+}
+
+impl<B> ArcPushMerger<B>
+where
+    B: Batch,
+{
+    pub fn new(
+        factories: &B::Factories,
+        batches: Vec<Arc<B>>,
+        key_filter: &Option<Filter<B::Key>>,
+        value_filter: &Option<Filter<B::Val>>,
+    ) -> Self {
+        Self(
+            ArcPushMergerInnerBuilder {
+                batches,
+                merger_builder: |batches| {
+                    PushMerger::new(
+                        factories,
+                        batches.iter().map(|b| b.push_cursor()).collect(),
+                        key_filter.clone(),
+                        value_filter.clone(),
+                    )
+                },
+            }
+            .build(),
+        )
+    }
+
+    pub fn merge(&mut self, builder: &mut B::Builder, frontier: &B::Time) -> Result<(), Pending> {
+        self.0
+            .with_mut(|fields| fields.merger.merge(builder, frontier))
+    }
+
+    pub fn prime(&mut self) {
+        self.0.with_mut(|fields| fields.merger.prime())
+    }
+}
 
 pub struct PushMerger<C, B>
 where
@@ -71,11 +125,8 @@ where
         self.cursors[index].key()
     }
 
-    fn work(&mut self, builder: &mut B::Builder, frontier: &B::Time) {
-        let _ = self.work_(builder, frontier);
-    }
-
-    fn work_(&mut self, builder: &mut B::Builder, frontier: &B::Time) -> Result<(), Pending> {
+    /// Returns `Ok(())` if the merge is complete, `Err(Pending)` otherwise.
+    fn merge(&mut self, builder: &mut B::Builder, frontier: &B::Time) -> Result<(), Pending> {
         // We can drop all the cursors whose keys are at EOI.  If that
         // eliminates all of them, we're all done.  If any keys are pending,
         // then we can't do any work.
@@ -115,11 +166,11 @@ where
                 // ...Find the indexes of the cursors with minimum values, among
                 // those with minimum keys, and copy their time-diff pairs and
                 // value into the output.
-                let min_vals = find_min_indexes(
+                let min_vals = try_find_min_indexes(
                     min_keys
                         .into_iter()
-                        .map(|index| (index, self.cursors[index].val().unwrap())),
-                );
+                        .map(|index| (index, self.cursors[index].val())),
+                )?;
                 self.any_values =
                     self.copy_times(builder, time_map_func, min_vals) || self.any_values;
 
@@ -136,6 +187,7 @@ where
             // values into the output.
             if let Some(index) = min_keys.first() {
                 loop {
+                    self.cursors[index].val()?;
                     self.any_values =
                         self.copy_times(builder, time_map_func, min_keys) || self.any_values;
                     if self.step_val(index)?.is_none() {
@@ -165,6 +217,7 @@ where
         if let Some(index) = remaining_cursors.first() {
             loop {
                 loop {
+                    self.cursors[index].val()?;
                     self.any_values = self.copy_times(builder, time_map_func, remaining_cursors)
                         || self.any_values;
                     if self.step_val(index)?.is_none() {
@@ -184,12 +237,20 @@ where
         Ok(())
     }
 
+    #[track_caller]
     fn copy_times(
         &mut self,
         builder: &mut B::Builder,
         map_func: Option<&dyn Fn(&mut DynDataTyped<B::Time>)>,
         indexes: IndexSet,
     ) -> bool {
+        // All of the cursors must have a valid value (hence the `unwrap()`, and
+        // they must be equal.
+        debug_assert!(indexes
+            .into_iter()
+            .map(|index| self.cursors[index].val().unwrap())
+            .all_equal());
+
         // If this is a timed batch, we must consolidate the (time, weight) array; otherwise we
         // simply compute the total weight of the current value.
         if let Some(time_diffs) = &mut self.time_diffs {
@@ -249,6 +310,12 @@ where
         builder.push_val(self.cursors[index].val().unwrap().unwrap());
         true
     }
+
+    pub fn prime(&mut self) {
+        for cursor in &mut self.cursors {
+            cursor.prime();
+        }
+    }
 }
 
 fn find_min_indexes<Item>(mut iterator: impl Iterator<Item = (usize, Item)>) -> IndexSet
@@ -271,6 +338,32 @@ where
         }
     }
     min_indexes
+}
+
+fn try_find_min_indexes<Item>(
+    mut iterator: impl Iterator<Item = (usize, Result<Item, Pending>)>,
+) -> Result<IndexSet, Pending>
+where
+    Item: Ord,
+{
+    let (min_index, min_value) = iterator.next().unwrap();
+    let mut min_indexes = IndexSet::for_index(min_index);
+    let mut min_value = min_value?;
+
+    for (index, value) in iterator {
+        let value = value?;
+        match value.cmp(&min_value) {
+            Ordering::Less => {
+                min_value = value;
+                min_indexes = IndexSet::for_index(index);
+            }
+            Ordering::Equal => {
+                min_indexes.add(index);
+            }
+            Ordering::Greater => (),
+        }
+    }
+    Ok(min_indexes)
 }
 
 fn skip_filtered_keys<C, K, V, T, R>(
