@@ -394,6 +394,25 @@ where
     invocations: usize,
 }
 
+impl<B> AsyncMerge<B>
+where
+    B: Batch,
+{
+    fn new(
+        batches: Vec<Arc<B>>,
+        key_filter: &Option<Filter<B::Key>>,
+        value_filter: &Option<Filter<B::Val>>,
+    ) -> Self {
+        let factories = batches[0].factories();
+        let builder = B::Builder::for_merge(&factories, &batches, None);
+        Self {
+            merger: ArcMerger::new(&factories, builder, batches, &key_filter, &value_filter),
+            elapsed: Duration::ZERO,
+            invocations: 0,
+        }
+    }
+}
+
 impl<B> AsyncMerger<B>
 where
     B: Batch,
@@ -683,13 +702,7 @@ where
             .filter_map(|(level, slot)| slot.try_start_merge(level).map(|batches| (level, batches)))
             .collect::<Vec<_>>();
         for (level, batches) in start_merges {
-            let factories = batches[0].factories();
-            let builder = B::Builder::for_merge(&factories, &batches, None);
-            mergers[level] = Some(AsyncMerge {
-                merger: ArcMerger::new(&factories, builder, batches, &key_filter, &value_filter),
-                elapsed: Duration::ZERO,
-                invocations: 0,
-            });
+            mergers[level] = Some(AsyncMerge::new(batches, &key_filter, &value_filter));
         }
 
         let state = state.lock().unwrap();
