@@ -3687,6 +3687,23 @@ where
     _phantom: PhantomData<fn(&K, &A, N)>,
 }
 
+impl<'a, K, A, N, T> Debug for BulkRows<'a, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+    T: ColumnSpec,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(
+            f,
+            "BulkRows {{ row: {}, n_rows: {}, n_readable: {} }}",
+            self.row,
+            self.n_rows,
+            self.n_readable()
+        )
+    }
+}
+
 impl<'a, K, A, NK, NA, NN, T> BulkRows<'a, K, A, (&'static NK, &'static NA, NN), T>
 where
     K: DataTrait + ?Sized,
@@ -3893,7 +3910,7 @@ where
     }
 
     pub fn is_readable(&self) -> bool {
-        self.n_readable() > 0
+        !self.data_blocks.is_empty()
     }
 
     pub fn wait(&mut self) -> Result<(), Error> {
@@ -3965,12 +3982,37 @@ where
             .transpose()
     }
 
+    pub fn row(&self) -> u64 {
+        self.row
+    }
+
+    pub fn n_rows(&self) -> u64 {
+        self.n_rows
+    }
+
     pub fn step(&mut self) {
         debug_assert!(self.data_blocks[0].rows().contains(&self.row));
         self.row += 1;
         if self.row >= self.data_blocks[0].rows().end {
             self.data_blocks.pop_front();
         }
+    }
+
+    pub fn step_to(&mut self, target_row: u64) -> bool {
+        debug_assert!(target_row >= self.row);
+        debug_assert!(target_row <= self.n_rows);
+        while target_row > self.row {
+            let Some(end) = self.data_blocks.front().map(|block| block.rows().end) else {
+                return false;
+            };
+            if target_row >= end {
+                self.row = end;
+                self.data_blocks.pop_front();
+            } else {
+                self.row = target_row;
+            }
+        }
+        true
     }
 }
 

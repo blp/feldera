@@ -961,6 +961,7 @@ where
         T: PartialEq<()>;
     fn step_key(&mut self);
     fn step_val(&mut self);
+    fn work(&mut self) {}
 }
 
 pub struct DefaultPushCursor<K, V, T, R, C>

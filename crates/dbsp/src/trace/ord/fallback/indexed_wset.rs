@@ -4,7 +4,7 @@ use crate::{
     dynamic::{DataTrait, DynVec, Erase, WeightTrait, WeightTraitTyped},
     storage::{buffer_cache::CacheStats, file::reader::Error as ReaderError},
     trace::{
-        cursor::{CursorFactory, DelegatingCursor},
+        cursor::{CursorFactory, DelegatingCursor, PushCursor},
         deserialize_indexed_wset, merge_batches_by_reference,
         ord::{
             fallback::utils::BuildTo,
@@ -213,6 +213,15 @@ where
             Inner::Vec(vec) => Box::new(vec.cursor()),
             Inner::File(file) => Box::new(file.cursor()),
         })
+    }
+
+    fn push_cursor(
+        &self,
+    ) -> Box<dyn PushCursor<Self::Key, Self::Val, Self::Time, Self::R> + Send + '_> {
+        match &self.inner {
+            Inner::Vec(vec) => vec.push_cursor(),
+            Inner::File(file) => file.push_cursor(),
+        }
     }
 
     fn merge_cursor(

@@ -55,6 +55,22 @@ where
         self.cursors.iter().all(|cursor| cursor.key().is_ok())
     }
 
+    fn step_val(&mut self, index: usize) -> Result<Option<&B::Val>, Pending> {
+        self.cursors[index].step_val();
+        skip_filtered_values(&mut self.cursors[index], &self.value_filter)?;
+        self.cursors[index].val()
+    }
+
+    fn step_key(&mut self, index: usize) -> Result<Option<&B::Key>, Pending> {
+        self.cursors[index].step_key();
+        skip_filtered_keys(
+            &mut self.cursors[index],
+            &self.key_filter,
+            &self.value_filter,
+        )?;
+        self.cursors[index].key()
+    }
+
     fn work(&mut self, builder: &mut B::Builder, frontier: &B::Time) {
         let _ = self.work_(builder, frontier);
     }
@@ -110,9 +126,7 @@ where
                 // Then go on to the next value in each cursor, dropping the keys
                 // for which we've exhausted the values.
                 for index in min_vals {
-                    self.cursors[index].step_val();
-                    skip_filtered_values(&mut self.cursors[index], &self.value_filter)?;
-                    if self.cursors[index].val()?.is_none() {
+                    if self.step_val(index)?.is_none() {
                         min_keys.remove(index);
                     }
                 }
@@ -124,9 +138,7 @@ where
                 loop {
                     self.any_values =
                         self.copy_times(builder, time_map_func, min_keys) || self.any_values;
-                    self.cursors[index].step_val();
-                    skip_filtered_values(&mut self.cursors[index], &self.value_filter)?;
-                    if self.cursors[index].val()?.is_none() {
+                    if self.step_val(index)?.is_none() {
                         break;
                     }
                 }
@@ -142,13 +154,7 @@ where
             // Advance each minimum-key cursor, dropping the cursors for which
             // we've exhausted the data.
             for index in orig_min_keys {
-                self.cursors[index].step_key();
-                skip_filtered_keys(
-                    &mut self.cursors[index],
-                    &self.key_filter,
-                    &self.value_filter,
-                )?;
-                if self.cursors[index].key()?.is_none() {
+                if self.step_key(index)?.is_none() {
                     remaining_cursors.remove(index);
                 }
             }
@@ -161,9 +167,7 @@ where
                 loop {
                     self.any_values = self.copy_times(builder, time_map_func, remaining_cursors)
                         || self.any_values;
-                    self.cursors[index].step_val();
-                    skip_filtered_values(&mut self.cursors[index], &self.value_filter)?;
-                    if self.cursors[index].val()?.is_none() {
+                    if self.step_val(index)?.is_none() {
                         break;
                     }
                 }
@@ -172,13 +176,7 @@ where
                     self.any_values = false;
                     builder.push_key(self.cursors[index].key().unwrap().unwrap());
                 }
-                self.cursors[index].step_key();
-                skip_filtered_keys(
-                    &mut self.cursors[index],
-                    &self.key_filter,
-                    &self.value_filter,
-                )?;
-                if self.cursors[index].key()?.is_none() {
+                if self.step_key(index)?.is_none() {
                     break;
                 }
             }
@@ -286,11 +284,11 @@ where
     V: ?Sized,
     R: ?Sized,
 {
-    if let Some(key_filter) = key_filter {
-        while cursor
-            .key()?
-            .is_some_and(|value| Filter::include(key_filter, value))
-        {
+    if key_filter.is_some() || value_filter.is_some() {
+        while let Some(key) = cursor.key()? {
+            if Filter::include(key_filter, key) && skip_filtered_values(cursor, value_filter)? {
+                return Ok(());
+            }
             cursor.step_key();
         }
     }
