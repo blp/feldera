@@ -100,7 +100,7 @@ impl FileReader for PosixReader {
             *reads += 1;
             *blocks += 1;
         });
-        //busy_wait(Duration::from_millis(2));
+        busy_wait(Duration::from_millis(2));
         let mut buffer = FBuf::with_capacity(location.size);
 
         match buffer.read_exact_at(&self.file, location.offset, location.size) {

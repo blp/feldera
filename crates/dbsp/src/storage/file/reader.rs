@@ -37,7 +37,6 @@ use snap::raw::{decompress_len, Decoder};
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::replace;
-use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{self, channel, Receiver, Sender};
 use std::time::Instant;
 use std::{
