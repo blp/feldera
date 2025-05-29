@@ -34,7 +34,6 @@ use feldera_storage::StoragePath;
 use futures::future::Either;
 use smallvec::{smallvec, SmallVec};
 use snap::raw::{decompress_len, Decoder};
-use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::mem::replace;
 use std::sync::mpsc::{self, channel, Receiver, Sender};
@@ -455,10 +454,6 @@ where
     fn cost(&self) -> usize {
         size_of::<Self>() + self.raw.capacity()
     }
-
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
-    }
 }
 
 struct DataBlockReader<'a> {
@@ -565,9 +560,8 @@ where
         location: BlockLocation,
     ) -> Result<Arc<Self>, Error> {
         cache_entry
-            .as_any()
             .downcast()
-            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(location)))
+            .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))
     }
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
         match DataBlockReader::new(file, node)? {
@@ -928,9 +922,6 @@ where
     fn cost(&self) -> usize {
         size_of::<Self>() + self.raw.capacity()
     }
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
-    }
 }
 
 struct IndexBlockReader<'a> {
@@ -1073,9 +1064,8 @@ where
         location: BlockLocation,
     ) -> Result<Arc<Self>, Error> {
         cache_entry
-            .as_any()
             .downcast()
-            .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(location)))
+            .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))
     }
 
     fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
@@ -1425,10 +1415,6 @@ impl CacheEntry for FileTrailer {
     fn cost(&self) -> usize {
         size_of::<FileTrailer>()
     }
-
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
-    }
 }
 
 impl FileTrailer {
@@ -1446,8 +1432,9 @@ impl FileTrailer {
         #[allow(clippy::borrow_deref_ref)]
         let (access, entry) = match cache.get(&*file_handle, location) {
             Some(entry) => {
-                let entry = Arc::downcast::<Self>(entry.as_any())
-                    .map_err(|_| Error::Corruption(CorruptionError::BadBlockType(location)))?;
+                let entry = entry
+                    .downcast()
+                    .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))?;
                 (CacheAccess::Hit, entry)
             }
             None => {

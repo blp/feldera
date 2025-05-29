@@ -74,9 +74,17 @@ fn is_locked(serial: u64) -> bool {
     serial > u64::MAX / 2
 }
 
-pub trait CacheEntry: Send + Sync + Debug {
+pub trait CacheEntry: Any + Send + Sync + Debug {
     fn cost(&self) -> usize;
-    fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
+}
+
+impl dyn CacheEntry {
+    pub fn downcast<T>(self: Arc<Self>) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        (self as Arc<dyn Any + Send + Sync>).downcast().ok()
+    }
 }
 
 struct CacheInner {
