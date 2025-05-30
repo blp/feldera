@@ -69,9 +69,8 @@
 #![cfg_attr(not(test), warn(missing_docs))]
 
 use crate::{
-    dynamic::{ArchivedDBData, DynPairs, LeanVec},
+    dynamic::{ArchivedDBData, DynVec, LeanVec},
     storage::buffer_cache::{FBuf, FBufSerializer},
-    utils::Tup2,
 };
 use rkyv::de::deserializers::SharedDeserializeMap;
 use rkyv::{
@@ -114,7 +113,8 @@ where
     /// Factory for creating instances of `Item<K, A>`.
     pub item_factory: &'static dyn ItemFactory<K, A>,
 
-    pub pairs_factory: &'static dyn Factory<DynPairs<K, A>>,
+    /// Factory for creating instances of `Vector<K>`.
+    pub keys_factory: &'static dyn Factory<DynVec<K>>,
 }
 
 impl<K, A> Clone for Factories<K, A>
@@ -126,7 +126,7 @@ where
         Self {
             key_factory: self.key_factory,
             item_factory: self.item_factory,
-            pairs_factory: self.pairs_factory,
+            keys_factory: self.keys_factory,
         }
     }
 }
@@ -146,7 +146,7 @@ where
         Self {
             key_factory: WithFactory::<KType>::FACTORY,
             item_factory: <RefTup2Factory<KType, AType> as WithItemFactory<K, A>>::ITEM_FACTORY,
-            pairs_factory: WithFactory::<LeanVec<Tup2<KType, AType>>>::FACTORY,
+            keys_factory: WithFactory::<LeanVec<KType>>::FACTORY,
         }
     }
 
@@ -159,7 +159,7 @@ where
         AnyFactories {
             key_factory: Arc::new(self.key_factory),
             item_factory: Arc::new(self.item_factory),
-            pairs_factory: Arc::new(self.pairs_factory),
+            keys_factory: Arc::new(self.keys_factory),
         }
     }
 }
@@ -176,7 +176,7 @@ where
 pub struct AnyFactories {
     key_factory: Arc<(dyn Any + Send + Sync + 'static)>,
     item_factory: Arc<(dyn Any + Send + Sync + 'static)>,
-    pairs_factory: Arc<(dyn Any + Send + Sync + 'static)>,
+    keys_factory: Arc<(dyn Any + Send + Sync + 'static)>,
 }
 
 impl Debug for AnyFactories {
@@ -209,15 +209,14 @@ impl AnyFactories {
             .unwrap()
     }
 
-    fn pairs_factory<K, A>(&self) -> &'static dyn Factory<DynPairs<K, A>>
+    fn keys_factory<K>(&self) -> &'static dyn Factory<DynVec<K>>
     where
         K: DataTrait + ?Sized,
-        A: DataTrait + ?Sized,
     {
         *self
-            .pairs_factory
+            .keys_factory
             .as_ref()
-            .downcast_ref::<&'static dyn Factory<DynPairs<K, A>>>()
+            .downcast_ref::<&'static dyn Factory<DynVec<K>>>()
             .unwrap()
     }
 
@@ -229,7 +228,7 @@ impl AnyFactories {
         Factories {
             key_factory: self.key_factory(),
             item_factory: self.item_factory(),
-            pairs_factory: self.pairs_factory(),
+            keys_factory: self.keys_factory(),
         }
     }
 }
@@ -855,12 +854,10 @@ mod test {
     {
         let keys_factory: &dyn Factory<dyn Vector<DynData>> = WithFactory::<LeanVec<K>>::FACTORY;
         let mut keys = keys_factory.default_box();
-        let mut auxes = Vec::new();
         for i in 0..n {
             if rand::random() {
-                let (_before, key, _after, aux) = (expected)(i);
+                let (_before, key, _after, _aux) = (expected)(i);
                 keys.push_ref(&key);
-                auxes.push(aux);
             }
         }
 
@@ -871,8 +868,7 @@ mod test {
         let (results, _groups) = multifetch.results();
         assert_eq!(results.len(), keys.len());
         for i in 0..keys.len() {
-            assert_eq!(results[i].fst(), &keys[i]);
-            assert_eq!(results[i].snd(), auxes[i].erase());
+            assert_eq!(&results[i], &keys[i]);
         }
         dbg!()
     }

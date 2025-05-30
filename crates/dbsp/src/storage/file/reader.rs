@@ -4199,7 +4199,7 @@ where
 
     tmp_key: Box<K>,
     tmp_key2: Box<K>,
-    output: Box<DynPairs<K, A>>,
+    output: Box<DynVec<K>>,
     row_groups: Vec<Range<u64>>,
 
     pending: usize,
@@ -4216,7 +4216,7 @@ where
     fn new(reader: &'a Reader<T>, keys: &'b DynVec<K>) -> Result<Self, Error> {
         let (sender, receiver) = channel();
         let factories = reader.columns[0].factories.factories();
-        let output = factories.pairs_factory.default_box();
+        let output = factories.keys_factory.default_box();
         let tmp_key = factories.key_factory.default_box();
         let tmp_key2 = factories.key_factory.default_box();
         let mut this = Self {
@@ -4247,10 +4247,9 @@ where
         self.pending == 0
     }
 
-    pub fn results(mut self) -> (Box<DynPairs<K, A>>, Vec<Range<u64>>) {
+    pub fn results(mut self) -> (Box<DynVec<K>>, Vec<Range<u64>>) {
         debug_assert!(self.is_done());
         self.output.sort_unstable();
-        self.row_groups.sort_unstable_by_key(|rows| rows.start);
         (self.output, self.row_groups)
     }
 
@@ -4341,11 +4340,7 @@ where
                     if let Some(child_index) = unsafe {
                         data_block.find_next(&self.factories, &mut self.tmp_key, key, &mut start)
                     } {
-                        self.output.push_with(&mut |pair| {
-                            let (k, a) = pair.split_mut();
-                            self.tmp_key.move_to(k);
-                            unsafe { data_block.aux(&self.factories, child_index, a) };
-                        });
+                        self.output.push_val(&mut self.tmp_key);
                         if data_block.row_groups.is_some() {
                             self.row_groups.push(data_block.row_group(child_index)?);
                         }
