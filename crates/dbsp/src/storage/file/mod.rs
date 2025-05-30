@@ -313,9 +313,10 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::{marker::PhantomData, sync::Arc};
+    use std::{marker::PhantomData, sync::Arc, time::Instant};
 
     use crate::{
+        dynamic::{Factory, LeanVec, Vector, WithFactory},
         storage::{
             backend::StorageBackend,
             buffer_cache::BufferCache,
@@ -325,7 +326,6 @@ mod test {
             },
             test::init_test_logger,
         },
-        Runtime,
     };
 
     use super::{
@@ -342,6 +342,13 @@ mod test {
     use feldera_types::config::{StorageConfig, StorageOptions};
     use rand::{seq::SliceRandom, thread_rng, Rng};
     use tempfile::tempdir;
+
+    fn test_buffer_cache() -> Arc<BufferCache> {
+        thread_local! {
+            static BUFFER_CACHE: Arc<BufferCache> = Arc::new(BufferCache::new(1024 * 1024));
+        }
+        BUFFER_CACHE.with(|cache| cache.clone())
+    }
 
     fn for_each_compression_type<F>(parameters: Parameters, f: F)
     where
@@ -829,7 +836,6 @@ mod test {
         while !bulk.at_eof() {
             bulk.wait().unwrap();
             let (mut key, mut aux) = expected.next().unwrap();
-            dbg!(row);
             assert_eq!(
                 unsafe { bulk.item((tmp_key, tmp_aux)) },
                 Some((key.erase_mut(), aux.erase_mut()))
@@ -838,6 +844,39 @@ mod test {
             row += 1;
         }
         assert!(expected.next().is_none());
+    }
+
+    fn test_multifetch<K, A, N, T>(
+        rows: &RowGroup<DynData, DynData, N, T>,
+        n: usize,
+        expected: impl Fn(usize) -> (K, K, K, A),
+    ) where
+        K: DBData,
+        A: DBData,
+        T: ColumnSpec,
+    {
+        let keys_factory: &dyn Factory<dyn Vector<DynData>> = WithFactory::<LeanVec<K>>::FACTORY;
+        let mut keys = keys_factory.default_box();
+        let mut auxes = Vec::new();
+        for i in 0..n {
+            if rand::random() {
+                let (_before, key, _after, aux) = (expected)(i);
+                keys.push_ref(&key);
+                auxes.push(aux);
+            }
+        }
+
+        let mut multifetch = rows.multifetch(&*keys).unwrap();
+        while !multifetch.is_done() {
+            multifetch.wait().unwrap();
+        }
+        let (results, _groups) = multifetch.results();
+        assert_eq!(results.len(), keys.len());
+        for i in 0..keys.len() {
+            assert_eq!(results[i].fst(), &keys[i]);
+            assert_eq!(results[i].snd(), auxes[i].erase());
+        }
+        dbg!()
     }
 
     fn test_bloom<K, A, N>(
@@ -891,6 +930,12 @@ mod test {
         .await;
     }
 
+    fn time(line: u32, f: impl FnOnce()) {
+        let start = Instant::now();
+        f();
+        println!("{line}: {:.1}", start.elapsed().as_secs_f64());
+    }
+
     fn test_two_columns<T>(parameters: Parameters)
     where
         T: TwoColumns,
@@ -898,7 +943,6 @@ mod test {
         let factories0 = Factories::<DynData, DynData>::new::<T::K0, T::A0>();
         let factories1 = Factories::<DynData, DynData>::new::<T::K1, T::A1>();
 
-        let cache = Arc::new(BufferCache::new(1024 * 1024));
         let tempdir = tempdir().unwrap();
         let storage_backend = <dyn StorageBackend>::new(
             &StorageConfig {
@@ -911,23 +955,25 @@ mod test {
         let mut layer_file = Writer2::new(
             &factories0,
             &factories1,
-            cache.clone(),
+            test_buffer_cache(),
             &*storage_backend,
             parameters,
             T::n0(),
         )
         .unwrap();
         let n0 = T::n0();
-        for row0 in 0..n0 {
-            for row1 in 0..T::n1(row0) {
-                layer_file
-                    .write1((&T::key1(row0, row1), &T::aux1(row0, row1)))
-                    .unwrap();
+        time(line!(), || {
+            for row0 in 0..n0 {
+                for row1 in 0..T::n1(row0) {
+                    layer_file
+                        .write1((&T::key1(row0, row1), &T::aux1(row0, row1)))
+                        .unwrap();
+                }
+                layer_file.write0((&T::key0(row0), &T::aux0(row0))).unwrap();
             }
-            layer_file.write0((&T::key0(row0), &T::aux0(row0))).unwrap();
-        }
+        });
 
-        let reader = layer_file.into_reader().unwrap();
+        let reader = layer_file.into_reader(test_buffer_cache).unwrap();
         reader.evict();
         let rows0 = reader.rows();
         let expected0 = |row0| {
@@ -936,8 +982,8 @@ mod test {
             let aux0 = T::aux0(row0);
             (before0, key0, after0, aux0)
         };
-        test_cursor(&rows0, n0, expected0);
-        test_bloom(&reader, n0, expected0);
+        time(line!(), || test_cursor(&rows0, n0, expected0));
+        time(line!(), || test_bloom(&reader, n0, expected0));
 
         let expected1 = |row0, row1| {
             let key1 = T::key1(row0, row1);
@@ -945,43 +991,51 @@ mod test {
             let aux1 = T::aux1(row0, row1);
             (before1, key1, after1, aux1)
         };
-        for row0 in 0..n0 {
-            let rows1 = rows0.nth(row0 as u64).unwrap().next_column().unwrap();
-            let n1 = T::n1(row0);
-            test_cursor(&rows1, n1, |row1| expected1(row0, row1));
-        }
-        test_bulk_rows(reader.bulk_rows().unwrap(), Column0::<T>::new());
-        test_bulk_rows(
-            reader.bulk_rows().unwrap().next_column().unwrap(),
-            Column1::<T>::new(),
-        );
-        TOKIO.block_on(async {
-            // Force some blocking due to I/O, to test those cases in
-            // [AsyncCacheContext].
-            reader.evict();
+        time(line!(), || {
+            for row0 in 0..n0 {
+                let rows1 = rows0.nth(row0 as u64).unwrap().next_column().unwrap();
+                let n1 = T::n1(row0);
+                test_cursor(&rows1, n1, |row1| expected1(row0, row1));
+            }
+        });
+        time(line!(), || {
+            test_bulk_rows(reader.bulk_rows().unwrap(), Column0::<T>::new());
+        });
+        time(line!(), || {
+            test_bulk_rows(
+                reader.bulk_rows().unwrap().next_column().unwrap(),
+                Column1::<T>::new(),
+            )
+        });
+        time(line!(), || {
+            TOKIO.block_on(async {
+                // Force some blocking due to I/O, to test those cases in
+                // [AsyncCacheContext].
+                reader.evict();
 
-            let context = reader.new_async_context();
-            context
-                .execute_tasks(
-                    reader.file_handle(),
-                    [async {
-                        let rows0 = reader.rows_async(&context);
-                        test_cursor_async(&rows0, n0, expected0).await;
+                let context = reader.new_async_context();
+                context
+                    .execute_tasks(
+                        reader.file_handle(),
+                        [async {
+                            let rows0 = reader.rows_async(&context);
+                            test_cursor_async(&rows0, n0, expected0).await;
 
-                        for row0 in 0..n0 {
-                            let rows1 = rows0
-                                .nth(row0 as u64)
-                                .await
-                                .unwrap()
-                                .next_column()
-                                .await
-                                .unwrap();
-                            let n1 = T::n1(row0);
-                            test_cursor_async(&rows1, n1, |row1| expected1(row0, row1)).await;
-                        }
-                    }],
-                )
-                .await;
+                            for row0 in 0..n0 {
+                                let rows1 = rows0
+                                    .nth(row0 as u64)
+                                    .await
+                                    .unwrap()
+                                    .next_column()
+                                    .await
+                                    .unwrap();
+                                let n1 = T::n1(row0);
+                                test_cursor_async(&rows1, n1, |row1| expected1(row0, row1)).await;
+                            }
+                        }],
+                    )
+                    .await;
+            })
         });
     }
 
@@ -1021,22 +1075,39 @@ mod test {
                 0x2222
             }
         }
-
-        for_each_compression_type(parameters, |parameters| {
-            test_two_columns::<TwoInts>(parameters)
-        });
+        test_two_columns::<TwoInts>(parameters);
     }
 
     #[test]
-    fn test_2_columns() {
+    fn two_columns_uncompressed() {
         init_test_logger();
-        test_2_columns_helper(Parameters::default());
+        test_2_columns_helper(Parameters::default().with_compression(None));
     }
 
     #[test]
-    fn test_2_columns_max_branch_2() {
+    fn two_columns_snappy() {
         init_test_logger();
-        test_2_columns_helper(Parameters::default().with_max_branch(2));
+        test_2_columns_helper(Parameters::default().with_compression(Some(Compression::Snappy)));
+    }
+
+    #[test]
+    fn two_columns_max_branch_2_uncompressed() {
+        init_test_logger();
+        test_2_columns_helper(
+            Parameters::default()
+                .with_max_branch(2)
+                .with_compression(None),
+        );
+    }
+
+    #[test]
+    fn two_columns_max_branch_2_snappy() {
+        init_test_logger();
+        test_2_columns_helper(
+            Parameters::default()
+                .with_max_branch(2)
+                .with_compression(Some(Compression::Snappy)),
+        );
     }
 
     struct OneColumn<'a, T> {
@@ -1081,70 +1152,68 @@ mod test {
         K: DBData,
         A: DBData,
     {
-        for_each_compression_type(parameters, |parameters| {
-            for reopen in [false, true] {
-                let factories = Factories::<DynData, DynData>::new::<K, A>();
-                let cache = Arc::new(BufferCache::new(1024 * 1024));
-                let tempdir = tempdir().unwrap();
-                let storage_backend = <dyn StorageBackend>::new(
-                    &StorageConfig {
-                        path: tempdir.path().to_string_lossy().to_string(),
-                        cache: Default::default(),
-                    },
-                    &StorageOptions::default(),
-                )
-                .unwrap();
-                let mut writer = Writer1::new(
-                    &factories,
-                    cache.clone(),
-                    &*storage_backend,
-                    parameters.clone(),
-                    n,
-                )
-                .unwrap();
-                for row in 0..n {
-                    let (_before, key, _after, aux) = expected(row);
-                    writer.write0((&key, &aux)).unwrap();
-                }
-
-                let reader = if reopen {
-                    println!("closing writer and reopening as reader");
-                    let (_file_handle, path, _bloom_filter) = writer.close().unwrap();
-                    Reader::open(
-                        &[&factories.any_factories()],
-                        Runtime::buffer_cache,
-                        &*storage_backend,
-                        &path,
-                    )
-                    .unwrap()
-                } else {
-                    println!("transforming writer into reader");
-                    writer.into_reader().unwrap()
-                };
-                reader.evict();
-                assert_eq!(reader.rows().len(), n as u64);
-                test_cursor(&reader.rows(), n, &expected);
-                test_bloom(&reader, n, &expected);
-                test_bulk_rows(reader.bulk_rows().unwrap(), OneColumn::new(&expected, n));
-
-                TOKIO.block_on(async {
-                    // Force some blocking due to I/O, to test those cases in
-                    // [AsyncCacheContext].
-                    reader.evict();
-
-                    let context = reader.new_async_context();
-                    context
-                        .execute_tasks(
-                            reader.file_handle(),
-                            [async {
-                                let row_group = reader.rows_async(&context);
-                                test_cursor_async(&row_group, n, &expected).await;
-                            }],
-                        )
-                        .await;
-                });
+        for reopen in [false, true] {
+            let factories = Factories::<DynData, DynData>::new::<K, A>();
+            let tempdir = tempdir().unwrap();
+            let storage_backend = <dyn StorageBackend>::new(
+                &StorageConfig {
+                    path: tempdir.path().to_string_lossy().to_string(),
+                    cache: Default::default(),
+                },
+                &StorageOptions::default(),
+            )
+            .unwrap();
+            let mut writer = Writer1::new(
+                &factories,
+                test_buffer_cache(),
+                &*storage_backend,
+                parameters.clone(),
+                n,
+            )
+            .unwrap();
+            for row in 0..n {
+                let (_before, key, _after, aux) = expected(row);
+                writer.write0((&key, &aux)).unwrap();
             }
-        });
+
+            let reader = if reopen {
+                println!("closing writer and reopening as reader");
+                let (_file_handle, path, _bloom_filter) = writer.close().unwrap();
+                Reader::open(
+                    &[&factories.any_factories()],
+                    test_buffer_cache,
+                    &*storage_backend,
+                    &path,
+                )
+                .unwrap()
+            } else {
+                println!("transforming writer into reader");
+                writer.into_reader(test_buffer_cache).unwrap()
+            };
+            reader.evict();
+            assert_eq!(reader.rows().len(), n as u64);
+            test_cursor(&reader.rows(), n, &expected);
+            test_bloom(&reader, n, &expected);
+            test_bulk_rows(reader.bulk_rows().unwrap(), OneColumn::new(&expected, n));
+            test_multifetch(&reader.rows(), n, &expected);
+
+            TOKIO.block_on(async {
+                // Force some blocking due to I/O, to test those cases in
+                // [AsyncCacheContext].
+                reader.evict();
+
+                let context = reader.new_async_context();
+                context
+                    .execute_tasks(
+                        reader.file_handle(),
+                        [async {
+                            let row_group = reader.rows_async(&context);
+                            test_cursor_async(&row_group, n, &expected).await;
+                        }],
+                    )
+                    .await;
+            });
+        }
     }
 
     fn test_i64_helper(parameters: Parameters) {
@@ -1158,22 +1227,48 @@ mod test {
 
     #[test]
     fn test_i64() {
-        test_i64_helper(Parameters::default());
+        for_each_compression_type(Parameters::default(), test_i64_helper);
     }
 
     #[test]
     fn test_i64_max_branch_32() {
-        test_i64_helper(Parameters::default().with_max_branch(32));
+        for_each_compression_type(Parameters::default().with_max_branch(32), test_i64_helper);
     }
 
     #[test]
-    fn test_i64_max_branch_3() {
-        test_i64_helper(Parameters::default().with_max_branch(3));
+    fn test_i64_max_branch_3_uncompressed() {
+        test_i64_helper(
+            Parameters::default()
+                .with_max_branch(3)
+                .with_compression(None),
+        );
     }
 
     #[test]
-    fn test_i64_max_branch_2() {
-        test_i64_helper(Parameters::default().with_max_branch(2));
+    fn test_i64_max_branch_3_snappy() {
+        test_i64_helper(
+            Parameters::default()
+                .with_max_branch(3)
+                .with_compression(Some(Compression::Snappy)),
+        );
+    }
+
+    #[test]
+    fn test_i64_max_branch_2_uncompressed() {
+        test_i64_helper(
+            Parameters::default()
+                .with_max_branch(2)
+                .with_compression(None),
+        );
+    }
+
+    #[test]
+    fn test_i64_max_branch_2_snappy() {
+        test_i64_helper(
+            Parameters::default()
+                .with_max_branch(2)
+                .with_compression(Some(Compression::Snappy)),
+        );
     }
 
     #[test]
@@ -1183,28 +1278,32 @@ mod test {
         }
 
         init_test_logger();
-        test_one_column(
-            1000,
-            |row| (f(row * 2), f(row * 2 + 1), f(row * 2 + 2), ()),
-            Parameters::default(),
-        );
+        for_each_compression_type(Parameters::default(), |parameters| {
+            test_one_column(
+                1000,
+                |row| (f(row * 2), f(row * 2 + 1), f(row * 2 + 2), ()),
+                Parameters::default(),
+            )
+        });
     }
 
     #[test]
     fn test_tuple() {
         init_test_logger();
-        test_one_column(
-            1000,
-            |row| {
-                (
-                    (row as u64, 0),
-                    (row as u64, 1),
-                    (row as u64, 2),
-                    row as u64,
-                )
-            },
-            Parameters::default(),
-        );
+        for_each_compression_type(Parameters::default(), |parameters| {
+            test_one_column(
+                1000,
+                |row| {
+                    (
+                        (row as u64, 0),
+                        (row as u64, 1),
+                        (row as u64, 2),
+                        row as u64,
+                    )
+                },
+                parameters,
+            )
+        });
     }
 
     #[test]
@@ -1213,10 +1312,12 @@ mod test {
             (0..row as i64).collect()
         }
         init_test_logger();
-        test_one_column(
-            500,
-            |row| (v(row * 2), v(row * 2 + 1), v(row * 2 + 2), ()),
-            Parameters::default(),
-        );
+        for_each_compression_type(Parameters::default(), |parameters| {
+            test_one_column(
+                500,
+                |row| (v(row * 2), v(row * 2 + 1), v(row * 2 + 2), ()),
+                parameters,
+            )
+        });
     }
 }

@@ -618,7 +618,7 @@ where
     fn done(self) -> FileKeyBatch<K, T, R> {
         FileKeyBatch {
             factories: self.factories,
-            file: Arc::new(self.writer.into_reader().unwrap()),
+            file: Arc::new(self.writer.into_reader(Runtime::buffer_cache).unwrap()),
         }
     }
 }

@@ -5,7 +5,7 @@
 use super::format::{Compression, FileTrailer};
 use super::{AnyFactories, Factories};
 use crate::circuit::runtime::ThreadType;
-use crate::dynamic::DynPairs;
+use crate::dynamic::{DynPairs, DynVec};
 use crate::storage::buffer_cache::AsyncCacheContext;
 use crate::storage::buffer_cache::{CacheAccess, CacheEntry};
 use crate::storage::file::format::FilterBlock;
@@ -26,7 +26,7 @@ use crate::{
 };
 use binrw::{
     io::{self},
-    BinRead, Error as BinError,
+    BinRead,
 };
 use crc32c::crc32c;
 use fastbloom::BloomFilter;
@@ -77,12 +77,6 @@ pub enum Error {
     Unsupported,
 }
 
-impl From<BinError> for Error {
-    fn from(source: BinError) -> Self {
-        Error::Corruption(source.into())
-    }
-}
-
 impl From<io::Error> for Error {
     fn from(source: io::Error) -> Self {
         Error::Storage(StorageError::StdIo(source.kind()))
@@ -124,11 +118,17 @@ pub enum CorruptionError {
     },
 
     /// [`mod@binrw`] reported a format violation.
-    #[error("Binary read/write error: {0}")]
-    Binrw(
+    #[error("Binary read/write error reading {block_type} block ({location}): {inner}")]
+    Binrw {
+        /// Block location.
+        location: BlockLocation,
+
+        /// Block type.
+        block_type: &'static str,
+
         /// Underlying error.
-        String,
-    ),
+        inner: String,
+    },
 
     /// Array overflows block bounds.
     #[error("{count}-element array of {each}-byte elements starting at offset {offset} within block overflows {block_size}-byte block")]
@@ -305,12 +305,6 @@ pub enum CorruptionError {
     /// Invalid filter block location.
     #[error("Invalid file block location ({0}).")]
     InvalidFilterLocation(InvalidBlockLocation),
-}
-
-impl From<BinError> for CorruptionError {
-    fn from(value: BinError) -> Self {
-        CorruptionError::Binrw(value.to_string())
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -526,7 +520,14 @@ where
         location: BlockLocation,
         first_row: u64,
     ) -> Result<Self, Error> {
-        let header = DataBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice()))?;
+        let header =
+            DataBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "data",
+                    inner: e.to_string(),
+                })
+            })?;
         Ok(Self {
             location,
             value_map: ValueMapReader::new(
@@ -1043,7 +1044,14 @@ where
         location: BlockLocation,
         first_row: u64,
     ) -> Result<Self, Error> {
-        let header = IndexBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice()))?;
+        let header =
+            IndexBlockHeader::read_le(&mut io::Cursor::new(raw.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "index",
+                    inner: e.to_string(),
+                })
+            })?;
         if header.n_children == 0 {
             return Err(CorruptionError::EmptyIndex(location).into());
         }
@@ -1417,22 +1425,23 @@ where
         &self,
         tmp_lower: &mut K,
         tmp_upper: &mut K,
-        targets: &[Box<K>],
+        targets: &DynVec<K>,
+        mut target_indexes: Range<usize>,
         start: &mut usize,
     ) -> Option<(usize, usize)> {
+        let start_index = target_indexes.next().unwrap();
         let mut end = self.n_children();
         while *start < end {
             let mid = start.midpoint(end);
             self.get_bound(mid * 2, tmp_lower);
-            if &*targets[0] < tmp_lower {
+            if &targets[start_index] < tmp_lower {
                 end = mid;
             } else {
                 *start = mid + 1;
                 self.get_bound(mid * 2 + 1, tmp_upper);
-                if &*targets[0] <= tmp_upper {
-                    let n = 1 + targets[1..]
-                        .iter()
-                        .take_while(|target| &***target <= tmp_upper)
+                if &targets[start_index] <= tmp_upper {
+                    let n = 1 + target_indexes
+                        .take_while(|i| &targets[*i] <= tmp_upper)
                         .count();
                     return Some((mid, n));
                 }
@@ -1491,8 +1500,16 @@ impl CacheEntry for FileTrailer {
 }
 
 impl FileTrailer {
-    fn from_raw(raw: Arc<FBuf>) -> Result<Self, Error> {
-        Ok(Self::read_le(&mut io::Cursor::new(raw.as_slice()))?)
+    fn from_raw(raw: Arc<FBuf>, location: BlockLocation) -> Result<Self, Error> {
+        Ok(
+            Self::read_le(&mut io::Cursor::new(raw.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "trailer",
+                    inner: e.to_string(),
+                })
+            })?,
+        )
     }
     fn new(
         cache: fn() -> Arc<BufferCache>,
@@ -1512,7 +1529,7 @@ impl FileTrailer {
             }
             None => {
                 let block = file_handle.read_block(location)?;
-                let entry = Arc::new(Self::from_raw(block)?);
+                let entry = Arc::new(Self::from_raw(block, location)?);
                 cache.insert(file_handle.file_id(), location.offset, entry.clone(), false);
                 (CacheAccess::Miss, entry)
             }
@@ -1532,7 +1549,15 @@ struct Column {
 impl FilterBlock {
     fn new(file_handle: &dyn FileReader, location: BlockLocation) -> Result<Self, Error> {
         let block = file_handle.read_block(location)?;
-        Ok(Self::read_le(&mut io::Cursor::new(block.as_slice()))?)
+        Ok(
+            Self::read_le(&mut io::Cursor::new(block.as_slice())).map_err(|e| {
+                Error::Corruption(CorruptionError::Binrw {
+                    location,
+                    block_type: "filter",
+                    inner: e.to_string(),
+                })
+            })?,
+        )
     }
 }
 
@@ -2102,7 +2127,10 @@ where
         }
     }
 
-    fn multifetch<'b>(&self, keys: &'b [Box<K>]) -> Result<Multifetch<'a, 'b, K, A, N, T>, Error>
+    pub fn multifetch<'b>(
+        &self,
+        keys: &'b DynVec<K>,
+    ) -> Result<Multifetch<'a, 'b, K, A, N, T>, Error>
     where
         T: ColumnSpec,
     {
@@ -4165,7 +4193,7 @@ where
     A: DataTrait + ?Sized,
 {
     reader: &'a Reader<T>,
-    keys: &'b [Box<K>],
+    keys: &'b DynVec<K>,
     cache: Arc<BufferCache>,
     factories: Factories<K, A>,
     column: usize,
@@ -4189,7 +4217,7 @@ where
     A: DataTrait + ?Sized,
     T: ColumnSpec,
 {
-    fn new(reader: &'a Reader<T>, keys: &'b [Box<K>], column: usize) -> Result<Self, Error> {
+    fn new(reader: &'a Reader<T>, keys: &'b DynVec<K>, column: usize) -> Result<Self, Error> {
         let (sender, receiver) = channel();
         let factories = reader.columns[column].factories.factories();
         let output = factories.pairs_factory.default_box();
@@ -4224,26 +4252,50 @@ where
         self.pending == 0
     }
 
-    pub fn results(self) -> (Box<DynPairs<K, A>>, Vec<Range<u64>>) {
+    pub fn results(mut self) -> (Box<DynPairs<K, A>>, Vec<Range<u64>>) {
+        debug_assert!(self.is_done());
+        self.output.sort();
         (self.output, self.row_groups)
     }
 
+    pub fn wait(&mut self) -> Result<(), Error> {
+        if !self.is_done() {
+            let mut reads = Vec::new();
+            self.process_results(self.receiver.recv().unwrap(), &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(())
+    }
+
     pub fn run(&mut self) -> Result<(), Error> {
-        let mut reads = Vec::new();
+        self.run_(Vec::new())
+    }
+
+    fn run_(&mut self, mut reads: Vec<MultifetchRead>) -> Result<(), Error> {
         while let Ok(results) = self.receiver.try_recv() {
-            self.pending -= 1;
-            for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
-                let raw = result?;
-                let tree_block = TreeBlock::from_raw_with_cache(
-                    raw,
-                    &read.node,
-                    &self.cache,
-                    self.reader.file_handle().file_id(),
-                )?;
-                self.process_read(&read.keys, tree_block, &mut reads)?;
-            }
+            self.process_results(results, &mut reads)?;
         }
         self.start_reads(reads);
+        Ok(())
+    }
+
+    fn process_results(
+        &mut self,
+        results: MultifetchReadResults,
+        reads: &mut Vec<MultifetchRead>,
+    ) -> Result<(), Error> {
+        self.pending -= 1;
+        for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
+            let raw = result?;
+            let tree_block = TreeBlock::from_raw_with_cache(
+                decompress(self.reader.file.compression, read.node.location, raw)?,
+                &read.node,
+                &self.cache,
+                self.reader.file_handle().file_id(),
+            )
+            .unwrap();
+            self.process_read(&read.keys, tree_block, reads)?;
+        }
         Ok(())
     }
 
@@ -4267,10 +4319,13 @@ where
         read: MultifetchRead,
         reads: &mut Vec<MultifetchRead>,
     ) -> Result<(), Error> {
+        dbg!(&read);
         if let Some(tree_block) =
-            TreeBlock::from_cache(&read.node, &self.cache, &*self.reader.file.file_handle)?
+            TreeBlock::from_cache(&read.node, &self.cache, &*self.reader.file.file_handle).unwrap()
         {
             self.process_read(&read.keys, tree_block, reads)?;
+        } else {
+            reads.push(read);
         }
         Ok(())
     }
@@ -4281,13 +4336,14 @@ where
         tree_block: TreeBlock<K, A>,
         reads: &mut Vec<MultifetchRead>,
     ) -> Result<(), Error> {
-        let keys = &self.keys[key_range.clone()];
         match tree_block {
             TreeBlock::Data(data_block) => {
+                dbg!();
                 let mut start = 0;
-                for key in keys {
+                for i in key_range.clone() {
+                    let key = &self.keys[i];
                     if let Some(child_index) = unsafe {
-                        data_block.find_next(&self.factories, &mut self.tmp_key, &key, &mut start)
+                        data_block.find_next(&self.factories, &mut self.tmp_key, key, &mut start)
                     } {
                         self.output.push_with(&mut |pair| {
                             let (k, a) = pair.split_mut();
@@ -4304,26 +4360,27 @@ where
                 }
             }
             TreeBlock::Index(index_block) => {
-                let mut start = 0;
-                let mut i = 0;
-                while i < keys.len() {
+                dbg!();
+                let mut child_idx = 0;
+                let mut i = key_range.start;
+                while i < key_range.end {
                     if let Some((child_index, n_keys)) = unsafe {
                         index_block.find_next(
                             &mut self.tmp_key,
                             &mut self.tmp_key2,
-                            &keys[i..],
-                            &mut start,
+                            self.keys,
+                            i..key_range.end,
+                            &mut child_idx,
                         )
                     } {
-                        reads.push(MultifetchRead::new(
-                            i..i + n_keys,
-                            index_block.get_child(child_index)?,
-                        ));
+                        let read =
+                            MultifetchRead::new(i..i + n_keys, index_block.get_child(child_index)?);
+                        self.try_read(read, reads)?;
                         i += n_keys;
                     } else {
                         i += 1;
                     }
-                    if start >= index_block.n_children() {
+                    if child_idx >= index_block.n_children() {
                         break;
                     }
                 }
@@ -4333,6 +4390,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct MultifetchRead {
     keys: Range<usize>,
     node: TreeNode,

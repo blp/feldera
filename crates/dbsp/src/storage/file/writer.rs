@@ -296,6 +296,7 @@ impl ColumnWriter {
         let rows = data_block.rows();
         let (block, location) =
             block_writer.write_block(data_block.raw, self.parameters.compression)?;
+        dbg!(("data", &location));
 
         let tree_node = TreeNode {
             location,
@@ -333,6 +334,7 @@ impl ColumnWriter {
             let n_rows = index_block.n_rows();
             let (block, location) =
                 block_writer.write_block(index_block.raw, self.parameters.compression)?;
+            dbg!(("index", &location));
             block_writer.insert_cache_entry(
                 location,
                 Arc::new(
@@ -1326,6 +1328,7 @@ where
     /// Finishes writing the layer file and returns a reader for it.
     pub fn into_reader(
         self,
+        cache: fn() -> Arc<BufferCache>,
     ) -> Result<Reader<(&'static K0, &'static A0, ())>, super::reader::Error> {
         let any_factories = self.factories.any_factories();
 
@@ -1334,7 +1337,7 @@ where
         Reader::new(
             &[&any_factories],
             path,
-            Runtime::buffer_cache,
+            cache,
             file_handle,
             Some(bloom_filter),
         )
@@ -1506,6 +1509,7 @@ where
     #[allow(clippy::type_complexity)]
     pub fn into_reader(
         self,
+        cache: fn() -> Arc<BufferCache>,
     ) -> Result<
         Reader<(&'static K0, &'static A0, (&'static K1, &'static A1, ()))>,
         super::reader::Error,
@@ -1516,7 +1520,7 @@ where
         Reader::new(
             &[&any_factories0, &any_factories1],
             path,
-            Runtime::buffer_cache,
+            cache,
             file_handle,
             Some(bloom_filter),
         )

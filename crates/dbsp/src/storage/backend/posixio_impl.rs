@@ -78,7 +78,7 @@ impl HasFileId for PosixReader {
 }
 
 fn busy_wait(duration: Duration) {
-    let start = Instant::now();
+        let start = Instant::now();
     while start.elapsed() < duration {}
 }
 

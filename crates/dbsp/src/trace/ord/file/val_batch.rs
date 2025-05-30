@@ -666,7 +666,7 @@ where
     fn done(self) -> FileValBatch<K, V, T, R> {
         FileValBatch {
             factories: self.factories,
-            file: Arc::new(self.writer.into_reader().unwrap()),
+            file: Arc::new(self.writer.into_reader(Runtime::buffer_cache).unwrap()),
         }
     }
 

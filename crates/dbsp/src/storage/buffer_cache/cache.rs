@@ -535,7 +535,6 @@ impl AsyncCacheContext {
             .map(|task| task.send_replies.len())
             .sum::<usize>();
         self.n_requests.send_modify(|n| *n -= n_requests);
-        println!("{n_requests} request for {} unique blocks", requests.len());
         let blocks = requests.keys().cloned().collect::<Vec<_>>();
         let (sender, receiver) = oneshot::channel();
         file.read_async(
@@ -618,9 +617,6 @@ impl AsyncCacheContext {
                 }
             }
         }
-        if n > 0 {
-            println!("{n} in {x} rounds");
-        }
         outputs.into_iter().map(|output| output.unwrap()).collect()
     }
 
@@ -688,9 +684,6 @@ where
                     x += 1;
                 }
             }
-        }
-        if n > 0 {
-            println!("{n} in {x} rounds");
         }
         self.outputs
             .into_iter()

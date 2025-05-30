@@ -266,7 +266,7 @@ where
         }
         Self {
             factories: self.factories.clone(),
-            file: Arc::new(writer.into_reader().unwrap()),
+            file: Arc::new(writer.into_reader(Runtime::buffer_cache).unwrap()),
         }
     }
 }
@@ -870,7 +870,7 @@ where
     fn done(self) -> FileIndexedWSet<K, V, R> {
         FileIndexedWSet {
             factories: self.factories,
-            file: Arc::new(self.writer.into_reader().unwrap()),
+            file: Arc::new(self.writer.into_reader(Runtime::buffer_cache).unwrap()),
         }
     }
 

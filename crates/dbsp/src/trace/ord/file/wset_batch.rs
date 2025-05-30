@@ -249,7 +249,7 @@ where
         }
         Self {
             factories: self.factories.clone(),
-            file: Arc::new(writer.into_reader().unwrap()),
+            file: Arc::new(writer.into_reader(Runtime::buffer_cache).unwrap()),
         }
     }
 }
@@ -794,7 +794,7 @@ where
     fn done(self) -> FileWSet<K, R> {
         FileWSet {
             factories: self.factories,
-            file: Arc::new(self.writer.into_reader().unwrap()),
+            file: Arc::new(self.writer.into_reader(Runtime::buffer_cache).unwrap()),
         }
     }
 
