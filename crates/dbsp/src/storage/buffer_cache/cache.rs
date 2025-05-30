@@ -595,8 +595,6 @@ impl AsyncCacheContext {
             }
         }
 
-        let n = futures.len();
-        let mut x = 0;
         while !futures.is_empty() {
             let wait = self.wait(futures.len());
             pin_mut!(wait);
@@ -613,7 +611,6 @@ impl AsyncCacheContext {
                     // All of the futures we launched have blocked on I/O. Launch a batch
                     // of I/O and wait for it to complete.
                     self.run_io_batch(file).await;
-                    x += 1;
                 }
             }
         }
@@ -663,8 +660,6 @@ where
             .map(|(index, future)| async move { (index, future.await) })
             .collect::<FuturesUnordered<_>>();
 
-        let n = futures.len();
-        let mut x = 0;
         while !futures.is_empty() {
             let wait = self.context.wait(futures.len());
             pin_mut!(wait);
@@ -681,7 +676,6 @@ where
                     // All of the futures we launched have blocked on I/O. Launch a batch
                     // of I/O and wait for it to complete.
                     self.context.run_io_batch(file).await;
-                    x += 1;
                 }
             }
         }

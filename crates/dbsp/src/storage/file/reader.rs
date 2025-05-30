@@ -1935,6 +1935,13 @@ where
         BulkRows::new(self, 0)
     }
 
+    pub fn multifetch<'a, 'b>(
+        &'a self,
+        keys: &'b DynVec<K>,
+    ) -> Result<Multifetch<'a, 'b, K, A, N, (&'static K, &'static A, N)>, Error> {
+        Multifetch::new(self, keys)
+    }
+
     /// Returns an [AsyncRowGroup] for all of the rows in column 0.
     ///
     /// Use [Reader::new_async_context] to create `context`.
@@ -2125,16 +2132,6 @@ where
             factories: self.factories.clone(),
             ..*self
         }
-    }
-
-    pub fn multifetch<'b>(
-        &self,
-        keys: &'b DynVec<K>,
-    ) -> Result<Multifetch<'a, 'b, K, A, N, T>, Error>
-    where
-        T: ColumnSpec,
-    {
-        Multifetch::new(self.reader, keys, self.column)
     }
 }
 
@@ -4196,7 +4193,6 @@ where
     keys: &'b DynVec<K>,
     cache: Arc<BufferCache>,
     factories: Factories<K, A>,
-    column: usize,
 
     receiver: Receiver<MultifetchReadResults>,
     sender: Sender<MultifetchReadResults>,
@@ -4217,9 +4213,9 @@ where
     A: DataTrait + ?Sized,
     T: ColumnSpec,
 {
-    fn new(reader: &'a Reader<T>, keys: &'b DynVec<K>, column: usize) -> Result<Self, Error> {
+    fn new(reader: &'a Reader<T>, keys: &'b DynVec<K>) -> Result<Self, Error> {
         let (sender, receiver) = channel();
-        let factories = reader.columns[column].factories.factories();
+        let factories = reader.columns[0].factories.factories();
         let output = factories.pairs_factory.default_box();
         let tmp_key = factories.key_factory.default_box();
         let tmp_key2 = factories.key_factory.default_box();
@@ -4228,7 +4224,6 @@ where
             keys,
             cache: (reader.file.cache)(),
             factories,
-            column,
             sender,
             receiver,
             tmp_key,
@@ -4239,7 +4234,7 @@ where
             _phantom: PhantomData,
         };
         if !keys.is_empty() {
-            if let Some(node) = &reader.columns[column].root {
+            if let Some(node) = &reader.columns[0].root {
                 let mut reads = Vec::new();
                 this.try_read(MultifetchRead::new(0..keys.len(), node.clone()), &mut reads)?;
                 this.start_reads(reads);
@@ -4254,7 +4249,8 @@ where
 
     pub fn results(mut self) -> (Box<DynPairs<K, A>>, Vec<Range<u64>>) {
         debug_assert!(self.is_done());
-        self.output.sort();
+        self.output.sort_unstable();
+        self.row_groups.sort_unstable_by_key(|rows| rows.start);
         (self.output, self.row_groups)
     }
 
@@ -4406,3 +4402,59 @@ struct MultifetchReadResults {
     reads: Vec<MultifetchRead>,
     results: Vec<Result<Arc<FBuf>, StorageError>>,
 }
+/*
+impl<'a, 'b, K, A, NK, NA, NN, T> Multifetch<'a, 'b, K, A, (&'static NK, &'static NA, NN), T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+    NK: DataTrait + ?Sized,
+    NA: DataTrait + ?Sized,
+    T: ColumnSpec,
+{
+    pub fn next_column(self) -> Result<BulkRows<'a, NK, NA, NN, T>, Error> {
+        let (results, row_groups) = self.results();
+
+        // Combine contiguous row groups.
+        //
+        // This could be done in-place with a little extra work.
+        let row_groups = row_groups
+            .into_iter()
+            .coalesce(|x, y| {
+                if x.end == y.start {
+                    Ok(x.start..y.end)
+                } else {
+                    Err((x, y))
+                }
+            })
+            .collect::<Vec<_>>();
+    }
+}
+
+pub struct MultifetchIndexedZSet<'a, 'b, K0, A0, K1, A1, T>
+where
+    K0: DataTrait + ?Sized,
+    A0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: DataTrait + ?Sized,
+{
+    reader: &'a Reader<T>,
+    col0: Box<DynPairs<K0, A0>>,
+    rows: Vec<Range<u64>>,
+    cache: Arc<BufferCache>,
+    factories: Factories<K0, A0>,
+
+    receiver: Receiver<MultifetchReadResults>,
+    sender: Sender<MultifetchReadResults>,
+
+    output: Box<DynPairs<K, A>>,
+    row_groups: Vec<Range<u64>>,
+
+    pending: usize,
+
+    _phantom: PhantomData<fn(&K, &A, N)>,
+}
+
+impl MultifetchValues {
+    //fn new(
+}
+*/

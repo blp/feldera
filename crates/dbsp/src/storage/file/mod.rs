@@ -832,7 +832,6 @@ mod test {
         let (tmp_key, tmp_aux): (&mut DynData, &mut DynData) =
             (tmp_key.erase_mut(), tmp_aux.erase_mut());
 
-        let mut row = 0;
         while !bulk.at_eof() {
             bulk.wait().unwrap();
             let (mut key, mut aux) = expected.next().unwrap();
@@ -841,19 +840,18 @@ mod test {
                 Some((key.erase_mut(), aux.erase_mut()))
             );
             bulk.step();
-            row += 1;
         }
         assert!(expected.next().is_none());
     }
 
-    fn test_multifetch<K, A, N, T>(
-        rows: &RowGroup<DynData, DynData, N, T>,
+    fn test_multifetch<K, A, N>(
+        reader: &Reader<(&'static DynData, &'static DynData, N)>,
         n: usize,
         expected: impl Fn(usize) -> (K, K, K, A),
     ) where
         K: DBData,
         A: DBData,
-        T: ColumnSpec,
+        N: ColumnSpec,
     {
         let keys_factory: &dyn Factory<dyn Vector<DynData>> = WithFactory::<LeanVec<K>>::FACTORY;
         let mut keys = keys_factory.default_box();
@@ -866,7 +864,7 @@ mod test {
             }
         }
 
-        let mut multifetch = rows.multifetch(&*keys).unwrap();
+        let mut multifetch = reader.multifetch(&*keys).unwrap();
         while !multifetch.is_done() {
             multifetch.wait().unwrap();
         }
@@ -1195,7 +1193,7 @@ mod test {
             test_cursor(&reader.rows(), n, &expected);
             test_bloom(&reader, n, &expected);
             test_bulk_rows(reader.bulk_rows().unwrap(), OneColumn::new(&expected, n));
-            test_multifetch(&reader.rows(), n, &expected);
+            test_multifetch(&reader, n, &expected);
 
             TOKIO.block_on(async {
                 // Force some blocking due to I/O, to test those cases in
@@ -1282,7 +1280,7 @@ mod test {
             test_one_column(
                 1000,
                 |row| (f(row * 2), f(row * 2 + 1), f(row * 2 + 2), ()),
-                Parameters::default(),
+                parameters,
             )
         });
     }
