@@ -68,8 +68,11 @@
 // Warn about missing docs, but not for item declared with `#[cfg(test)]`.
 #![cfg_attr(not(test), warn(missing_docs))]
 
-use crate::dynamic::ArchivedDBData;
-use crate::storage::buffer_cache::{FBuf, FBufSerializer};
+use crate::{
+    dynamic::{ArchivedDBData, DynPairs, LeanVec},
+    storage::buffer_cache::{FBuf, FBufSerializer},
+    utils::Tup2,
+};
 use rkyv::de::deserializers::SharedDeserializeMap;
 use rkyv::{
     ser::{
@@ -110,6 +113,8 @@ where
 
     /// Factory for creating instances of `Item<K, A>`.
     pub item_factory: &'static dyn ItemFactory<K, A>,
+
+    pub pairs_factory: &'static dyn Factory<DynPairs<K, A>>,
 }
 
 impl<K, A> Clone for Factories<K, A>
@@ -121,6 +126,7 @@ where
         Self {
             key_factory: self.key_factory,
             item_factory: self.item_factory,
+            pairs_factory: self.pairs_factory,
         }
     }
 }
@@ -140,6 +146,7 @@ where
         Self {
             key_factory: WithFactory::<KType>::FACTORY,
             item_factory: <RefTup2Factory<KType, AType> as WithItemFactory<K, A>>::ITEM_FACTORY,
+            pairs_factory: WithFactory::<LeanVec<Tup2<KType, AType>>>::FACTORY,
         }
     }
 
@@ -152,6 +159,7 @@ where
         AnyFactories {
             key_factory: Arc::new(self.key_factory),
             item_factory: Arc::new(self.item_factory),
+            pairs_factory: Arc::new(self.pairs_factory),
         }
     }
 }
@@ -168,6 +176,7 @@ where
 pub struct AnyFactories {
     key_factory: Arc<(dyn Any + Send + Sync + 'static)>,
     item_factory: Arc<(dyn Any + Send + Sync + 'static)>,
+    pairs_factory: Arc<(dyn Any + Send + Sync + 'static)>,
 }
 
 impl Debug for AnyFactories {
@@ -200,6 +209,18 @@ impl AnyFactories {
             .unwrap()
     }
 
+    fn pairs_factory<K, A>(&self) -> &'static dyn Factory<DynPairs<K, A>>
+    where
+        K: DataTrait + ?Sized,
+        A: DataTrait + ?Sized,
+    {
+        *self
+            .pairs_factory
+            .as_ref()
+            .downcast_ref::<&'static dyn Factory<DynPairs<K, A>>>()
+            .unwrap()
+    }
+
     fn factories<K, A>(&self) -> Factories<K, A>
     where
         K: DataTrait + ?Sized,
@@ -208,6 +229,7 @@ impl AnyFactories {
         Factories {
             key_factory: self.key_factory(),
             item_factory: self.item_factory(),
+            pairs_factory: self.pairs_factory(),
         }
     }
 }

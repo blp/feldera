@@ -5,6 +5,7 @@
 use super::format::{Compression, FileTrailer};
 use super::{AnyFactories, Factories};
 use crate::circuit::runtime::ThreadType;
+use crate::dynamic::DynPairs;
 use crate::storage::buffer_cache::AsyncCacheContext;
 use crate::storage::buffer_cache::{CacheAccess, CacheEntry};
 use crate::storage::file::format::FilterBlock;
@@ -610,8 +611,7 @@ where
     fn rows(&self) -> Range<u64> {
         self.first_row..(self.first_row + self.n_values() as u64)
     }
-    fn row_group(&self, row: u64) -> Result<Range<u64>, Error> {
-        let index = (row - self.first_row) as usize;
+    fn row_group(&self, index: usize) -> Result<Range<u64>, Error> {
         let row_groups = self.row_groups.as_ref().unwrap();
         let start = row_groups.get(&self.raw, index);
         let end = row_groups.get(&self.raw, index + 1);
@@ -626,6 +626,10 @@ where
             }
             .into())
         }
+    }
+    fn row_group_for_row(&self, row: u64) -> Result<Range<u64>, Error> {
+        let index = (row - self.first_row) as usize;
+        self.row_group(index)
     }
     unsafe fn archived_item(
         &self,
@@ -691,7 +695,7 @@ where
             let mut start = (max(block_rows.start, target_rows.start) - self.first_row) as usize;
             let mut end = (min(block_rows.end, target_rows.end) - self.first_row) as usize;
             while start < end {
-                let mid = (start + end) / 2;
+                let mid = start.midpoint(end);
                 self.key(factories, mid, key);
                 let cmp = compare(key);
 
@@ -721,6 +725,26 @@ where
         C: Fn(&K) -> Ordering,
     {
         self.find_best_match(factories, target_rows, compare, Equal)
+    }
+
+    unsafe fn find_next(
+        &self,
+        factories: &Factories<K, A>,
+        tmp: &mut K,
+        target: &K,
+        start: &mut usize,
+    ) -> Option<usize> {
+        let mut end = self.n_values();
+        while *start < end {
+            let mid = start.midpoint(end);
+            self.key(factories, mid, tmp);
+            match target.cmp(tmp) {
+                Less => end = mid,
+                Equal => return Some(mid),
+                Greater => *start = mid + 1,
+            };
+        }
+        None
     }
 
     /// Returns the comparison of the key in `row` using `compare`.
@@ -808,30 +832,15 @@ impl TreeNode {
                 );
                 for (result, node) in receiver.recv().unwrap().into_iter().zip(nodes.iter()) {
                     let raw = decompress(file.compression, node.location, result?)?;
-                    match node.node_type {
-                        NodeType::Data => {
-                            let entry = DataBlock::from_raw_with_cache(
-                                raw,
-                                node,
-                                &cache,
-                                file.file_handle.file_id(),
-                            )?;
-                            if retval.is_none() {
-                                retval = Some(TreeBlock::Data(entry));
-                            }
-                        }
-                        NodeType::Index => {
-                            let entry = IndexBlock::from_raw_with_cache(
-                                raw,
-                                node,
-                                &cache,
-                                file.file_handle.file_id(),
-                            )?;
-                            if retval.is_none() {
-                                retval = Some(TreeBlock::Index(entry));
-                            }
-                        }
-                    };
+                    let entry = TreeBlock::from_raw_with_cache(
+                        raw,
+                        node,
+                        &cache,
+                        file.file_handle.file_id(),
+                    )?;
+                    if retval.is_none() {
+                        retval = Some(entry);
+                    }
                 }
                 Ok(retval.unwrap())
             } else {
@@ -871,6 +880,42 @@ where
     K: DataTrait + ?Sized,
     A: DataTrait + ?Sized,
 {
+    fn from_cache(
+        node: &TreeNode,
+        cache: &BufferCache,
+        file: &dyn FileReader,
+    ) -> Result<Option<Self>, Error> {
+        match cache.get(file, node.location) {
+            Some(cache_entry) => match node.node_type {
+                NodeType::Data => Ok(Some(Self::Data(DataBlock::from_cache_entry(
+                    cache_entry,
+                    node.location,
+                )?))),
+                NodeType::Index => Ok(Some(Self::Index(IndexBlock::from_cache_entry(
+                    cache_entry,
+                    node.location,
+                )?))),
+            },
+            None => Ok(None),
+        }
+    }
+
+    pub(super) fn from_raw_with_cache(
+        raw: Arc<FBuf>,
+        node: &TreeNode,
+        cache: &BufferCache,
+        file_id: FileId,
+    ) -> Result<Self, Error> {
+        match node.node_type {
+            NodeType::Data => Ok(Self::Data(DataBlock::from_raw_with_cache(
+                raw, node, cache, file_id,
+            )?)),
+            NodeType::Index => Ok(Self::Index(IndexBlock::from_raw_with_cache(
+                raw, node, cache, file_id,
+            )?)),
+        }
+    }
+
     fn lookup_row(&self, row: u64) -> Result<Option<TreeNode>, Error> {
         self.lookup_row_and_successors::<1>(row)
             .map(|mut vec| vec.pop())
@@ -1176,7 +1221,7 @@ where
     fn find_row(&self, row: u64) -> Result<usize, Error> {
         let mut indexes = 0..self.n_children();
         while !indexes.is_empty() {
-            let mid = (indexes.start + indexes.end) / 2;
+            let mid = indexes.start.midpoint(indexes.end);
             let rows = self.get_rows(mid);
             if row < rows.start {
                 indexes.end = mid;
@@ -1221,7 +1266,7 @@ where
                 if start >= end {
                     break None;
                 }
-                let mid = (start + end) / 2;
+                let mid = start.midpoint(end);
                 let rows = self.get_row_range(mid);
 
                 /// Compares `a` to `b` and reports their relationship.
@@ -1340,7 +1385,7 @@ where
             let mut end = self.n_children() * 2;
             result = None;
             while start < end {
-                let mid = (start + end) / 2;
+                let mid = start.midpoint(end);
                 let row = self.get_row_bound(mid) + self.first_row;
                 let cmp = match range_compare(target_rows, row) {
                     Equal => {
@@ -1366,6 +1411,34 @@ where
         });
 
         result
+    }
+
+    unsafe fn find_next(
+        &self,
+        tmp_lower: &mut K,
+        tmp_upper: &mut K,
+        targets: &[Box<K>],
+        start: &mut usize,
+    ) -> Option<(usize, usize)> {
+        let mut end = self.n_children();
+        while *start < end {
+            let mid = start.midpoint(end);
+            self.get_bound(mid * 2, tmp_lower);
+            if &*targets[0] < tmp_lower {
+                end = mid;
+            } else {
+                *start = mid + 1;
+                self.get_bound(mid * 2 + 1, tmp_upper);
+                if &*targets[0] <= tmp_upper {
+                    let n = 1 + targets[1..]
+                        .iter()
+                        .take_while(|target| &***target <= tmp_upper)
+                        .count();
+                    return Some((mid, n));
+                }
+            }
+        }
+        None
     }
 
     fn n_children(&self) -> usize {
@@ -2028,6 +2101,13 @@ where
             ..*self
         }
     }
+
+    fn multifetch<'b>(&self, keys: &'b [Box<K>]) -> Result<Multifetch<'a, 'b, K, A, N, T>, Error>
+    where
+        T: ColumnSpec,
+    {
+        Multifetch::new(self.reader, keys, self.column)
+    }
 }
 
 /// Trait for equality comparisons that might fail due to an I/O error.
@@ -2655,7 +2735,7 @@ where
     }
 
     fn row_group(&self) -> Result<Range<u64>, Error> {
-        self.data.row_group(self.row)
+        self.data.row_group_for_row(self.row)
     }
     fn move_to_row_blocking<T>(&mut self, reader: &Reader<T>, row: u64) -> Result<(), Error> {
         if self.data.rows().contains(&row) {
@@ -3623,13 +3703,13 @@ where
     }
 }
 
-struct Read {
+struct BulkRead {
     node: TreeNode,
     level: usize,
 }
 
-struct ReadResults {
-    reads: Vec<Read>,
+struct BulkReadResults {
+    reads: Vec<BulkRead>,
     results: Vec<Result<Arc<FBuf>, StorageError>>,
 }
 
@@ -3649,8 +3729,8 @@ where
     row: u64,
     n_rows: u64,
 
-    receiver: Receiver<ReadResults>,
-    sender: Sender<ReadResults>,
+    receiver: Receiver<BulkReadResults>,
+    sender: Sender<BulkReadResults>,
 
     /// If nonempty, then:
     /// - `data_blocks[0]` contains `row`.
@@ -3735,7 +3815,11 @@ where
         Ok(this)
     }
 
-    fn start_index_read(&mut self, node: &TreeNode, level: usize) -> Result<Option<Read>, Error> {
+    fn start_index_read(
+        &mut self,
+        node: &TreeNode,
+        level: usize,
+    ) -> Result<Option<BulkRead>, Error> {
         if level >= self.indexes.len() {
             self.indexes.push(IndexLevel::new());
         }
@@ -3747,14 +3831,14 @@ where
             self.indexes[level].received(IndexBlock::from_cache_entry(cache_entry, node.location)?);
             Ok(None)
         } else {
-            Ok(Some(Read {
+            Ok(Some(BulkRead {
                 node: node.clone(),
                 level,
             }))
         }
     }
 
-    fn start_data_read(&mut self, node: &TreeNode) -> Result<Option<Read>, Error> {
+    fn start_data_read(&mut self, node: &TreeNode) -> Result<Option<BulkRead>, Error> {
         self.data_pending += 1;
         if let Some(cache_entry) = self
             .cache
@@ -3763,39 +3847,36 @@ where
             self.received_data(DataBlock::from_cache_entry(cache_entry, node.location)?);
             Ok(None)
         } else {
-            Ok(Some(Read {
+            Ok(Some(BulkRead {
                 node: node.clone(),
                 level: 0,
             }))
         }
     }
 
-    fn start_block_read(&mut self, node: &TreeNode, level: usize) -> Result<Option<Read>, Error> {
+    fn start_block_read(
+        &mut self,
+        node: &TreeNode,
+        level: usize,
+    ) -> Result<Option<BulkRead>, Error> {
         match node.node_type {
             NodeType::Data => self.start_data_read(node),
             NodeType::Index => self.start_index_read(node, level),
         }
     }
 
-    fn process_read_results(&mut self, read_results: ReadResults) -> Result<(), Error> {
-        for (Read { node, level }, result) in read_results
+    fn process_read_results(&mut self, read_results: BulkReadResults) -> Result<(), Error> {
+        for (BulkRead { node, level }, result) in read_results
             .reads
             .into_iter()
             .zip(read_results.results.into_iter())
         {
             let raw = decompress(self.reader.file.compression, node.location, result?)?;
             let file_id = self.reader.file.file_handle.file_id();
-            match node.node_type {
-                NodeType::Data => {
-                    let data_block =
-                        DataBlock::from_raw_with_cache(raw, &node, &self.cache, file_id)?;
-                    self.received_data(data_block);
-                }
-                NodeType::Index => {
-                    let index_block =
-                        IndexBlock::from_raw_with_cache(raw, &node, &self.cache, file_id)?;
-                    self.indexes[level].received(index_block);
-                }
+            let tree_block = TreeBlock::from_raw_with_cache(raw, &node, &self.cache, file_id)?;
+            match tree_block {
+                TreeBlock::Data(data_block) => self.received_data(data_block),
+                TreeBlock::Index(index_block) => self.indexes[level].received(index_block),
             }
         }
         Ok(())
@@ -3808,7 +3889,7 @@ where
         self.work_(Vec::new())
     }
 
-    fn work_(&mut self, mut reads: Vec<Read>) -> Result<(), Error> {
+    fn work_(&mut self, mut reads: Vec<BulkRead>) -> Result<(), Error> {
         // First, catch up on all completed reads.
         while let Ok(read_results) = self.receiver.try_recv() {
             self.process_read_results(read_results)?;
@@ -3835,7 +3916,7 @@ where
                 {
                     let sender = self.sender.clone();
                     Box::new(move |results| {
-                        let _ = sender.send(ReadResults { reads, results });
+                        let _ = sender.send(BulkReadResults { reads, results });
                     })
                 },
             );
@@ -3957,7 +4038,7 @@ where
     pub fn row_group(&self) -> Result<Option<Range<u64>>, Error> {
         self.data_blocks
             .front()
-            .map(|block| block.row_group(self.row))
+            .map(|block| block.row_group_for_row(self.row))
             .transpose()
     }
 
@@ -4076,4 +4157,194 @@ where
     fn is_full(&self, level: usize) -> bool {
         self.pending + self.blocks.len() + self.out_of_order.len() >= 1 << level
     }
+}
+
+pub struct Multifetch<'a, 'b, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+{
+    reader: &'a Reader<T>,
+    keys: &'b [Box<K>],
+    cache: Arc<BufferCache>,
+    factories: Factories<K, A>,
+    column: usize,
+
+    receiver: Receiver<MultifetchReadResults>,
+    sender: Sender<MultifetchReadResults>,
+
+    tmp_key: Box<K>,
+    tmp_key2: Box<K>,
+    output: Box<DynPairs<K, A>>,
+    row_groups: Vec<Range<u64>>,
+
+    pending: usize,
+
+    _phantom: PhantomData<fn(&K, &A, N)>,
+}
+
+impl<'a, 'b, K, A, N, T> Multifetch<'a, 'b, K, A, N, T>
+where
+    K: DataTrait + ?Sized,
+    A: DataTrait + ?Sized,
+    T: ColumnSpec,
+{
+    fn new(reader: &'a Reader<T>, keys: &'b [Box<K>], column: usize) -> Result<Self, Error> {
+        let (sender, receiver) = channel();
+        let factories = reader.columns[column].factories.factories();
+        let output = factories.pairs_factory.default_box();
+        let tmp_key = factories.key_factory.default_box();
+        let tmp_key2 = factories.key_factory.default_box();
+        let mut this = Self {
+            reader,
+            keys,
+            cache: (reader.file.cache)(),
+            factories,
+            column,
+            sender,
+            receiver,
+            tmp_key,
+            tmp_key2,
+            output,
+            row_groups: Vec::new(),
+            pending: 0,
+            _phantom: PhantomData,
+        };
+        if !keys.is_empty() {
+            if let Some(node) = &reader.columns[column].root {
+                let mut reads = Vec::new();
+                this.try_read(MultifetchRead::new(0..keys.len(), node.clone()), &mut reads)?;
+                this.start_reads(reads);
+            }
+        }
+        Ok(this)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.pending == 0
+    }
+
+    pub fn results(self) -> (Box<DynPairs<K, A>>, Vec<Range<u64>>) {
+        (self.output, self.row_groups)
+    }
+
+    pub fn run(&mut self) -> Result<(), Error> {
+        let mut reads = Vec::new();
+        while let Ok(results) = self.receiver.try_recv() {
+            self.pending -= 1;
+            for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
+                let raw = result?;
+                let tree_block = TreeBlock::from_raw_with_cache(
+                    raw,
+                    &read.node,
+                    &self.cache,
+                    self.reader.file_handle().file_id(),
+                )?;
+                self.process_read(&read.keys, tree_block, &mut reads)?;
+            }
+        }
+        self.start_reads(reads);
+        Ok(())
+    }
+
+    fn start_reads(&mut self, reads: Vec<MultifetchRead>) {
+        if !reads.is_empty() {
+            self.reader.file.file_handle.read_async(
+                reads.iter().map(|read| read.node.location).collect(),
+                {
+                    let sender = self.sender.clone();
+                    Box::new(move |results| {
+                        let _ = sender.send(MultifetchReadResults { reads, results });
+                    })
+                },
+            );
+            self.pending += 1;
+        }
+    }
+
+    fn try_read(
+        &mut self,
+        read: MultifetchRead,
+        reads: &mut Vec<MultifetchRead>,
+    ) -> Result<(), Error> {
+        if let Some(tree_block) =
+            TreeBlock::from_cache(&read.node, &self.cache, &*self.reader.file.file_handle)?
+        {
+            self.process_read(&read.keys, tree_block, reads)?;
+        }
+        Ok(())
+    }
+
+    fn process_read(
+        &mut self,
+        key_range: &Range<usize>,
+        tree_block: TreeBlock<K, A>,
+        reads: &mut Vec<MultifetchRead>,
+    ) -> Result<(), Error> {
+        let keys = &self.keys[key_range.clone()];
+        match tree_block {
+            TreeBlock::Data(data_block) => {
+                let mut start = 0;
+                for key in keys {
+                    if let Some(child_index) = unsafe {
+                        data_block.find_next(&self.factories, &mut self.tmp_key, &key, &mut start)
+                    } {
+                        self.output.push_with(&mut |pair| {
+                            let (k, a) = pair.split_mut();
+                            self.tmp_key.move_to(k);
+                            unsafe { data_block.aux(&self.factories, child_index, a) };
+                        });
+                        if data_block.row_groups.is_some() {
+                            self.row_groups.push(data_block.row_group(child_index)?);
+                        }
+                    }
+                    if start >= data_block.n_values() {
+                        break;
+                    }
+                }
+            }
+            TreeBlock::Index(index_block) => {
+                let mut start = 0;
+                let mut i = 0;
+                while i < keys.len() {
+                    if let Some((child_index, n_keys)) = unsafe {
+                        index_block.find_next(
+                            &mut self.tmp_key,
+                            &mut self.tmp_key2,
+                            &keys[i..],
+                            &mut start,
+                        )
+                    } {
+                        reads.push(MultifetchRead::new(
+                            i..i + n_keys,
+                            index_block.get_child(child_index)?,
+                        ));
+                        i += n_keys;
+                    } else {
+                        i += 1;
+                    }
+                    if start >= index_block.n_children() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct MultifetchRead {
+    keys: Range<usize>,
+    node: TreeNode,
+}
+
+impl MultifetchRead {
+    fn new(keys: Range<usize>, node: TreeNode) -> Self {
+        Self { keys, node }
+    }
+}
+
+struct MultifetchReadResults {
+    reads: Vec<MultifetchRead>,
+    results: Vec<Result<Arc<FBuf>, StorageError>>,
 }
