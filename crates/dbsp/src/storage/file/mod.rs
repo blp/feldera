@@ -115,6 +115,9 @@ where
 
     /// Factory for creating instances of `Vector<K>`.
     pub keys_factory: &'static dyn Factory<DynVec<K>>,
+
+    /// Factory for creating instances of `Vector<A>`.
+    pub auxes_factory: &'static dyn Factory<DynVec<A>>,
 }
 
 impl<K, A> Clone for Factories<K, A>
@@ -127,6 +130,7 @@ where
             key_factory: self.key_factory,
             item_factory: self.item_factory,
             keys_factory: self.keys_factory,
+            auxes_factory: self.auxes_factory,
         }
     }
 }
@@ -147,6 +151,7 @@ where
             key_factory: WithFactory::<KType>::FACTORY,
             item_factory: <RefTup2Factory<KType, AType> as WithItemFactory<K, A>>::ITEM_FACTORY,
             keys_factory: WithFactory::<LeanVec<KType>>::FACTORY,
+            auxes_factory: WithFactory::<LeanVec<AType>>::FACTORY,
         }
     }
 
@@ -160,6 +165,7 @@ where
             key_factory: Arc::new(self.key_factory),
             item_factory: Arc::new(self.item_factory),
             keys_factory: Arc::new(self.keys_factory),
+            auxes_factory: Arc::new(self.auxes_factory),
         }
     }
 }
@@ -177,6 +183,7 @@ pub struct AnyFactories {
     key_factory: Arc<(dyn Any + Send + Sync + 'static)>,
     item_factory: Arc<(dyn Any + Send + Sync + 'static)>,
     keys_factory: Arc<(dyn Any + Send + Sync + 'static)>,
+    auxes_factory: Arc<(dyn Any + Send + Sync + 'static)>,
 }
 
 impl Debug for AnyFactories {
@@ -220,6 +227,17 @@ impl AnyFactories {
             .unwrap()
     }
 
+    fn auxes_factory<K>(&self) -> &'static dyn Factory<DynVec<K>>
+    where
+        K: DataTrait + ?Sized,
+    {
+        *self
+            .auxes_factory
+            .as_ref()
+            .downcast_ref::<&'static dyn Factory<DynVec<K>>>()
+            .unwrap()
+    }
+
     fn factories<K, A>(&self) -> Factories<K, A>
     where
         K: DataTrait + ?Sized,
@@ -229,6 +247,7 @@ impl AnyFactories {
             key_factory: self.key_factory(),
             item_factory: self.item_factory(),
             keys_factory: self.keys_factory(),
+            auxes_factory: self.auxes_factory(),
         }
     }
 }

@@ -5,7 +5,7 @@
 use super::format::{Compression, FileTrailer};
 use super::{AnyFactories, Factories};
 use crate::circuit::runtime::ThreadType;
-use crate::dynamic::{DynPairs, DynVec};
+use crate::dynamic::DynVec;
 use crate::storage::buffer_cache::AsyncCacheContext;
 use crate::storage::buffer_cache::{CacheAccess, CacheEntry};
 use crate::storage::file::format::FilterBlock;
@@ -33,6 +33,7 @@ use fastbloom::BloomFilter;
 use feldera_storage::file::FileId;
 use feldera_storage::StoragePath;
 use futures::future::Either;
+use itertools::Itertools;
 use smallvec::{smallvec, SmallVec};
 use snap::raw::{decompress_len, Decoder};
 use std::collections::{BTreeMap, VecDeque};
@@ -1938,8 +1939,8 @@ where
     pub fn multifetch<'a, 'b>(
         &'a self,
         keys: &'b DynVec<K>,
-    ) -> Result<Multifetch<'a, 'b, K, A, N, (&'static K, &'static A, N)>, Error> {
-        Multifetch::new(self, keys)
+    ) -> Result<Multifetch0<'a, 'b, K, A, N, (&'static K, &'static A, N)>, Error> {
+        Multifetch0::new(self, keys)
     }
 
     /// Returns an [AsyncRowGroup] for all of the rows in column 0.
@@ -4184,7 +4185,7 @@ where
     }
 }
 
-pub struct Multifetch<'a, 'b, K, A, N, T>
+pub struct Multifetch0<'a, 'b, K, A, N, T>
 where
     K: DataTrait + ?Sized,
     A: DataTrait + ?Sized,
@@ -4203,11 +4204,10 @@ where
     row_groups: Vec<Range<u64>>,
 
     pending: usize,
-
-    _phantom: PhantomData<fn(&K, &A, N)>,
+    _phantom: PhantomData<fn(&N)>,
 }
 
-impl<'a, 'b, K, A, N, T> Multifetch<'a, 'b, K, A, N, T>
+impl<'a, 'b, K, A, N, T> Multifetch0<'a, 'b, K, A, N, T>
 where
     K: DataTrait + ?Sized,
     A: DataTrait + ?Sized,
@@ -4247,9 +4247,14 @@ where
         self.pending == 0
     }
 
-    pub fn results(mut self) -> (Box<DynVec<K>>, Vec<Range<u64>>) {
+    fn finish(&mut self) {
         debug_assert!(self.is_done());
         self.output.sort_unstable();
+        self.row_groups.sort_unstable_by_key(|rows| rows.start);
+    }
+
+    pub fn results(mut self) -> (Box<DynVec<K>>, Vec<Range<u64>>) {
+        self.finish();
         (self.output, self.row_groups)
     }
 
@@ -4397,8 +4402,8 @@ struct MultifetchReadResults {
     reads: Vec<MultifetchRead>,
     results: Vec<Result<Arc<FBuf>, StorageError>>,
 }
-/*
-impl<'a, 'b, K, A, NK, NA, NN, T> Multifetch<'a, 'b, K, A, (&'static NK, &'static NA, NN), T>
+
+impl<'a, 'b, K, A, NK, NA, NN, T> Multifetch0<'a, 'b, K, A, (&'static NK, &'static NA, NN), T>
 where
     K: DataTrait + ?Sized,
     A: DataTrait + ?Sized,
@@ -4406,13 +4411,65 @@ where
     NA: DataTrait + ?Sized,
     T: ColumnSpec,
 {
-    pub fn next_column(self) -> Result<BulkRows<'a, NK, NA, NN, T>, Error> {
-        let (results, row_groups) = self.results();
+    pub fn next_column(self) -> Result<Multifetch1<'a, K, NK, NA, T>, Error> {
+        Multifetch1::new(self)
+    }
+}
+
+pub struct Multifetch1<'a, K0, K1, A1, T>
+where
+    K0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: DataTrait + ?Sized,
+{
+    reader: &'a Reader<T>,
+    cache: Arc<BufferCache>,
+    factories: Factories<K1, A1>,
+
+    receiver: Receiver<MultifetchReadResults>,
+    sender: Sender<MultifetchReadResults>,
+
+    keys: Box<DynVec<K0>>,
+    offs: Vec<usize>,
+    vals: Box<DynVec<K1>>,
+    diffs: Box<DynVec<A1>>,
+
+    rows: Vec<Range<u64>>,
+
+    pending: usize,
+}
+
+impl<'a, K0, K1, A1, T> Multifetch1<'a, K0, K1, A1, T>
+where
+    K0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: DataTrait + ?Sized,
+    T: ColumnSpec,
+{
+    fn new<'b, A0, N>(
+        mut source: Multifetch0<'a, 'b, K0, A0, (&'static K1, &'static A1, N), T>,
+    ) -> Result<Self, Error>
+    where
+        A0: DataTrait + ?Sized,
+    {
+        source.finish();
+
+        let factories = source.reader.columns[1].factories.factories();
+
+        let offs = {
+            let mut offs = Vec::with_capacity(source.row_groups.len() + 1);
+            offs.push(0);
+            for row_group in &source.row_groups {
+                offs.push(offs.last().unwrap() + (row_group.end - row_group.start) as usize);
+            }
+            offs
+        };
 
         // Combine contiguous row groups.
         //
         // This could be done in-place with a little extra work.
-        let row_groups = row_groups
+        let rows = source
+            .row_groups
             .into_iter()
             .coalesce(|x, y| {
                 if x.end == y.start {
@@ -4421,35 +4478,188 @@ where
                     Err((x, y))
                 }
             })
-            .collect::<Vec<_>>();
+            .collect();
+
+        let mut this = Self {
+            reader: source.reader,
+            cache: source.cache,
+            keys: source.output,
+            offs,
+            vals: factories.keys_factory.default_box(),
+            diffs: factories.auxes_factory.default_box(),
+            rows,
+            factories,
+            receiver: source.receiver,
+            sender: source.sender,
+            pending: 0,
+        };
+        if !this.rows.is_empty() {
+            if let Some(node) = &source.reader.columns[1].root {
+                let mut reads = Vec::new();
+                this.try_read(
+                    MultifetchRead::new(0..this.rows.len(), node.clone()),
+                    &mut reads,
+                )?;
+                this.start_reads(reads);
+            }
+        }
+        Ok(this)
+    }
+
+    fn start_reads(&mut self, reads: Vec<MultifetchRead>) {
+        if !reads.is_empty() {
+            self.reader.file.file_handle.read_async(
+                reads.iter().map(|read| read.node.location).collect(),
+                {
+                    let sender = self.sender.clone();
+                    Box::new(move |results| {
+                        let _ = sender.send(MultifetchReadResults { reads, results });
+                    })
+                },
+            );
+            self.pending += 1;
+        }
+    }
+    fn try_read(
+        &mut self,
+        read: MultifetchRead,
+        reads: &mut Vec<MultifetchRead>,
+    ) -> Result<(), Error> {
+        dbg!(&read);
+        if let Some(tree_block) =
+            TreeBlock::from_cache(&read.node, &self.cache, &*self.reader.file.file_handle).unwrap()
+        {
+            self.process_read(&read.keys, tree_block, reads)?;
+        } else {
+            reads.push(read);
+        }
+        Ok(())
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.pending == 0
+    }
+
+    /*
+    pub fn results(mut self) -> (Box<DynVec<K>>, Vec<Range<u64>>) {
+        debug_assert!(self.is_done());
+        todo!()
+    }*/
+
+    pub fn wait(&mut self) -> Result<(), Error> {
+        if !self.is_done() {
+            _ = ();
+            let mut reads = Vec::new();
+            self.process_results(self.receiver.recv().unwrap(), &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(())
+    }
+
+    pub fn run(&mut self) -> Result<(), Error> {
+        self.run_(Vec::new())
+    }
+
+    fn run_(&mut self, mut reads: Vec<MultifetchRead>) -> Result<(), Error> {
+        while let Ok(results) = self.receiver.try_recv() {
+            self.process_results(results, &mut reads)?;
+        }
+        self.start_reads(reads);
+        Ok(())
+    }
+
+    fn process_results(
+        &mut self,
+        results: MultifetchReadResults,
+        reads: &mut Vec<MultifetchRead>,
+    ) -> Result<(), Error> {
+        self.pending -= 1;
+        for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
+            let raw = result?;
+            let tree_block = TreeBlock::from_raw_with_cache(
+                decompress(self.reader.file.compression, read.node.location, raw)?,
+                &read.node,
+                &self.cache,
+                self.reader.file_handle().file_id(),
+            )
+            .unwrap();
+            self.process_read(&read.keys, tree_block, reads)?;
+        }
+        Ok(())
+    }
+
+    fn process_read(
+        &mut self,
+        rows_range: &Range<usize>,
+        tree_block: TreeBlock<K1, A1>,
+        reads: &mut Vec<MultifetchRead>,
+    ) -> Result<(), Error> {
+        match tree_block {
+            TreeBlock::Data(data_block) => {
+                dbg!();
+                for rows in &self.rows[rows_range.clone()] {
+                    for row in intersect(rows, &data_block.rows()) {
+                        self.vals.push_with(&mut |val| unsafe {
+                            data_block.key_for_row(&self.factories, row, val)
+                        });
+                        self.diffs.push_with(&mut |diff| unsafe {
+                            data_block.aux_for_row(&self.factories, row, diff)
+                        });
+                    }
+                }
+            }
+            TreeBlock::Index(index_block) => {
+                let mut start = rows_range.start;
+                while start < rows_range.end {
+                    let intersection = intersect(&index_block.rows(), &self.rows[start]);
+                    if intersection.is_empty() {
+                        start += 1;
+                        continue;
+                    }
+
+                    let child_idx = index_block.find_row(intersection.start)?;
+                    let child = index_block.get_child(child_idx)?;
+                    let mut end = start;
+                    while end + 1 < rows_range.end
+                        && !intersect(&self.rows[end + 1], &child.rows).is_empty()
+                    {
+                        end += 1;
+                    }
+                    let read = MultifetchRead::new(start..end + 1, child);
+                    self.try_read(read, reads)?;
+                    start = end;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-pub struct MultifetchIndexedZSet<'a, 'b, K0, A0, K1, A1, T>
+fn intersect<T>(a: &Range<T>, b: &Range<T>) -> Range<T>
 where
-    K0: DataTrait + ?Sized,
-    A0: DataTrait + ?Sized,
-    K1: DataTrait + ?Sized,
-    A1: DataTrait + ?Sized,
+    T: Copy + Ord + Default,
 {
-    reader: &'a Reader<T>,
-    col0: Box<DynPairs<K0, A0>>,
-    rows: Vec<Range<u64>>,
-    cache: Arc<BufferCache>,
-    factories: Factories<K0, A0>,
-
-    receiver: Receiver<MultifetchReadResults>,
-    sender: Sender<MultifetchReadResults>,
-
-    output: Box<DynPairs<K, A>>,
-    row_groups: Vec<Range<u64>>,
-
-    pending: usize,
-
-    _phantom: PhantomData<fn(&K, &A, N)>,
+    if a.contains(&b.start) {
+        b.start..min(a.end, b.end)
+    } else if b.contains(&a.start) {
+        a.start..min(a.end, b.end)
+    } else {
+        Range::default()
+    }
 }
 
-impl MultifetchValues {
-    //fn new(
+#[cfg(test)]
+mod test {
+    use crate::storage::file::reader::intersect;
+
+    #[test]
+    fn intersection() {
+        let a = 5..10;
+        assert_eq!(intersect(&a, &(3..7)), 5..7);
+        assert_eq!(intersect(&a, &(7..12)), 7..10);
+        assert_eq!(intersect(&a, &(0..3)), 0..0);
+        assert_eq!(intersect(&a, &(13..15)), 0..0);
+        assert_eq!(intersect(&a, &(6..8)), 6..8);
+        assert_eq!(intersect(&a, &(3..12)), 5..10);
+    }
 }
-*/
