@@ -402,52 +402,27 @@ where
     where
         B: BatchReader<Key = Self::Key>,
     {
-        let context = self.file.new_async_context();
-        let mut tasks = context.tasks();
-        let mut keys = keys.cursor();
-        while let Some(key) = keys.get_key() {
-            let key = clone_box(key);
-            tasks
-                .push(async {
-                    let key = key; // Force moving `key`.
-                    let mut output = self.factories.weighted_items_factory().default_box();
-
-                    let key_rows = self.file.rows_async(&context);
-                    if let Some(key_cursor) = unsafe { key_rows.find_exact(&key) }.await.unwrap() {
-                        let value_rows = key_cursor.next_column().await.unwrap();
-                        output.reserve(value_rows.len() as usize);
-                        let mut value_cursor = value_rows.first().await.unwrap();
-                        let mut item = self.factories.weighted_item_factory().default_box();
-                        while value_cursor.has_value() {
-                            let (kv, weight) = item.split_mut();
-                            let (k, v) = kv.split_mut();
-                            key.clone_to(k);
-                            unsafe { value_cursor.key(v) };
-                            unsafe { value_cursor.aux(weight) };
-                            output.push_val(&mut *item);
-                            value_cursor.move_next().await.unwrap();
-                        }
-                    }
-                    output
-                })
-                .await;
-            keys.step_key();
+        // If `B` is `VecIndexedWset` or `VecWSet`, we could get a reference to
+        // their existing internal vector instead.
+        let mut keys_vec = self.factories.factories0.keys_factory.default_box();
+        keys_vec.reserve(keys.len());
+        let mut cursor = keys.cursor();
+        while cursor.key_valid() {
+            keys_vec.push_ref(cursor.key());
+            cursor.step_key();
         }
 
-        let outputs = tasks.run(self.file.file_handle()).await;
-
-        let builder =
-            <VecIndexedWSet<Self::Key, Self::Val, Self::R> as Batch>::Builder::with_capacity(
-                &self.factories.vec_indexed_wset_factory,
-                outputs.len(),
-            );
-        let mut builder = TupleBuilder::new(&self.factories.vec_indexed_wset_factory, builder);
-        for mut output in outputs {
-            for update in output.dyn_iter_mut() {
-                builder.push(update);
-            }
+        let mut multifetch0 = self.file.multifetch(&*keys_vec).unwrap();
+        while !multifetch0.is_done() {
+            multifetch0.wait().unwrap();
         }
-        Some(Box::new(CursorFactoryWrapper(builder.done())))
+        let mut multifetch1 = multifetch0.next_column().unwrap();
+        while !multifetch1.is_done() {
+            multifetch1.wait().unwrap();
+        }
+        let results = multifetch1.results(self.factories.vec_indexed_wset_factory.clone());
+
+        Some(Box::new(CursorFactoryWrapper(results)))
     }
 }
 

@@ -4498,7 +4498,7 @@ where
             offs,
             vals: factories.keys_factory.default_box(),
             diffs: factories.auxes_factory.default_box(),
-            next_row: rows[0].start,
+            next_row: rows.get(0).map_or(0, |range| range.start),
             rows,
             factories,
             receiver,
@@ -4912,7 +4912,7 @@ mod test {
         assert_eq!(intersect(&a, &(3..12)), Some(5..10));
     }
 
-    fn check_rows(rows: &Rows, ranges: &[Range<u64>], mut expected: u32) {
+    fn check_rows(rows: &Rows, ranges: &[Range<u64>], expected: u32) {
         rows.check_invariants(ranges);
         let mut actual = 0;
         for row in rows.iter(&ranges) {

@@ -345,8 +345,8 @@ mod test {
             test::init_test_logger,
         },
         trace::{
-            ord::vec::indexed_wset_batch::VecIndexedWSetBuilder, BatchReader, BatchReaderFactories,
-            Builder, Cursor, VecIndexedWSet, VecIndexedWSetFactories,
+            ord::vec::indexed_wset_batch::VecIndexedWSetBuilder, BatchReaderFactories, Builder,
+            VecIndexedWSetFactories,
         },
         DBWeight,
     };
