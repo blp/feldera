@@ -17,7 +17,7 @@ use crate::{
         merge_batches_by_reference,
         ord::merge_batcher::MergeBatcher,
         Batch, BatchFactories, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor,
-        TupleBuilder, VecIndexedWSet, VecIndexedWSetFactories, WeightedItem,
+        VecIndexedWSetFactories, WeightedItem,
     },
     DBData, DBWeight, NumEntries, Runtime,
 };
@@ -402,7 +402,7 @@ where
     where
         B: BatchReader<Key = Self::Key>,
     {
-        // If `B` is `VecIndexedWset` or `VecWSet`, we could get a reference to
+        // If `B` is `VecIndexedWSet` or `VecWSet`, we could get a reference to
         // their existing internal vector instead.
         let mut keys_vec = self.factories.factories0.keys_factory.default_box();
         keys_vec.reserve(keys.len());
@@ -412,7 +412,7 @@ where
             cursor.step_key();
         }
 
-        let mut multifetch0 = self.file.multifetch(&*keys_vec).unwrap();
+        let mut multifetch0 = self.file.multifetch_indexed_zset(&*keys_vec).unwrap();
         while !multifetch0.is_done() {
             multifetch0.wait().unwrap();
         }

@@ -345,8 +345,8 @@ mod test {
             test::init_test_logger,
         },
         trace::{
-            ord::vec::indexed_wset_batch::VecIndexedWSetBuilder, BatchReaderFactories, Builder,
-            VecIndexedWSetFactories,
+            ord::vec::{indexed_wset_batch::VecIndexedWSetBuilder, wset_batch::VecWSetBuilder},
+            BatchReaderFactories, Builder, VecIndexedWSetFactories, VecWSetFactories,
         },
         DBWeight,
     };
@@ -867,33 +867,37 @@ mod test {
         assert!(expected.next().is_none());
     }
 
-    fn test_multifetch_one_column<K, A, N>(
-        reader: &Reader<(&'static DynData, &'static DynData, N)>,
+    fn test_multifetch_zset<K, A, N>(
+        reader: &Reader<(&'static DynData, &'static DynWeight, N)>,
         n: usize,
-        expected: impl Fn(usize) -> (K, K, K, A),
+        expected_fn: impl Fn(usize) -> (K, K, K, A),
     ) where
         K: DBData,
-        A: DBData,
+        A: DBWeight,
         N: ColumnSpec,
     {
         let keys_factory: &dyn Factory<dyn Vector<DynData>> = WithFactory::<LeanVec<K>>::FACTORY;
+
+        let vec_wset_factories = VecWSetFactories::new::<K, (), A>();
+        let mut expected = VecWSetBuilder::new_builder(&vec_wset_factories);
+
         let mut keys = keys_factory.default_box();
         for i in 0..n {
             if rand::random() {
-                let (_before, key, _after, _aux) = (expected)(i);
+                let (_before, key, _after, diff) = (expected_fn)(i);
                 keys.push_ref(&key);
+                expected.push_val_diff(().erase(), diff.erase());
+                expected.push_key(key.erase());
             }
         }
+        let expected = expected.done();
 
-        let mut multifetch = reader.multifetch(&*keys).unwrap();
+        let mut multifetch = reader.multifetch_zset(&*keys).unwrap();
         while !multifetch.is_done() {
             multifetch.wait().unwrap();
         }
-        let (results, _groups) = multifetch.results();
-        assert_eq!(results.len(), keys.len());
-        for i in 0..keys.len() {
-            assert_eq!(&results[i], &keys[i]);
-        }
+        let output = multifetch.results(vec_wset_factories);
+        assert_eq!(&output, &expected);
     }
 
     fn test_multifetch_two_columns<T>(
@@ -927,7 +931,7 @@ mod test {
         }
         let expected = expected.done();
 
-        let mut multifetch0 = reader.multifetch(&*keys).unwrap();
+        let mut multifetch0 = reader.multifetch_indexed_zset(&*keys).unwrap();
         while !multifetch0.is_done() {
             multifetch0.wait().unwrap();
         }
@@ -1281,7 +1285,6 @@ mod test {
             test_cursor(&reader.rows(), n, &expected);
             test_bloom(&reader, n, &expected);
             test_bulk_rows(reader.bulk_rows().unwrap(), OneColumn::new(&expected, n));
-            test_multifetch_one_column(&reader, n, &expected);
 
             TOKIO.block_on(async {
                 // Force some blocking due to I/O, to test those cases in
@@ -1299,6 +1302,58 @@ mod test {
                     )
                     .await;
             });
+        }
+    }
+
+    fn test_one_column_zset<K, A>(
+        n: usize,
+        expected: impl Fn(usize) -> (K, K, K, A),
+        parameters: Parameters,
+    ) where
+        K: DBData,
+        A: DBWeight,
+    {
+        for reopen in [false, true] {
+            let factories = Factories::<DynData, DynWeight>::new::<K, A>();
+            let tempdir = tempdir().unwrap();
+            let storage_backend = <dyn StorageBackend>::new(
+                &StorageConfig {
+                    path: tempdir.path().to_string_lossy().to_string(),
+                    cache: Default::default(),
+                },
+                &StorageOptions::default(),
+            )
+            .unwrap();
+            let mut writer = Writer1::new(
+                &factories,
+                test_buffer_cache(),
+                &*storage_backend,
+                parameters.clone(),
+                n,
+            )
+            .unwrap();
+            for row in 0..n {
+                let (_before, key, _after, aux) = expected(row);
+                writer.write0((&key, &aux)).unwrap();
+            }
+
+            let reader = if reopen {
+                println!("closing writer and reopening as reader");
+                let (_file_handle, path, _bloom_filter) = writer.close().unwrap();
+                Reader::open(
+                    &[&factories.any_factories()],
+                    test_buffer_cache,
+                    &*storage_backend,
+                    &path,
+                )
+                .unwrap()
+            } else {
+                println!("transforming writer into reader");
+                writer.into_reader(test_buffer_cache).unwrap()
+            };
+            reader.evict();
+            assert_eq!(reader.rows().len(), n as u64);
+            test_multifetch_zset(&reader, n, &expected);
         }
     }
 
@@ -1377,18 +1432,16 @@ mod test {
     fn test_tuple() {
         init_test_logger();
         for_each_compression_type(Parameters::default(), |parameters| {
-            test_one_column(
-                1000,
-                |row| {
-                    (
-                        (row as u64, 0),
-                        (row as u64, 1),
-                        (row as u64, 2),
-                        row as u64,
-                    )
-                },
-                parameters,
-            )
+            let expected = |row| {
+                (
+                    (row as u64, 0),
+                    (row as u64, 1),
+                    (row as u64, 2),
+                    row as u64 + 1,
+                )
+            };
+            test_one_column(1000, &expected, parameters.clone());
+            test_one_column_zset(1000, &expected, parameters);
         });
     }
 

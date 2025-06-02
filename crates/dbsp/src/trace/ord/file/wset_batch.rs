@@ -13,11 +13,11 @@ use crate::{
         },
     },
     trace::{
-        cursor::{CursorFactory, CursorFactoryWrapper, Pending, PushCursor},
+        cursor::{CursorFactoryWrapper, Pending, PushCursor},
         merge_batches_by_reference,
         ord::merge_batcher::MergeBatcher,
         Batch, BatchFactories, BatchLocation, BatchReader, BatchReaderFactories, Builder, Cursor,
-        Deserializer, Serializer, VecWSet, VecWSetFactories, WeightedItem,
+        Deserializer, Serializer, VecWSetFactories, WeightedItem,
     },
     DBData, DBWeight, NumEntries, Runtime,
 };
@@ -396,17 +396,18 @@ where
         }
     }
 
-    /*
     async fn fetch<B>(
         &self,
         keys: &B,
-    ) -> Option<Box<dyn CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>>
+    ) -> Option<
+        Box<dyn crate::trace::cursor::CursorFactory<Self::Key, Self::Val, Self::Time, Self::R>>,
+    >
     where
-        B: BatchReader<Key = Self::Key>,
+        B: BatchReader<Key = Self::Key, Time = ()>,
     {
-        // If `B` is `VecIndexedWset` or `VecWSet`, we could get a reference to
+        // If `B` is `VecIndexedWSet` or `VecWSet`, we could get a reference to
         // their existing internal vector instead.
-        let mut keys_vec = self.factories.factories0.keys_factory.default_box();
+        let mut keys_vec = self.factories.vec_wset_factory.keys_factory().default_box();
         keys_vec.reserve(keys.len());
         let mut cursor = keys.cursor();
         while cursor.key_valid() {
@@ -414,18 +415,14 @@ where
             cursor.step_key();
         }
 
-        let mut multifetch0 = self.file.multifetch(&*keys_vec).unwrap();
-        while !multifetch0.is_done() {
-            multifetch0.wait().unwrap();
+        let mut multifetch = self.file.multifetch_zset(&*keys_vec).unwrap();
+        while !multifetch.is_done() {
+            multifetch.wait().unwrap();
         }
-        let mut multifetch1 = multifetch0.next_column().unwrap();
-        while !multifetch1.is_done() {
-            multifetch1.wait().unwrap();
-        }
-        let results = multifetch1.results(self.factories.vec_indexed_wset_factory.clone());
+        let results = multifetch.results(self.factories.vec_wset_factory.clone());
 
         Some(Box::new(CursorFactoryWrapper(results)))
-    }*/
+    }
 }
 
 impl<K, R> Batch for FileWSet<K, R>

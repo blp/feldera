@@ -127,6 +127,23 @@ where
     // batch_item_factory: &'static BatchItemFactory<K, (), K, R>,
 }
 
+impl<K, R> VecWSet<K, R>
+where
+    K: DataTrait + ?Sized,
+    R: WeightTrait + ?Sized,
+{
+    pub fn from_parts(
+        factories: VecWSetFactories<K, R>,
+        keys: Box<DynVec<K>>,
+        diffs: Box<DynVec<R>>,
+    ) -> Self {
+        Self {
+            layer: Leaf::from_parts(&factories.layer_factories, keys, diffs),
+            factories,
+        }
+    }
+}
+
 impl<K, R> PartialEq for VecWSet<K, R>
 where
     K: DataTrait + ?Sized,
