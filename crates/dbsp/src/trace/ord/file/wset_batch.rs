@@ -415,11 +415,13 @@ where
             cursor.step_key();
         }
 
-        let mut multifetch = self.file.multifetch_zset(&*keys_vec).unwrap();
-        while !multifetch.is_done() {
-            multifetch.wait().unwrap();
-        }
-        let results = multifetch.results(self.factories.vec_wset_factory.clone());
+        let results = self
+            .file
+            .multifetch_zset(&*keys_vec)
+            .unwrap()
+            .async_results(self.factories.vec_wset_factory.clone())
+            .await
+            .unwrap();
 
         Some(Box::new(CursorFactoryWrapper(results)))
     }

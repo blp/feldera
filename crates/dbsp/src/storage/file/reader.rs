@@ -56,6 +56,7 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error as ThisError;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// Any kind of error encountered reading a layer file.
 #[derive(ThisError, Clone, Debug)]
@@ -4199,8 +4200,8 @@ where
     cache: Arc<BufferCache>,
     factories: Factories<K, A>,
 
-    receiver: Receiver<MultifetchZSetReadResults>,
-    sender: Sender<MultifetchZSetReadResults>,
+    receiver: UnboundedReceiver<MultifetchZSetReadResults>,
+    sender: UnboundedSender<MultifetchZSetReadResults>,
 
     tmp_key: Box<K>,
     tmp_key2: Box<K>,
@@ -4219,7 +4220,7 @@ where
 {
     fn new(reader: &'a Reader<T>, keys: &'b DynVec<K>) -> Result<Self, Error> {
         debug_assert!(keys.is_sorted_by(&|a, b| a.cmp(b)));
-        let (sender, receiver) = channel();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let factories = reader.columns[0].factories.factories();
         let tmp_key = factories.key_factory.default_box();
         let tmp_key2 = factories.key_factory.default_box();
@@ -4278,10 +4279,24 @@ where
         builder.done()
     }
 
+    pub async fn async_results(
+        mut self,
+        factories: VecWSetFactories<K, A>,
+    ) -> Result<VecWSet<K, A>, Error> {
+        while !self.is_done() {
+            let mut reads = Vec::new();
+            let msg = self.receiver.recv().await.unwrap();
+            self.process_results(msg, &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(self.results(factories))
+    }
+
     pub fn wait(&mut self) -> Result<(), Error> {
         if !self.is_done() {
             let mut reads = Vec::new();
-            self.process_results(self.receiver.recv().unwrap(), &mut reads)?;
+            let msg = self.receiver.blocking_recv().unwrap();
+            self.process_results(msg, &mut reads)?;
             self.run_(reads)?;
         }
         Ok(())
