@@ -334,7 +334,7 @@ mod test {
     use std::{marker::PhantomData, sync::Arc};
 
     use crate::{
-        dynamic::{Factory, LeanVec, Vector, WithFactory},
+        dynamic::{DynWeight, Factory, LeanVec, Vector, WithFactory},
         storage::{
             backend::StorageBackend,
             buffer_cache::BufferCache,
@@ -344,6 +344,11 @@ mod test {
             },
             test::init_test_logger,
         },
+        trace::{
+            ord::vec::indexed_wset_batch::VecIndexedWSetBuilder, BatchReader, BatchReaderFactories,
+            Builder, Cursor, VecIndexedWSet, VecIndexedWSetFactories,
+        },
+        DBWeight,
     };
 
     use super::{
@@ -382,7 +387,7 @@ mod test {
         type K0: DBData;
         type A0: DBData;
         type K1: DBData;
-        type A1: DBData;
+        type A1: DBWeight;
 
         fn n0() -> usize;
         fn key0(row0: usize) -> Self::K0;
@@ -895,19 +900,32 @@ mod test {
         reader: &Reader<(
             &'static DynData,
             &'static DynData,
-            (&'static DynData, &'static DynData, ()),
+            (&'static DynData, &'static DynWeight, ()),
         )>,
     ) where
         T: TwoColumns,
     {
         let keys_factory: &dyn Factory<dyn Vector<DynData>> =
             WithFactory::<LeanVec<T::K0>>::FACTORY;
+
+        let vec_indexed_wset_factories = VecIndexedWSetFactories::new::<T::K0, T::K1, T::A1>();
+        let mut expected = VecIndexedWSetBuilder::new_builder(&vec_indexed_wset_factories);
+
         let mut keys = keys_factory.default_box();
         for i in 0..T::n0() {
             if rand::random() {
                 keys.push_ref(&T::key0(i));
+
+                for j in 0..T::n1(i) {
+                    let val = T::key1(i, j);
+                    let weight = T::aux1(i, j);
+                    expected.push_val_diff(val.erase(), weight.erase());
+                }
+                let key = T::key0(i);
+                expected.push_key(key.erase());
             }
         }
+        let expected = expected.done();
 
         let mut multifetch0 = reader.multifetch(&*keys).unwrap();
         while !multifetch0.is_done() {
@@ -917,12 +935,9 @@ mod test {
         while !multifetch1.is_done() {
             multifetch1.wait().unwrap();
         }
-        /*
-        let (results, _groups) = multifetch0.results();
-        assert_eq!(results.len(), keys.len());
-        for i in 0..keys.len() {
-            assert_eq!(&results[i], &keys[i]);
-        }*/
+
+        let output = multifetch1.results(vec_indexed_wset_factories);
+        assert_eq!(&output, &expected);
     }
 
     fn test_bloom<K, A, N>(
@@ -1039,7 +1054,6 @@ mod test {
             reader.bulk_rows().unwrap().next_column().unwrap(),
             Column1::<T>::new(),
         );
-        test_multifetch_two_columns::<T>(&reader);
         TOKIO.block_on(async {
             // Force some blocking due to I/O, to test those cases in
             // [AsyncCacheContext].
@@ -1068,6 +1082,46 @@ mod test {
                 )
                 .await;
         })
+    }
+
+    fn test_two_columns_multifetch<T>(parameters: Parameters)
+    where
+        T: TwoColumns,
+    {
+        let factories0 = Factories::<DynData, DynData>::new::<T::K0, T::A0>();
+        let factories1 = Factories::<DynData, DynWeight>::new::<T::K1, T::A1>();
+
+        let tempdir = tempdir().unwrap();
+        let storage_backend = <dyn StorageBackend>::new(
+            &StorageConfig {
+                path: tempdir.path().to_string_lossy().to_string(),
+                cache: Default::default(),
+            },
+            &StorageOptions::default(),
+        )
+        .unwrap();
+        let mut layer_file = Writer2::new(
+            &factories0,
+            &factories1,
+            test_buffer_cache(),
+            &*storage_backend,
+            parameters,
+            T::n0(),
+        )
+        .unwrap();
+        let n0 = T::n0();
+        for row0 in 0..n0 {
+            for row1 in 0..T::n1(row0) {
+                layer_file
+                    .write1((&T::key1(row0, row1), &T::aux1(row0, row1)))
+                    .unwrap();
+            }
+            layer_file.write0((&T::key0(row0), &T::aux0(row0))).unwrap();
+        }
+
+        let reader = layer_file.into_reader(test_buffer_cache).unwrap();
+        reader.evict();
+        test_multifetch_two_columns::<T>(&reader);
     }
 
     fn test_2_columns_helper(parameters: Parameters) {
@@ -1106,7 +1160,8 @@ mod test {
                 0x2222
             }
         }
-        test_two_columns::<TwoInts>(parameters);
+        test_two_columns::<TwoInts>(parameters.clone());
+        test_two_columns_multifetch::<TwoInts>(parameters);
     }
 
     #[test]

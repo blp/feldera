@@ -5,7 +5,7 @@
 use super::format::{Compression, FileTrailer};
 use super::{AnyFactories, Factories};
 use crate::circuit::runtime::ThreadType;
-use crate::dynamic::DynVec;
+use crate::dynamic::{DynVec, WeightTrait};
 use crate::storage::buffer_cache::AsyncCacheContext;
 use crate::storage::buffer_cache::{CacheAccess, CacheEntry};
 use crate::storage::file::format::FilterBlock;
@@ -17,6 +17,7 @@ use crate::storage::{
     },
     file::item::ArchivedItem,
 };
+use crate::trace::{VecIndexedWSet, VecIndexedWSetFactories};
 use crate::{
     dynamic::{DataTrait, DeserializeDyn, Factory},
     storage::{
@@ -4412,7 +4413,7 @@ where
     K: DataTrait + ?Sized,
     A: DataTrait + ?Sized,
     NK: DataTrait + ?Sized,
-    NA: DataTrait + ?Sized,
+    NA: WeightTrait + ?Sized,
     T: ColumnSpec,
 {
     pub fn next_column(self) -> Result<Multifetch1<'a, K, NK, NA, T>, Error> {
@@ -4424,7 +4425,7 @@ pub struct Multifetch1<'a, K0, K1, A1, T>
 where
     K0: DataTrait + ?Sized,
     K1: DataTrait + ?Sized,
-    A1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
 {
     reader: &'a Reader<T>,
     cache: Arc<BufferCache>,
@@ -4452,7 +4453,7 @@ impl<'a, K0, K1, A1, T> Multifetch1<'a, K0, K1, A1, T>
 where
     K0: DataTrait + ?Sized,
     K1: DataTrait + ?Sized,
-    A1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
     T: ColumnSpec,
 {
     fn new<'b, A0, N>(
@@ -4551,11 +4552,13 @@ where
         self.pending == 0
     }
 
-    /*
-    pub fn results(mut self) -> (Box<DynVec<K>>, Vec<Range<u64>>) {
+    pub fn results(
+        self,
+        factories: VecIndexedWSetFactories<K0, K1, A1>,
+    ) -> VecIndexedWSet<K0, K1, A1> {
         debug_assert!(self.is_done());
-        todo!()
-    }*/
+        VecIndexedWSet::from_parts(factories, self.keys, self.offs, self.vals, self.diffs)
+    }
 
     pub fn wait(&mut self) -> Result<(), Error> {
         if !self.is_done() {
