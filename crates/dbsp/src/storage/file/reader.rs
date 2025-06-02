@@ -4281,12 +4281,7 @@ where
     pub fn wait(&mut self) -> Result<(), Error> {
         if !self.is_done() {
             let mut reads = Vec::new();
-            let msg = loop {
-                if let Ok(msg) = self.receiver.try_recv() {
-                    break msg;
-                }
-            };
-            self.process_results(msg, &mut reads)?;
+            self.process_results(self.receiver.recv().unwrap(), &mut reads)?;
             self.run_(reads)?;
         }
         Ok(())
@@ -4496,12 +4491,7 @@ where
     pub fn wait(&mut self) -> Result<(), Error> {
         if !self.is_done() {
             let mut reads = Vec::new();
-            let msg = loop {
-                if let Ok(msg) = self.receiver.try_recv() {
-                    break msg;
-                }
-            };
-            self.process_results(msg, &mut reads)?;
+            self.process_results(self.receiver.recv().unwrap(), &mut reads)?;
             self.run_(reads)?;
         }
         Ok(())
@@ -4814,12 +4804,7 @@ where
     pub fn wait(&mut self) -> Result<(), Error> {
         if !self.is_done() {
             let mut reads = Vec::new();
-            let msg = loop {
-                if let Ok(msg) = self.receiver.try_recv() {
-                    break msg;
-                }
-            };
-            self.process_results(msg, &mut reads)?;
+            self.process_results(self.receiver.recv().unwrap(), &mut reads)?;
             self.run_(reads)?;
         }
         Ok(())
