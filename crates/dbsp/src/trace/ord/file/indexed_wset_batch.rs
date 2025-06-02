@@ -412,15 +412,11 @@ where
             cursor.step_key();
         }
 
-        let mut multifetch0 = self.file.multifetch_indexed_zset(&*keys_vec).unwrap();
-        while !multifetch0.is_done() {
-            multifetch0.wait().unwrap();
+        let mut multifetch = self.file.multifetch_indexed_zset(&*keys_vec).unwrap();
+        while !multifetch.is_done() {
+            multifetch.wait().unwrap();
         }
-        let mut multifetch1 = multifetch0.next_column().unwrap();
-        while !multifetch1.is_done() {
-            multifetch1.wait().unwrap();
-        }
-        let results = multifetch1.results(self.factories.vec_indexed_wset_factory.clone());
+        let results = multifetch.results(self.factories.vec_indexed_wset_factory.clone());
 
         Some(Box::new(CursorFactoryWrapper(results)))
     }

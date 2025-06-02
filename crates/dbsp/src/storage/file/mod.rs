@@ -931,16 +931,11 @@ mod test {
         }
         let expected = expected.done();
 
-        let mut multifetch0 = reader.multifetch_indexed_zset(&*keys).unwrap();
-        while !multifetch0.is_done() {
-            multifetch0.wait().unwrap();
+        let mut multifetch = reader.multifetch_indexed_zset(&*keys).unwrap();
+        while !multifetch.is_done() {
+            multifetch.wait().unwrap();
         }
-        let mut multifetch1 = multifetch0.next_column().unwrap();
-        while !multifetch1.is_done() {
-            multifetch1.wait().unwrap();
-        }
-
-        let output = multifetch1.results(vec_indexed_wset_factories);
+        let output = multifetch.results(vec_indexed_wset_factories);
         assert_eq!(&output, &expected);
     }
 

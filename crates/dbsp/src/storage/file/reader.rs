@@ -1941,13 +1941,6 @@ where
         MultifetchZSet::new(self, keys)
     }
 
-    pub fn multifetch_indexed_zset<'a, 'b>(
-        &'a self,
-        keys: &'b DynVec<K>,
-    ) -> Result<Multifetch0<'a, 'b, K, A, N, (&'static K, &'static A, N)>, Error> {
-        Multifetch0::new(self, keys)
-    }
-
     /// Returns an [AsyncRowGroup] for all of the rows in column 0.
     ///
     /// Use [Reader::new_async_context] to create `context`.
@@ -1959,6 +1952,21 @@ where
             row_group: self.rows(),
             context,
         }
+    }
+}
+
+impl<K0, A0, K1, A1> Reader<(&'static K0, &'static A0, (&'static K1, &'static A1, ()))>
+where
+    K0: DataTrait + ?Sized,
+    A0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
+{
+    pub fn multifetch_indexed_zset<'a, 'b>(
+        &'a self,
+        keys: &'b DynVec<K0>,
+    ) -> Result<MultifetchIndexedZSet<'a, 'b, K0, A0, K1, A1>, Error> {
+        MultifetchIndexedZSet::new(self, keys)
     }
 }
 
@@ -4426,6 +4434,94 @@ struct MultifetchZSetReadResults {
     results: Vec<Result<Arc<FBuf>, StorageError>>,
 }
 
+pub enum MultifetchIndexedZSet<'a, 'b, K0, A0, K1, A1>
+where
+    K0: DataTrait + ?Sized,
+    A0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
+{
+    Column0(
+        Option<
+            Multifetch0<
+                'a,
+                'b,
+                K0,
+                A0,
+                (&'static K1, &'static A1, ()),
+                (&'static K0, &'static A0, (&'static K1, &'static A1, ())),
+            >,
+        >,
+    ),
+    Column1(
+        Multifetch1<'a, K0, K1, A1, (&'static K0, &'static A0, (&'static K1, &'static A1, ()))>,
+    ),
+}
+
+impl<'a, 'b, K0, A0, K1, A1> MultifetchIndexedZSet<'a, 'b, K0, A0, K1, A1>
+where
+    K0: DataTrait + ?Sized,
+    A0: DataTrait + ?Sized,
+    K1: DataTrait + ?Sized,
+    A1: WeightTrait + ?Sized,
+{
+    fn new(
+        reader: &'a Reader<(&'static K0, &'static A0, (&'static K1, &'static A1, ()))>,
+        keys: &'b DynVec<K0>,
+    ) -> Result<Self, Error> {
+        Ok(Self::Column0(Some(Multifetch0::new(reader, keys)?)))
+    }
+
+    pub fn wait(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Column0(option0) => {
+                let inner0 = option0.as_mut().unwrap();
+                inner0.wait()?;
+                if inner0.is_done() {
+                    let inner0 = option0.take().unwrap();
+                    *self = Self::Column1(inner0.next_column()?);
+                }
+                Ok(())
+            }
+            Self::Column1(inner1) => inner1.wait(),
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        match self {
+            MultifetchIndexedZSet::Column0(option0) => option0.as_ref().unwrap().is_done(),
+            MultifetchIndexedZSet::Column1(multifetch1) => multifetch1.is_done(),
+        }
+    }
+
+    pub fn results(
+        self,
+        factories: VecIndexedWSetFactories<K0, K1, A1>,
+    ) -> VecIndexedWSet<K0, K1, A1> {
+        match self {
+            MultifetchIndexedZSet::Column0(multifetch0) => {
+                panic!("can't get results because MultifetchIndexedZSet is not done yet")
+            }
+            MultifetchIndexedZSet::Column1(multifetch1) => multifetch1.results(factories),
+        }
+    }
+
+    pub async fn async_results(
+        self,
+        factories: VecIndexedWSetFactories<K0, K1, A1>,
+    ) -> Result<VecIndexedWSet<K0, K1, A1>, Error> {
+        let multifetch1 = match self {
+            MultifetchIndexedZSet::Column0(option0) => {
+                let mut inner0 = option0.unwrap();
+                inner0.async_run().await?;
+                inner0.next_column()?
+            }
+            MultifetchIndexedZSet::Column1(multifetch1) => multifetch1,
+        };
+        multifetch1.async_results(factories).await
+    }
+}
+
 pub struct Multifetch0<'a, 'b, K, A, N, T>
 where
     K: DataTrait + ?Sized,
@@ -4436,8 +4532,8 @@ where
     cache: Arc<BufferCache>,
     factories: Factories<K, A>,
 
-    receiver: Receiver<Multifetch0ReadResults>,
-    sender: Sender<Multifetch0ReadResults>,
+    receiver: UnboundedReceiver<Multifetch0ReadResults>,
+    sender: UnboundedSender<Multifetch0ReadResults>,
 
     tmp_key: Box<K>,
     tmp_key2: Box<K>,
@@ -4456,7 +4552,7 @@ where
 {
     fn new(reader: &'a Reader<T>, keys: &'b DynVec<K>) -> Result<Self, Error> {
         debug_assert!(keys.is_sorted_by(&|a, b| a.cmp(b)));
-        let (sender, receiver) = channel();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let factories = reader.columns[0].factories.factories();
         let output = factories.keys_factory.default_box();
         let tmp_key = factories.key_factory.default_box();
@@ -4503,10 +4599,21 @@ where
         (self.output, self.row_groups)
     }
 
+    pub async fn async_run(&mut self) -> Result<(), Error> {
+        while !self.is_done() {
+            let mut reads = Vec::new();
+            let msg = self.receiver.recv().await.unwrap();
+            self.process_results(msg, &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(())
+    }
+
     pub fn wait(&mut self) -> Result<(), Error> {
         if !self.is_done() {
             let mut reads = Vec::new();
-            self.process_results(self.receiver.recv().unwrap(), &mut reads)?;
+            let msg = self.receiver.blocking_recv().unwrap();
+            self.process_results(msg, &mut reads)?;
             self.run_(reads)?;
         }
         Ok(())
@@ -4687,8 +4794,8 @@ where
     cache: Arc<BufferCache>,
     factories: Factories<K1, A1>,
 
-    receiver: Receiver<Multifetch1ReadResults>,
-    sender: Sender<Multifetch1ReadResults>,
+    receiver: UnboundedReceiver<Multifetch1ReadResults>,
+    sender: UnboundedSender<Multifetch1ReadResults>,
 
     keys: Box<DynVec<K0>>,
     offs: Vec<usize>,
@@ -4746,7 +4853,7 @@ where
             })
             .collect::<Vec<_>>();
 
-        let (sender, receiver) = channel();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut this = Self {
             reader: source.reader,
             cache: source.cache,
@@ -4816,10 +4923,24 @@ where
         VecIndexedWSet::from_parts(factories, self.keys, self.offs, self.vals, self.diffs)
     }
 
+    pub async fn async_results(
+        mut self,
+        factories: VecIndexedWSetFactories<K0, K1, A1>,
+    ) -> Result<VecIndexedWSet<K0, K1, A1>, Error> {
+        while !self.is_done() {
+            let mut reads = Vec::new();
+            let msg = self.receiver.recv().await.unwrap();
+            self.process_results(msg, &mut reads)?;
+            self.run_(reads)?;
+        }
+        Ok(self.results(factories))
+    }
+
     pub fn wait(&mut self) -> Result<(), Error> {
         if !self.is_done() {
             let mut reads = Vec::new();
-            self.process_results(self.receiver.recv().unwrap(), &mut reads)?;
+            let msg = self.receiver.blocking_recv().unwrap();
+            self.process_results(msg, &mut reads)?;
             self.run_(reads)?;
         }
         Ok(())
