@@ -892,7 +892,7 @@ mod test {
         }
         let expected = expected.done();
 
-        let mut multifetch = reader.multifetch_zset(&*keys).unwrap();
+        let mut multifetch = reader.fetch_zset(&*keys).unwrap();
         while !multifetch.is_done() {
             multifetch.wait().unwrap();
         }
@@ -931,7 +931,7 @@ mod test {
         }
         let expected = expected.done();
 
-        let mut multifetch = reader.multifetch_indexed_zset(&*keys).unwrap();
+        let mut multifetch = reader.fetch_indexed_zset(&*keys).unwrap();
         while !multifetch.is_done() {
             multifetch.wait().unwrap();
         }

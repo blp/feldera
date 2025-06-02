@@ -414,7 +414,7 @@ where
 
         let results = self
             .file
-            .multifetch_indexed_zset(&*keys_vec)
+            .fetch_indexed_zset(&*keys_vec)
             .unwrap()
             .async_results(self.factories.vec_indexed_wset_factory.clone())
             .await

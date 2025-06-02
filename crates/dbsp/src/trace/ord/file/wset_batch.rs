@@ -417,7 +417,7 @@ where
 
         let results = self
             .file
-            .multifetch_zset(&*keys_vec)
+            .fetch_zset(&*keys_vec)
             .unwrap()
             .async_results(self.factories.vec_wset_factory.clone())
             .await
