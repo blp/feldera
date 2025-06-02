@@ -296,7 +296,6 @@ impl ColumnWriter {
         let rows = data_block.rows();
         let (block, location) =
             block_writer.write_block(data_block.raw, self.parameters.compression)?;
-        dbg!(("data", &location));
 
         let tree_node = TreeNode {
             location,
@@ -334,7 +333,6 @@ impl ColumnWriter {
             let n_rows = index_block.n_rows();
             let (block, location) =
                 block_writer.write_block(index_block.raw, self.parameters.compression)?;
-            dbg!(("index", &location));
             block_writer.insert_cache_entry(
                 location,
                 Arc::new(
