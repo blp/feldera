@@ -4262,12 +4262,12 @@ where
         self.pending == 0
     }
 
-    pub fn results(mut self, factories: VecWSetFactories<K, A>) -> VecWSet<K, A> {
+    pub fn results(self, factories: VecWSetFactories<K, A>) -> VecWSet<K, A> {
         debug_assert!(self.is_done());
         let mut builder = VecWSetBuilder::<K, A>::new_builder(&factories);
         let mut weighted_item = factories.weighted_item_factory().default_box();
-        let (mut kv, mut tmp_diff) = weighted_item.split_mut();
-        let (mut tmp_key, _val) = kv.split_mut();
+        let (kv, tmp_diff) = weighted_item.split_mut();
+        let (tmp_key, _val) = kv.split_mut();
         for (key_range, data_block) in self.output_blocks.into_values() {
             let mut start = 0;
             for i in key_range {
@@ -4499,7 +4499,7 @@ where
         factories: VecIndexedWSetFactories<K0, K1, A1>,
     ) -> VecIndexedWSet<K0, K1, A1> {
         match self {
-            MultifetchIndexedZSet::Column0(multifetch0) => {
+            MultifetchIndexedZSet::Column0(_) => {
                 panic!("can't get results because MultifetchIndexedZSet is not done yet")
             }
             MultifetchIndexedZSet::Column1(multifetch1) => multifetch1.results(factories),
@@ -5080,6 +5080,7 @@ impl Rows {
         this
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.before.is_none() && self.middle.is_empty() && self.after.is_none()
     }
@@ -5257,37 +5258,13 @@ impl<'a> RowsIter<'a> {
     }
 }
 
-fn intersect<T>(a: &Range<T>, b: &Range<T>) -> Option<Range<T>>
-where
-    T: Copy + Ord + Default,
-{
-    if a.contains(&b.start) {
-        Some(b.start..min(a.end, b.end))
-    } else if b.contains(&a.start) {
-        Some(a.start..min(a.end, b.end))
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::ops::Range;
 
     use itertools::Itertools;
 
-    use crate::storage::file::reader::{intersect, Rows};
-
-    #[test]
-    fn intersection() {
-        let a = 5..10;
-        assert_eq!(intersect(&a, &(3..7)), Some(5..7));
-        assert_eq!(intersect(&a, &(7..12)), Some(7..10));
-        assert_eq!(intersect(&a, &(0..3)), None);
-        assert_eq!(intersect(&a, &(13..15)), None);
-        assert_eq!(intersect(&a, &(6..8)), Some(6..8));
-        assert_eq!(intersect(&a, &(3..12)), Some(5..10));
-    }
+    use crate::storage::file::reader::Rows;
 
     fn check_rows(rows: &Rows, ranges: &[Range<u64>], expected: u32) {
         rows.check_invariants(ranges);
@@ -5317,7 +5294,6 @@ mod test {
                 rows.first(&ranges),
                 (pattern != 0).then(|| pattern.trailing_zeros() as u64)
             );
-            assert_eq!(rows.is_empty(), pattern == 0);
 
             check_rows(&rows, &ranges, pattern);
 

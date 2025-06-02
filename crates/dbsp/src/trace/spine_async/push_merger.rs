@@ -101,10 +101,12 @@ where
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_done(&self) -> bool {
         self.cursors.iter().all(|cursor| cursor.key() == Ok(None))
     }
 
+    #[allow(dead_code)]
     pub fn is_ready(&self) -> bool {
         self.cursors.iter().all(|cursor| cursor.key().is_ok())
     }
