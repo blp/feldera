@@ -331,7 +331,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::{marker::PhantomData, sync::Arc, time::Instant};
+    use std::{marker::PhantomData, sync::Arc};
 
     use crate::{
         dynamic::{Factory, LeanVec, Vector, WithFactory},
@@ -862,7 +862,7 @@ mod test {
         assert!(expected.next().is_none());
     }
 
-    fn test_multifetch<K, A, N>(
+    fn test_multifetch_one_column<K, A, N>(
         reader: &Reader<(&'static DynData, &'static DynData, N)>,
         n: usize,
         expected: impl Fn(usize) -> (K, K, K, A),
@@ -889,7 +889,40 @@ mod test {
         for i in 0..keys.len() {
             assert_eq!(&results[i], &keys[i]);
         }
-        dbg!()
+    }
+
+    fn test_multifetch_two_columns<T>(
+        reader: &Reader<(
+            &'static DynData,
+            &'static DynData,
+            (&'static DynData, &'static DynData, ()),
+        )>,
+    ) where
+        T: TwoColumns,
+    {
+        let keys_factory: &dyn Factory<dyn Vector<DynData>> =
+            WithFactory::<LeanVec<T::K0>>::FACTORY;
+        let mut keys = keys_factory.default_box();
+        for i in 0..T::n0() {
+            if rand::random() {
+                keys.push_ref(&T::key0(i));
+            }
+        }
+
+        let mut multifetch0 = reader.multifetch(&*keys).unwrap();
+        while !multifetch0.is_done() {
+            multifetch0.wait().unwrap();
+        }
+        let mut multifetch1 = multifetch0.next_column().unwrap();
+        while !multifetch1.is_done() {
+            multifetch1.wait().unwrap();
+        }
+        /*
+        let (results, _groups) = multifetch0.results();
+        assert_eq!(results.len(), keys.len());
+        for i in 0..keys.len() {
+            assert_eq!(&results[i], &keys[i]);
+        }*/
     }
 
     fn test_bloom<K, A, N>(
@@ -943,12 +976,6 @@ mod test {
         .await;
     }
 
-    fn time(line: u32, f: impl FnOnce()) {
-        let start = Instant::now();
-        f();
-        println!("{line}: {:.1}", start.elapsed().as_secs_f64());
-    }
-
     fn test_two_columns<T>(parameters: Parameters)
     where
         T: TwoColumns,
@@ -975,16 +1002,14 @@ mod test {
         )
         .unwrap();
         let n0 = T::n0();
-        time(line!(), || {
-            for row0 in 0..n0 {
-                for row1 in 0..T::n1(row0) {
-                    layer_file
-                        .write1((&T::key1(row0, row1), &T::aux1(row0, row1)))
-                        .unwrap();
-                }
-                layer_file.write0((&T::key0(row0), &T::aux0(row0))).unwrap();
+        for row0 in 0..n0 {
+            for row1 in 0..T::n1(row0) {
+                layer_file
+                    .write1((&T::key1(row0, row1), &T::aux1(row0, row1)))
+                    .unwrap();
             }
-        });
+            layer_file.write0((&T::key0(row0), &T::aux0(row0))).unwrap();
+        }
 
         let reader = layer_file.into_reader(test_buffer_cache).unwrap();
         reader.evict();
@@ -995,8 +1020,8 @@ mod test {
             let aux0 = T::aux0(row0);
             (before0, key0, after0, aux0)
         };
-        time(line!(), || test_cursor(&rows0, n0, expected0));
-        time(line!(), || test_bloom(&reader, n0, expected0));
+        test_cursor(&rows0, n0, expected0);
+        test_bloom(&reader, n0, expected0);
 
         let expected1 = |row0, row1| {
             let key1 = T::key1(row0, row1);
@@ -1004,52 +1029,45 @@ mod test {
             let aux1 = T::aux1(row0, row1);
             (before1, key1, after1, aux1)
         };
-        time(line!(), || {
-            for row0 in 0..n0 {
-                let rows1 = rows0.nth(row0 as u64).unwrap().next_column().unwrap();
-                let n1 = T::n1(row0);
-                test_cursor(&rows1, n1, |row1| expected1(row0, row1));
-            }
-        });
-        time(line!(), || {
-            test_bulk_rows(reader.bulk_rows().unwrap(), Column0::<T>::new());
-        });
-        time(line!(), || {
-            test_bulk_rows(
-                reader.bulk_rows().unwrap().next_column().unwrap(),
-                Column1::<T>::new(),
-            )
-        });
-        time(line!(), || {
-            TOKIO.block_on(async {
-                // Force some blocking due to I/O, to test those cases in
-                // [AsyncCacheContext].
-                reader.evict();
+        for row0 in 0..n0 {
+            let rows1 = rows0.nth(row0 as u64).unwrap().next_column().unwrap();
+            let n1 = T::n1(row0);
+            test_cursor(&rows1, n1, |row1| expected1(row0, row1));
+        }
+        test_bulk_rows(reader.bulk_rows().unwrap(), Column0::<T>::new());
+        test_bulk_rows(
+            reader.bulk_rows().unwrap().next_column().unwrap(),
+            Column1::<T>::new(),
+        );
+        test_multifetch_two_columns::<T>(&reader);
+        TOKIO.block_on(async {
+            // Force some blocking due to I/O, to test those cases in
+            // [AsyncCacheContext].
+            reader.evict();
 
-                let context = reader.new_async_context();
-                context
-                    .execute_tasks(
-                        reader.file_handle(),
-                        [async {
-                            let rows0 = reader.rows_async(&context);
-                            test_cursor_async(&rows0, n0, expected0).await;
+            let context = reader.new_async_context();
+            context
+                .execute_tasks(
+                    reader.file_handle(),
+                    [async {
+                        let rows0 = reader.rows_async(&context);
+                        test_cursor_async(&rows0, n0, expected0).await;
 
-                            for row0 in 0..n0 {
-                                let rows1 = rows0
-                                    .nth(row0 as u64)
-                                    .await
-                                    .unwrap()
-                                    .next_column()
-                                    .await
-                                    .unwrap();
-                                let n1 = T::n1(row0);
-                                test_cursor_async(&rows1, n1, |row1| expected1(row0, row1)).await;
-                            }
-                        }],
-                    )
-                    .await;
-            })
-        });
+                        for row0 in 0..n0 {
+                            let rows1 = rows0
+                                .nth(row0 as u64)
+                                .await
+                                .unwrap()
+                                .next_column()
+                                .await
+                                .unwrap();
+                            let n1 = T::n1(row0);
+                            test_cursor_async(&rows1, n1, |row1| expected1(row0, row1)).await;
+                        }
+                    }],
+                )
+                .await;
+        })
     }
 
     fn test_2_columns_helper(parameters: Parameters) {
@@ -1208,7 +1226,7 @@ mod test {
             test_cursor(&reader.rows(), n, &expected);
             test_bloom(&reader, n, &expected);
             test_bulk_rows(reader.bulk_rows().unwrap(), OneColumn::new(&expected, n));
-            test_multifetch(&reader, n, &expected);
+            test_multifetch_one_column(&reader, n, &expected);
 
             TOKIO.block_on(async {
                 // Force some blocking due to I/O, to test those cases in

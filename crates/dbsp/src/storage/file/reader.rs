@@ -1248,16 +1248,6 @@ where
         bound.deserialize_from_bytes(&self.raw, offset)
     }
 
-    fn get_row_range(&self, child_idx: usize) -> Range<u64> {
-        let start = if child_idx > 0 {
-            self.row_totals.get(&self.raw, child_idx - 1)
-        } else {
-            0
-        } + self.first_row;
-        let end = self.row_totals.get(&self.raw, child_idx) + self.first_row;
-        start..end
-    }
-
     unsafe fn find_exact<C>(
         &self,
         key_factory: &dyn Factory<K>,
@@ -1276,7 +1266,7 @@ where
                     break None;
                 }
                 let mid = start.midpoint(end);
-                let rows = self.get_row_range(mid);
+                let rows = self.get_rows(mid);
 
                 /// Compares `a` to `b` and reports their relationship.
                 fn compare_ranges(a: &Range<u64>, b: &Range<u64>) -> Case {
@@ -4319,7 +4309,6 @@ where
         read: MultifetchRead,
         reads: &mut Vec<MultifetchRead>,
     ) -> Result<(), Error> {
-        dbg!(&read);
         if let Some(tree_block) =
             TreeBlock::from_cache(&read.node, &self.cache, &*self.reader.file.file_handle).unwrap()
         {
@@ -4338,7 +4327,6 @@ where
     ) -> Result<(), Error> {
         match tree_block {
             TreeBlock::Data(data_block) => {
-                dbg!();
                 let mut start = 0;
                 for i in key_range.clone() {
                     let key = &self.keys[i];
@@ -4356,7 +4344,6 @@ where
                 }
             }
             TreeBlock::Index(index_block) => {
-                dbg!();
                 let mut child_idx = 0;
                 let mut i = key_range.start;
                 while i < key_range.end {
@@ -4403,6 +4390,23 @@ struct MultifetchReadResults {
     results: Vec<Result<Arc<FBuf>, StorageError>>,
 }
 
+#[derive(Debug)]
+struct Multifetch1Read {
+    keys: Rows,
+    node: TreeNode,
+}
+
+impl Multifetch1Read {
+    fn new(keys: Rows, node: TreeNode) -> Self {
+        Self { keys, node }
+    }
+}
+
+struct Multifetch1ReadResults {
+    reads: Vec<Multifetch1Read>,
+    results: Vec<Result<Arc<FBuf>, StorageError>>,
+}
+
 impl<'a, 'b, K, A, NK, NA, NN, T> Multifetch0<'a, 'b, K, A, (&'static NK, &'static NA, NN), T>
 where
     K: DataTrait + ?Sized,
@@ -4426,8 +4430,8 @@ where
     cache: Arc<BufferCache>,
     factories: Factories<K1, A1>,
 
-    receiver: Receiver<MultifetchReadResults>,
-    sender: Sender<MultifetchReadResults>,
+    receiver: Receiver<Multifetch1ReadResults>,
+    sender: Sender<Multifetch1ReadResults>,
 
     keys: Box<DynVec<K0>>,
     offs: Vec<usize>,
@@ -4435,6 +4439,11 @@ where
     diffs: Box<DynVec<A1>>,
 
     rows: Vec<Range<u64>>,
+
+    /// Next row to append to `vals` and `diffs`.
+    next_row: u64,
+
+    out_of_order: BTreeMap<u64, (Rows, Arc<DataBlock<K1, A1>>)>,
 
     pending: usize,
 }
@@ -4478,8 +4487,9 @@ where
                     Err((x, y))
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
 
+        let (sender, receiver) = channel();
         let mut this = Self {
             reader: source.reader,
             cache: source.cache,
@@ -4487,17 +4497,19 @@ where
             offs,
             vals: factories.keys_factory.default_box(),
             diffs: factories.auxes_factory.default_box(),
+            next_row: rows[0].start,
             rows,
             factories,
-            receiver: source.receiver,
-            sender: source.sender,
+            receiver,
+            sender,
+            out_of_order: BTreeMap::new(),
             pending: 0,
         };
         if !this.rows.is_empty() {
             if let Some(node) = &source.reader.columns[1].root {
                 let mut reads = Vec::new();
                 this.try_read(
-                    MultifetchRead::new(0..this.rows.len(), node.clone()),
+                    Multifetch1Read::new(Rows::new(&this.rows), node.clone()),
                     &mut reads,
                 )?;
                 this.start_reads(reads);
@@ -4506,14 +4518,14 @@ where
         Ok(this)
     }
 
-    fn start_reads(&mut self, reads: Vec<MultifetchRead>) {
+    fn start_reads(&mut self, reads: Vec<Multifetch1Read>) {
         if !reads.is_empty() {
             self.reader.file.file_handle.read_async(
                 reads.iter().map(|read| read.node.location).collect(),
                 {
                     let sender = self.sender.clone();
                     Box::new(move |results| {
-                        let _ = sender.send(MultifetchReadResults { reads, results });
+                        let _ = sender.send(Multifetch1ReadResults { reads, results });
                     })
                 },
             );
@@ -4522,14 +4534,13 @@ where
     }
     fn try_read(
         &mut self,
-        read: MultifetchRead,
-        reads: &mut Vec<MultifetchRead>,
+        read: Multifetch1Read,
+        reads: &mut Vec<Multifetch1Read>,
     ) -> Result<(), Error> {
-        dbg!(&read);
         if let Some(tree_block) =
             TreeBlock::from_cache(&read.node, &self.cache, &*self.reader.file.file_handle).unwrap()
         {
-            self.process_read(&read.keys, tree_block, reads)?;
+            self.process_read(read.keys, tree_block, reads)?;
         } else {
             reads.push(read);
         }
@@ -4548,7 +4559,6 @@ where
 
     pub fn wait(&mut self) -> Result<(), Error> {
         if !self.is_done() {
-            _ = ();
             let mut reads = Vec::new();
             self.process_results(self.receiver.recv().unwrap(), &mut reads)?;
             self.run_(reads)?;
@@ -4560,7 +4570,7 @@ where
         self.run_(Vec::new())
     }
 
-    fn run_(&mut self, mut reads: Vec<MultifetchRead>) -> Result<(), Error> {
+    fn run_(&mut self, mut reads: Vec<Multifetch1Read>) -> Result<(), Error> {
         while let Ok(results) = self.receiver.try_recv() {
             self.process_results(results, &mut reads)?;
         }
@@ -4570,8 +4580,8 @@ where
 
     fn process_results(
         &mut self,
-        results: MultifetchReadResults,
-        reads: &mut Vec<MultifetchRead>,
+        results: Multifetch1ReadResults,
+        reads: &mut Vec<Multifetch1Read>,
     ) -> Result<(), Error> {
         self.pending -= 1;
         for (read, result) in results.reads.into_iter().zip(results.results.into_iter()) {
@@ -4583,51 +4593,52 @@ where
                 self.reader.file_handle().file_id(),
             )
             .unwrap();
-            self.process_read(&read.keys, tree_block, reads)?;
+            self.process_read(read.keys, tree_block, reads)?;
         }
         Ok(())
     }
 
+    fn process_data_block(&mut self, rows: Rows, data_block: Arc<DataBlock<K1, A1>>) {
+        for row in rows.iter(&self.rows) {
+            self.vals
+                .push_with(&mut |val| unsafe { data_block.key_for_row(&self.factories, row, val) });
+            self.diffs.push_with(&mut |diff| unsafe {
+                data_block.aux_for_row(&self.factories, row, diff)
+            });
+        }
+        self.next_row = Rows::next(&self.rows, data_block.rows().end);
+    }
+
     fn process_read(
         &mut self,
-        rows_range: &Range<usize>,
+        mut rows: Rows,
         tree_block: TreeBlock<K1, A1>,
-        reads: &mut Vec<MultifetchRead>,
+        reads: &mut Vec<Multifetch1Read>,
     ) -> Result<(), Error> {
         match tree_block {
             TreeBlock::Data(data_block) => {
-                dbg!();
-                for rows in &self.rows[rows_range.clone()] {
-                    for row in intersect(rows, &data_block.rows()) {
-                        self.vals.push_with(&mut |val| unsafe {
-                            data_block.key_for_row(&self.factories, row, val)
-                        });
-                        self.diffs.push_with(&mut |diff| unsafe {
-                            data_block.aux_for_row(&self.factories, row, diff)
-                        });
+                let first_row = rows.first(&self.rows).unwrap();
+                if first_row == self.next_row {
+                    self.process_data_block(rows, data_block);
+                    while let Some(first_entry) = self.out_of_order.first_entry() {
+                        if &self.next_row != first_entry.key() {
+                            break;
+                        }
+                        let (rows, data_block) = first_entry.remove();
+                        self.process_data_block(rows, data_block);
                     }
+                } else {
+                    self.out_of_order.insert(first_row, (rows, data_block));
                 }
             }
             TreeBlock::Index(index_block) => {
-                let mut start = rows_range.start;
-                while start < rows_range.end {
-                    let intersection = intersect(&index_block.rows(), &self.rows[start]);
-                    if intersection.is_empty() {
-                        start += 1;
-                        continue;
-                    }
-
-                    let child_idx = index_block.find_row(intersection.start)?;
-                    let child = index_block.get_child(child_idx)?;
-                    let mut end = start;
-                    while end + 1 < rows_range.end
-                        && !intersect(&self.rows[end + 1], &child.rows).is_empty()
-                    {
-                        end += 1;
-                    }
-                    let read = MultifetchRead::new(start..end + 1, child);
+                while let Some(first_row) = rows.first(&self.rows) {
+                    let child_idx = index_block.find_row(first_row)?;
+                    let child_rows;
+                    (child_rows, rows) =
+                        rows.split(&self.rows, index_block.get_rows(child_idx).end);
+                    let read = Multifetch1Read::new(child_rows, index_block.get_child(child_idx)?);
                     self.try_read(read, reads)?;
-                    start = end;
                 }
             }
         }
@@ -4635,31 +4646,316 @@ where
     }
 }
 
-fn intersect<T>(a: &Range<T>, b: &Range<T>) -> Range<T>
+#[derive(Clone, Debug, Default)]
+struct Rows {
+    before: Option<Range<u64>>,
+    middle: Range<usize>,
+    after: Option<Range<u64>>,
+}
+
+impl Rows {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    #[allow(dead_code)]
+    fn check_invariants(&self, _rows: &[Range<u64>]) {
+        #[cfg(debug_assertions)]
+        {
+            if let Some(before) = &self.before {
+                assert!(!before.is_empty());
+                if !self.middle.is_empty() {
+                    assert!(before.end < _rows[self.middle.start].start);
+                }
+                if let Some(after) = &self.after {
+                    assert!(before.end < after.start);
+                }
+            }
+            if let Some(after) = &self.after {
+                assert!(!after.is_empty());
+                if !self.middle.is_empty() {
+                    assert!(_rows[self.middle.end - 1].end < after.start);
+                }
+            }
+        }
+    }
+
+    pub fn new(rows: &[Range<u64>]) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            for range in rows {
+                assert!(!range.is_empty());
+            }
+            for i in 1..rows.len() {
+                assert!(rows[i - 1].end < rows[i].start);
+            }
+        }
+
+        let this = Self {
+            before: None,
+            middle: 0..rows.len(),
+            after: None,
+        };
+        this.check_invariants(rows);
+        this
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.before.is_none() && self.middle.is_empty() && self.after.is_none()
+    }
+
+    /// Equivalent to `self.iter(rows).next()`.
+    pub fn first(&self, rows: &[Range<u64>]) -> Option<u64> {
+        if let Some(before) = &self.before {
+            Some(before.start)
+        } else if !self.middle.is_empty() {
+            Some(rows[self.middle.start].start)
+        } else if let Some(after) = &self.after {
+            Some(after.start)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the smallest row within the ranges in `rows` that is greater
+    /// than or equal to `row`, or `row` if `row` is greater than all of the
+    /// rows in `rows`.
+    pub fn next(rows: &[Range<u64>], row: u64) -> u64 {
+        match rows.binary_search_by_key(&row, |range| range.start) {
+            Ok(_) => row,
+            Err(0) if rows.is_empty() => row,
+            Err(0) => rows[0].start,
+            Err(index) if row < rows[index - 1].end => row,
+            Err(index) if index < rows.len() => rows[index].start,
+            _ => row,
+        }
+    }
+
+    pub fn iter<'a>(&self, rows: &'a [Range<u64>]) -> RowsIter<'a> {
+        RowsIter::new(self, rows)
+    }
+
+    /// Splits this set of rows into two at `row`.  Returns the rows before
+    /// `row` and the rest as new `Rows`.
+    pub fn split(self, rows: &[Range<u64>], row: u64) -> (Rows, Rows) {
+        fn split_range(range: &Range<u64>, row: u64) -> (Option<Range<u64>>, Option<Range<u64>>) {
+            if row == range.start {
+                (None, Some(range.clone()))
+            } else if row == range.end {
+                (Some(range.clone()), None)
+            } else {
+                debug_assert!(range.contains(&row));
+                (Some(range.start..row), Some(row..range.end))
+            }
+        }
+
+        if let Some(before) = &self.before {
+            if row < before.start {
+                return (Self::empty(), self);
+            } else if row <= before.end {
+                let split = split_range(before, row);
+                return (
+                    Self {
+                        before: split.0,
+                        ..Self::empty()
+                    },
+                    Self {
+                        before: split.1,
+                        ..self
+                    },
+                );
+            }
+        }
+
+        if let Some(after) = &self.after {
+            if row >= after.end {
+                return (self, Self::empty());
+            } else if row >= after.start {
+                let split = split_range(after, row);
+                return (
+                    Self {
+                        after: split.0,
+                        ..self
+                    },
+                    Self {
+                        after: split.1,
+                        ..Self::empty()
+                    },
+                );
+            }
+        }
+
+        match rows.binary_search_by_key(&row, |range| range.start) {
+            Ok(index) => (
+                Self {
+                    before: self.before,
+                    middle: self.middle.start..index,
+                    after: None,
+                },
+                Self {
+                    before: None,
+                    middle: index..self.middle.end,
+                    after: self.after,
+                },
+            ),
+            Err(0) => (
+                Self {
+                    before: self.before,
+                    middle: 0..0,
+                    after: None,
+                },
+                Self {
+                    before: None,
+                    ..self
+                },
+            ),
+            Err(index) if row >= rows[index - 1].end => (
+                Self {
+                    before: self.before,
+                    middle: self.middle.start..index,
+                    after: None,
+                },
+                Self {
+                    before: None,
+                    middle: index..self.middle.end,
+                    after: self.after,
+                },
+            ),
+            Err(index) => (
+                Self {
+                    before: self.before,
+                    middle: self.middle.start..index - 1,
+                    after: Some(rows[index - 1].start..row),
+                },
+                Self {
+                    before: Some(row..rows[index - 1].end),
+                    middle: index..self.middle.end,
+                    after: self.after,
+                },
+            ),
+        }
+    }
+}
+
+struct RowsIter<'a> {
+    rows: Rows,
+    range: Range<u64>,
+    ranges: &'a [Range<u64>],
+}
+
+impl<'a> Iterator for RowsIter<'a> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.range.is_empty() {
+            if let Some(before) = self.rows.before.take() {
+                self.range = before;
+            } else if !self.rows.middle.is_empty() {
+                self.range = self.ranges[self.rows.middle.start].clone();
+                self.rows.middle.start += 1;
+            } else if let Some(after) = self.rows.after.take() {
+                self.range = after;
+            } else {
+                return None;
+            }
+        }
+
+        debug_assert!(!self.range.is_empty());
+        let row = self.range.start;
+        self.range.start += 1;
+        Some(row)
+    }
+}
+
+impl<'a> RowsIter<'a> {
+    fn new(rows: &Rows, ranges: &'a [Range<u64>]) -> Self {
+        Self {
+            rows: rows.clone(),
+            range: 0..0,
+            ranges,
+        }
+    }
+}
+
+fn intersect<T>(a: &Range<T>, b: &Range<T>) -> Option<Range<T>>
 where
     T: Copy + Ord + Default,
 {
     if a.contains(&b.start) {
-        b.start..min(a.end, b.end)
+        Some(b.start..min(a.end, b.end))
     } else if b.contains(&a.start) {
-        a.start..min(a.end, b.end)
+        Some(a.start..min(a.end, b.end))
     } else {
-        Range::default()
+        None
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::storage::file::reader::intersect;
+    use std::ops::Range;
+
+    use itertools::Itertools;
+
+    use crate::storage::file::reader::{intersect, Rows};
 
     #[test]
     fn intersection() {
         let a = 5..10;
-        assert_eq!(intersect(&a, &(3..7)), 5..7);
-        assert_eq!(intersect(&a, &(7..12)), 7..10);
-        assert_eq!(intersect(&a, &(0..3)), 0..0);
-        assert_eq!(intersect(&a, &(13..15)), 0..0);
-        assert_eq!(intersect(&a, &(6..8)), 6..8);
-        assert_eq!(intersect(&a, &(3..12)), 5..10);
+        assert_eq!(intersect(&a, &(3..7)), Some(5..7));
+        assert_eq!(intersect(&a, &(7..12)), Some(7..10));
+        assert_eq!(intersect(&a, &(0..3)), None);
+        assert_eq!(intersect(&a, &(13..15)), None);
+        assert_eq!(intersect(&a, &(6..8)), Some(6..8));
+        assert_eq!(intersect(&a, &(3..12)), Some(5..10));
+    }
+
+    fn check_rows(rows: &Rows, ranges: &[Range<u64>], mut expected: u32) {
+        rows.check_invariants(ranges);
+        let mut actual = 0;
+        for row in rows.iter(&ranges) {
+            assert!((0..32).contains(&row));
+            actual |= 1 << row;
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rows() {
+        for pattern in 0..4096u32 {
+            let ranges = (0..12)
+                .map(|index| (pattern & (1 << index)) != 0)
+                .enumerate()
+                .dedup_by_with_count(|a, b| a.1 == b.1)
+                .filter_map(|(count, (offset, value))| {
+                    value.then(|| offset as u64..offset as u64 + count as u64)
+                })
+                .collect::<Vec<_>>();
+
+            let rows = Rows::new(&ranges);
+            check_rows(&rows, &ranges, pattern);
+            assert_eq!(
+                rows.first(&ranges),
+                (pattern != 0).then(|| pattern.trailing_zeros() as u64)
+            );
+            assert_eq!(rows.is_empty(), pattern == 0);
+
+            check_rows(&rows, &ranges, pattern);
+
+            for i in 0..=12 {
+                let (a, b) = rows.clone().split(&ranges, i);
+                check_rows(&a, &ranges, ((1 << i) - 1) & pattern);
+                check_rows(&b, &ranges, !((1 << i) - 1) & pattern);
+            }
+
+            for i in 0..=12 {
+                let remaining = !((1 << i) - 1) & pattern;
+                let next = if remaining != 0 {
+                    remaining.trailing_zeros()
+                } else {
+                    i
+                };
+                assert_eq!(Rows::next(&ranges, i as u64), next as u64);
+            }
+        }
     }
 }
