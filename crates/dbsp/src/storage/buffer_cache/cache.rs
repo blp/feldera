@@ -58,7 +58,7 @@ struct CacheValue {
     serial: u64,
 }
 
-pub trait CacheEntry: Any + Send + Sync + Debug {
+pub trait CacheEntry: Any + Send + Sync {
     fn cost(&self) -> usize;
 }
 
