@@ -28,7 +28,7 @@
 
 use crate::circuit::metadata::{MetaItem, OperatorMeta};
 use crate::circuit::GlobalNodeId;
-use crate::dynamic::{ClonableTrait, DynDataTyped, DynUnit, Vector, Weight};
+use crate::dynamic::{ClonableTrait, DynDataTyped, DynUnit, Weight};
 use crate::storage::buffer_cache::CacheStats;
 pub use crate::storage::file::{Deserializable, Deserializer, Rkyv, Serializer};
 use crate::trace::cursor::{

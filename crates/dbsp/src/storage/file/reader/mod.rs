@@ -31,7 +31,6 @@ use crc32c::crc32c;
 use fastbloom::BloomFilter;
 use feldera_storage::file::FileId;
 use feldera_storage::StoragePath;
-use futures::future::Either;
 use smallvec::{smallvec, SmallVec};
 use snap::raw::{decompress_len, Decoder};
 use std::mem::replace;
@@ -458,65 +457,6 @@ where
     }
 }
 
-struct DataBlockReader<'a> {
-    file: &'a ImmutableFileRef,
-    node: &'a TreeNode,
-    start: Instant,
-    cache: Arc<BufferCache>,
-    access: CacheAccess,
-}
-
-impl<'a> DataBlockReader<'a> {
-    fn new<K, A>(
-        file: &'a ImmutableFileRef,
-        node: &'a TreeNode,
-    ) -> Result<Either<Self, Arc<DataBlock<K, A>>>, Error>
-    where
-        K: DataTrait + ?Sized,
-        A: DataTrait + ?Sized,
-    {
-        let start = Instant::now();
-        let cache = (file.cache)();
-        #[allow(clippy::borrow_deref_ref)]
-        let (access, entry) = match cache.get(&*file.file_handle, node.location) {
-            Some(entry) => (CacheAccess::Hit, Some(entry)),
-            None => (CacheAccess::Miss, None),
-        };
-        let this = Self {
-            file,
-            node,
-            start,
-            cache,
-            access,
-        };
-        match entry {
-            Some(entry) => Ok(Either::Right(this.complete(entry)?)),
-            None => Ok(Either::Left(this)),
-        }
-    }
-    fn complete<K, A>(self, cache_entry: Arc<dyn CacheEntry>) -> Result<Arc<DataBlock<K, A>>, Error>
-    where
-        K: DataTrait + ?Sized,
-        A: DataTrait + ?Sized,
-    {
-        let data_block = DataBlock::from_cache_entry(cache_entry, self.node.location)?;
-        self.file
-            .stats
-            .record(self.access, self.start.elapsed(), self.node.location);
-
-        if data_block.rows() != self.node.rows {
-            return Err(CorruptionError::DataBlockWrongRows {
-                location: self.node.location,
-                rows: data_block.rows(),
-                expected_rows: self.node.rows.clone(),
-            }
-            .into());
-        }
-
-        Ok(data_block)
-    }
-}
-
 impl<K, A> DataBlock<K, A>
 where
     K: DataTrait + ?Sized,
@@ -572,19 +512,35 @@ where
             .downcast()
             .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))
     }
-    fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
-        match DataBlockReader::new(file, node)? {
-            Either::Left(data_block_reader) => {
-                let entry = Self::from_raw_with_cache(
-                    file.read_blocking(node.location)?,
-                    node,
-                    &data_block_reader.cache,
-                    file.file_handle.file_id(),
-                )?;
-                data_block_reader.complete(entry)
+
+    fn new(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
+        let start = Instant::now();
+        let cache = (file.cache)();
+        #[allow(clippy::borrow_deref_ref)]
+        let (access, entry) = match cache.get(&*file.file_handle, node.location) {
+            Some(entry) => (
+                CacheAccess::Hit,
+                Self::from_cache_entry(entry, node.location)?,
+            ),
+            None => {
+                let block = file.read_blocking(node.location)?;
+                let entry =
+                    Self::from_raw_with_cache(block, node, &cache, file.file_handle.file_id())?;
+                (CacheAccess::Miss, entry)
             }
-            Either::Right(data_block) => Ok(data_block),
+        };
+        file.stats.record(access, start.elapsed(), node.location);
+
+        if entry.rows() != node.rows {
+            return Err(CorruptionError::DataBlockWrongRows {
+                location: node.location,
+                rows: entry.rows(),
+                expected_rows: node.rows.clone(),
+            }
+            .into());
         }
+
+        Ok(entry)
     }
 
     fn n_values(&self) -> usize {
@@ -783,8 +739,8 @@ impl TreeNode {
         A: DataTrait + ?Sized,
     {
         match self.node_type {
-            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new_blocking(file, self)?)),
-            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new_blocking(file, self)?)),
+            NodeType::Data => Ok(TreeBlock::Data(DataBlock::new(file, self)?)),
+            NodeType::Index => Ok(TreeBlock::Index(IndexBlock::new(file, self)?)),
         }
     }
     fn read_blocking_multiple<K, A, const N: usize>(
@@ -933,71 +889,6 @@ where
     }
 }
 
-struct IndexBlockReader<'a> {
-    file: &'a ImmutableFileRef,
-    node: &'a TreeNode,
-    start: Instant,
-    cache: Arc<BufferCache>,
-    access: CacheAccess,
-}
-
-impl<'a> IndexBlockReader<'a> {
-    fn new<K>(
-        file: &'a ImmutableFileRef,
-        node: &'a TreeNode,
-    ) -> Result<Either<Self, Arc<IndexBlock<K>>>, Error>
-    where
-        K: DataTrait + ?Sized,
-    {
-        let start = Instant::now();
-        let cache = (file.cache)();
-        #[allow(clippy::borrow_deref_ref)]
-        let (access, entry) = match cache.get(&*file.file_handle, node.location) {
-            Some(entry) => (CacheAccess::Hit, Some(entry)),
-            None => (CacheAccess::Miss, None),
-        };
-        let this = Self {
-            file,
-            node,
-            start,
-            cache,
-            access,
-        };
-        match entry {
-            Some(entry) => Ok(Either::Right(this.complete(entry)?)),
-            None => Ok(Either::Left(this)),
-        }
-    }
-    fn complete<K>(self, cache_entry: Arc<dyn CacheEntry>) -> Result<Arc<IndexBlock<K>>, Error>
-    where
-        K: DataTrait + ?Sized,
-    {
-        let index_block = IndexBlock::from_cache_entry(cache_entry, self.node.location)?;
-        if index_block.first_row != self.node.rows.start {
-            return Err(Error::Corruption(CorruptionError::MultiplePaths(
-                self.node.location,
-            )));
-        }
-        self.file
-            .stats
-            .record(self.access, self.start.elapsed(), self.node.location);
-
-        let expected_rows = self.node.rows.end - self.node.rows.start;
-        let n_rows = index_block
-            .row_totals
-            .get(&index_block.raw, index_block.row_totals.count - 1);
-        if n_rows != expected_rows {
-            return Err(CorruptionError::IndexBlockWrongNumberOfRows {
-                location: self.node.location,
-                n_rows,
-                expected_rows,
-            }
-            .into());
-        }
-        Ok(index_block)
-    }
-}
-
 impl<K> IndexBlock<K>
 where
     K: DataTrait + ?Sized,
@@ -1084,19 +975,42 @@ where
             .ok_or(Error::Corruption(CorruptionError::BadBlockType(location)))
     }
 
-    fn new_blocking(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
-        match IndexBlockReader::new(file, node)? {
-            Either::Left(index_block_reader) => {
-                let entry = Self::from_raw_with_cache(
-                    file.read_blocking(node.location)?,
-                    &node,
-                    &index_block_reader.cache,
-                    file.file_handle.file_id(),
-                )?;
-                index_block_reader.complete(entry)
+    fn new(file: &ImmutableFileRef, node: &TreeNode) -> Result<Arc<Self>, Error> {
+        let start = Instant::now();
+        let cache = (file.cache)();
+        let first_row = node.rows.start;
+        #[allow(clippy::borrow_deref_ref)]
+        let (access, entry) = match cache.get(&*file.file_handle, node.location) {
+            Some(entry) => {
+                let entry = Self::from_cache_entry(entry, node.location)?;
+                if entry.first_row != first_row {
+                    return Err(Error::Corruption(CorruptionError::MultiplePaths(
+                        node.location,
+                    )));
+                }
+                (CacheAccess::Hit, entry)
             }
-            Either::Right(index_block) => Ok(index_block),
+            None => {
+                let block = file.read_blocking(node.location)?;
+                let entry =
+                    Self::from_raw_with_cache(block, node, &cache, file.file_handle.file_id())?;
+                (CacheAccess::Miss, entry)
+            }
+        };
+        file.stats.record(access, start.elapsed(), node.location);
+
+        let expected_rows = node.rows.end - node.rows.start;
+        let n_rows = entry.row_totals.get(&entry.raw, entry.row_totals.count - 1);
+        if n_rows != expected_rows {
+            return Err(CorruptionError::IndexBlockWrongNumberOfRows {
+                location: node.location,
+                n_rows,
+                expected_rows,
+            }
+            .into());
         }
+
+        Ok(entry)
     }
 
     /// Returns the range of rows covered by this index block.

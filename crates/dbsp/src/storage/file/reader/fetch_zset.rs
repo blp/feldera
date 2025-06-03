@@ -8,7 +8,7 @@ use crate::storage::{
     buffer_cache::{BufferCache, FBuf},
 };
 use crate::trace::ord::vec::wset_batch::VecWSetBuilder;
-use crate::trace::{BatchFactories, Builder, VecWSet, VecWSetFactories};
+use crate::trace::{BatchReaderFactories, Builder, VecWSet, VecWSetFactories};
 use smallvec::SmallVec;
 use std::{collections::BTreeMap, fmt::Debug, marker::PhantomData, ops::Range, sync::Arc};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -77,9 +77,7 @@ where
     pub fn results(self, factories: VecWSetFactories<K, A>) -> VecWSet<K, A> {
         debug_assert!(self.is_done());
         let mut builder = VecWSetBuilder::<K, A>::new_builder(&factories);
-        let mut weighted_item = factories.weighted_item_factory().default_box();
-        let (kv, tmp_diff) = weighted_item.split_mut();
-        let (tmp_key, _val) = kv.split_mut();
+        let mut tmp_diff = factories.weight_factory().default_box();
         let mut index_stack = SmallVec::<[usize; 10]>::new();
         let mut key_stack = factories.layer_factories.keys.default_box();
         key_stack.reserve_exact(10);
@@ -96,8 +94,8 @@ where
                         key,
                     )
                 } {
-                    unsafe { data_block.aux(&self.factories, child_index, tmp_diff) };
-                    builder.push_val_diff(&(), tmp_diff);
+                    unsafe { data_block.aux(&self.factories, child_index, &mut tmp_diff) };
+                    builder.push_val_diff(&(), &mut tmp_diff);
 
                     builder.push_key_mut(key_stack.last_mut().unwrap());
                     index_stack.pop().unwrap();
