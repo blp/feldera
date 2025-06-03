@@ -6,7 +6,6 @@ use super::format::{Compression, FileTrailer};
 use super::{AnyFactories, Factories};
 use crate::circuit::runtime::ThreadType;
 use crate::dynamic::{DynVec, WeightTrait};
-use crate::storage::buffer_cache::AsyncCacheContext;
 use crate::storage::buffer_cache::{CacheAccess, CacheEntry};
 use crate::storage::file::format::FilterBlock;
 use crate::storage::{
@@ -587,32 +586,6 @@ where
             Either::Right(data_block) => Ok(data_block),
         }
     }
-    async fn new_async(
-        file: &ImmutableFileRef,
-        context: &AsyncCacheContext,
-        node: TreeNode,
-    ) -> Result<Arc<Self>, Error> {
-        match DataBlockReader::new(file, &node)? {
-            Either::Left(data_block_reader) => {
-                let compression = file.compression;
-                let entry = context
-                    .read(
-                        node.location,
-                        move |raw| {
-                            Ok(Arc::new(Self::from_raw(
-                                decompress(compression, node.location, raw)?,
-                                node.location,
-                                node.rows.start,
-                            )?))
-                        },
-                        false,
-                    )
-                    .await?;
-                data_block_reader.complete(entry)
-            }
-            Either::Right(data_block) => Ok(data_block),
-        }
-    }
 
     fn n_values(&self) -> usize {
         self.value_map.len()
@@ -796,12 +769,6 @@ where
 }
 
 /// Metadata for reading an index or data node.
-///
-/// # Naming convention
-///
-/// In this API, functions that can block on I/O have names that end in
-/// `_blocking`. Thus, an `async` function should not call a `_blocking`
-/// function.
 #[derive(Clone, Debug)]
 pub(super) struct TreeNode {
     pub location: BlockLocation,
@@ -869,24 +836,6 @@ impl TreeNode {
             }
         } else {
             nodes[0].read_blocking(file)
-        }
-    }
-    async fn read_async<K, A>(
-        self,
-        file: &ImmutableFileRef,
-        context: &AsyncCacheContext,
-    ) -> Result<TreeBlock<K, A>, Error>
-    where
-        K: DataTrait + ?Sized,
-        A: DataTrait + ?Sized,
-    {
-        match self.node_type {
-            NodeType::Data => Ok(TreeBlock::Data(
-                DataBlock::new_async(file, context, self).await?,
-            )),
-            NodeType::Index => Ok(TreeBlock::Index(
-                IndexBlock::new_async(file, context, self).await?,
-            )),
         }
     }
 }
@@ -960,12 +909,6 @@ where
 }
 
 /// Index block.
-///
-/// # Naming convention
-///
-/// In this API, functions that can block on I/O have names that end in
-/// `_blocking`. Thus, an `async` function should not call a `_blocking`
-/// function.
 pub(super) struct IndexBlock<K>
 where
     K: DataTrait + ?Sized,
@@ -1150,32 +1093,6 @@ where
                     &index_block_reader.cache,
                     file.file_handle.file_id(),
                 )?;
-                index_block_reader.complete(entry)
-            }
-            Either::Right(index_block) => Ok(index_block),
-        }
-    }
-    async fn new_async(
-        file: &ImmutableFileRef,
-        context: &AsyncCacheContext,
-        node: TreeNode,
-    ) -> Result<Arc<Self>, Error> {
-        match IndexBlockReader::new(file, &node)? {
-            Either::Left(index_block_reader) => {
-                let compression = file.compression;
-                let entry = context
-                    .read(
-                        node.location,
-                        move |raw| {
-                            Ok(Arc::new(Self::from_raw(
-                                decompress(compression, node.location, raw)?,
-                                node.location,
-                                node.rows.start,
-                            )?))
-                        },
-                        true,
-                    )
-                    .await?;
                 index_block_reader.complete(entry)
             }
             Either::Right(index_block) => Ok(index_block),
@@ -1753,8 +1670,7 @@ where
 /// `T` in `Reader<T>` must be a [`ColumnSpec`] that specifies the key and
 /// auxiliary data types for all of the columns in the file to be read.
 ///
-/// Use [Reader::rows] to read data using blocking I/O and [Reader::rows_async]
-/// for an async API.
+/// Use [Reader::rows] to read data.
 #[derive(Debug)]
 pub struct Reader<T> {
     file: ImmutableFileRef,
@@ -1915,12 +1831,6 @@ where
     pub fn file_handle(&self) -> &dyn FileReader {
         &*self.file.file_handle
     }
-
-    /// Returns a context that can be used for performing overlapped I/O
-    /// operations on this reader.
-    pub fn new_async_context(&self) -> AsyncCacheContext {
-        AsyncCacheContext::new((self.file.cache)().clone(), &*self.file.file_handle)
-    }
 }
 
 impl<K, A, N> Reader<(&'static K, &'static A, N)>
@@ -1953,19 +1863,6 @@ where
         A: WeightTrait,
     {
         FetchZSet::new(self, keys)
-    }
-
-    /// Returns an [AsyncRowGroup] for all of the rows in column 0.
-    ///
-    /// Use [Reader::new_async_context] to create `context`.
-    pub fn rows_async<'a>(
-        &'a self,
-        context: &'a AsyncCacheContext,
-    ) -> AsyncRowGroup<'a, K, A, N, (&'static K, &'static A, N)> {
-        AsyncRowGroup {
-            row_group: self.rows(),
-            context,
-        }
     }
 }
 
@@ -2546,12 +2443,6 @@ where
 }
 
 /// A path from the root of a column to a data block.
-///
-/// # Naming convention
-///
-/// In this API, functions that can block on I/O have names that end in
-/// `_blocking`. Thus, an `async` function should not call a `_blocking`
-/// function.
 struct Path<K: DataTrait + ?Sized, A: DataTrait + ?Sized> {
     row: u64,
     indexes: Vec<Arc<IndexBlock<K>>>,
@@ -2627,19 +2518,6 @@ where
             row,
         )
     }
-    async fn for_row_async<N, T>(
-        row_group: &AsyncRowGroup<'_, K, A, N, T>,
-        row: u64,
-    ) -> Result<Self, Error> {
-        Self::for_row_from_ancestor_async(
-            &row_group.row_group.reader.file,
-            row_group.context,
-            Vec::new(),
-            row_group.row_group.root_node().unwrap(),
-            row,
-        )
-        .await
-    }
     fn for_row_from_ancestors_blocking<T, const N: usize>(
         reader: &Reader<T>,
         mut indexes: Vec<Arc<IndexBlock<K>>>,
@@ -2680,25 +2558,7 @@ where
             }
         }
     }
-    async fn for_row_from_ancestor_async(
-        file: &ImmutableFileRef,
-        context: &AsyncCacheContext,
-        mut indexes: Vec<Arc<IndexBlock<K>>>,
-        mut node: TreeNode,
-        row: u64,
-    ) -> Result<Self, Error> {
-        loop {
-            let block = node.read_async(file, context).await?;
-            let next = block.lookup_row(row)?;
-            match block {
-                TreeBlock::Data(data) => {
-                    return Ok(Self { row, indexes, data });
-                }
-                TreeBlock::Index(index) => indexes.push(index),
-            };
-            node = next.unwrap();
-        }
-    }
+
     fn find_ancestor(&self, row: u64) -> Result<(TreeNode, Vec<Arc<IndexBlock<K>>>), Error> {
         for (idx, index_block) in self.indexes.iter().enumerate().rev() {
             match index_block.get_child_by_row(row) {
@@ -2750,30 +2610,6 @@ where
             row,
         )
     }
-    async fn for_row_from_hint_async<N, T>(
-        row_group: &AsyncRowGroup<'_, K, A, N, T>,
-        hint: Option<&Self>,
-        row: u64,
-    ) -> Result<Self, Error> {
-        let Some(hint) = hint else {
-            return Self::for_row_async(row_group, row).await;
-        };
-        if hint.data.rows().contains(&row) {
-            return Ok(Self {
-                row,
-                ..hint.clone()
-            });
-        }
-        let (node, indexes) = hint.find_ancestor(row)?;
-        Self::for_row_from_ancestor_async(
-            &row_group.row_group.reader.file,
-            &row_group.context,
-            indexes,
-            node,
-            row,
-        )
-        .await
-    }
     unsafe fn key(&self, factories: &Factories<K, A>, key: &mut K) {
         self.data.key_for_row(factories, self.row, key)
     }
@@ -2796,21 +2632,6 @@ where
         } else {
             let (ancestors, indexes) = self.find_ancestors::<4>(row)?;
             *self = Self::for_row_from_ancestors_blocking(reader, indexes, ancestors, row)?;
-        }
-        Ok(())
-    }
-    async fn move_to_row_async(
-        &mut self,
-        file: &ImmutableFileRef,
-        context: &AsyncCacheContext,
-        row: u64,
-    ) -> Result<(), Error> {
-        if self.data.rows().contains(&row) {
-            self.row = row;
-        } else {
-            let (ancestor, indexes) = self.find_ancestor(row)?;
-            *self =
-                Self::for_row_from_ancestor_async(file, context, indexes, ancestor, row).await?;
         }
         Ok(())
     }
@@ -2881,54 +2702,6 @@ where
                 TreeBlock::Data(data_block) => {
                     return Ok(data_block
                         .find_exact(&row_group.factories, &row_group.rows, compare)
-                        .map(|child_idx| Self {
-                            row: data_block.first_row + child_idx as u64,
-                            indexes,
-                            data: data_block,
-                        }));
-                }
-            }
-        }
-    }
-
-    async unsafe fn find_exact_async<N, T, C>(
-        row_group: &AsyncRowGroup<'_, K, A, N, T>,
-        compare: &C,
-    ) -> Result<Option<Self>, Error>
-    where
-        T: ColumnSpec,
-        C: Fn(&K) -> Ordering,
-    {
-        let mut indexes = Vec::new();
-        let Some(mut node) = row_group.row_group.reader.columns[row_group.row_group.column]
-            .root
-            .clone()
-        else {
-            return Ok(None);
-        };
-        loop {
-            match node
-                .read_async(&row_group.row_group.reader.file, row_group.context)
-                .await?
-            {
-                TreeBlock::Index(index_block) => {
-                    let Some(child_idx) = index_block.find_exact(
-                        row_group.row_group.factories.key_factory,
-                        &row_group.row_group.rows,
-                        compare,
-                    ) else {
-                        return Ok(None);
-                    };
-                    node = index_block.get_child(child_idx)?;
-                    indexes.push(index_block);
-                }
-                TreeBlock::Data(data_block) => {
-                    return Ok(data_block
-                        .find_exact(
-                            &row_group.row_group.factories,
-                            &row_group.row_group.rows,
-                            compare,
-                        )
                         .map(|child_idx| Self {
                             row: data_block.first_row + child_idx as u64,
                             indexes,
@@ -3186,12 +2959,6 @@ where
     ) -> Result<Self, Error> {
         Ok(Self::Row(Path::for_row_blocking(row_group, row)?))
     }
-    async fn for_row_async<N, T>(
-        row_group: &AsyncRowGroup<'_, K, A, N, T>,
-        row: u64,
-    ) -> Result<Self, Error> {
-        Ok(Self::Row(Path::for_row_async(row_group, row).await?))
-    }
     fn for_row_from_hint_blocking<N, T>(
         row_group: &RowGroup<'_, K, A, N, T>,
         hint: &Self,
@@ -3205,15 +2972,6 @@ where
             hint.hint(),
             row,
         )?))
-    }
-    async fn for_row_from_hint_async<N, T>(
-        row_group: &AsyncRowGroup<'_, K, A, N, T>,
-        hint: &Self,
-        row: u64,
-    ) -> Result<Self, Error> {
-        Ok(Self::Row(
-            Path::for_row_from_hint_async(row_group, hint.hint(), row).await?,
-        ))
     }
     fn row(&self) -> Row {
         match self {
@@ -3264,33 +3022,6 @@ where
             Position::Row(path) => Some(path),
             Position::After { hint } => hint.as_ref(),
         }
-    }
-    async fn move_to_async<N, T>(
-        &mut self,
-        row_group: &AsyncRowGroup<'_, K, A, N, T>,
-        row: Row,
-    ) -> Result<(), Error> {
-        match row {
-            Row::Before => *self = Self::Before,
-            Row::After => self.move_after(),
-            Row::At(row) => match self {
-                Position::Before => *self = Self::Row(Path::for_row_async(row_group, row).await?),
-                Position::After { hint } => {
-                    *self = Self::Row(
-                        Path::for_row_from_hint_async(row_group, hint.as_ref(), row).await?,
-                    )
-                }
-                Position::Row(path) => {
-                    path.move_to_row_async(
-                        &row_group.row_group.reader.file,
-                        &row_group.context,
-                        row,
-                    )
-                    .await?
-                }
-            },
-        }
-        Ok(())
     }
 
     fn path(&self) -> Option<&Path<K, A>> {
@@ -3365,18 +3096,6 @@ where
     {
         Ok(Path::find_exact_blocking(row_group, compare)?.map(|path| Position::Row(path)))
     }
-    async unsafe fn find_exact_async<N, T, C>(
-        row_group: &AsyncRowGroup<'_, K, A, N, T>,
-        compare: &C,
-    ) -> Result<Option<Self>, Error>
-    where
-        T: ColumnSpec,
-        C: Fn(&K) -> Ordering,
-    {
-        Ok(Path::find_exact_async(row_group, compare)
-            .await?
-            .map(|path| Position::Row(path)))
-    }
     fn absolute_position<N, T>(&self, row_group: &RowGroup<K, A, N, T>) -> u64 {
         match self {
             Position::Before => row_group.rows.start,
@@ -3425,333 +3144,5 @@ where
             }
         }
         Ok(())
-    }
-}
-
-/// A [RowGroup] for use with Rust `async` and overlapping I/O.
-pub struct AsyncRowGroup<'a, K, A, N, T>
-where
-    K: DataTrait + ?Sized,
-    A: DataTrait + ?Sized,
-{
-    row_group: RowGroup<'a, K, A, N, T>,
-    context: &'a AsyncCacheContext,
-}
-
-impl<K, A, N, T> Clone for AsyncRowGroup<'_, K, A, N, T>
-where
-    K: DataTrait + ?Sized,
-    A: DataTrait + ?Sized,
-{
-    fn clone(&self) -> Self {
-        Self {
-            row_group: self.row_group.clone(),
-            context: self.context,
-        }
-    }
-}
-impl<'a, K, A, N, T> AsyncRowGroup<'a, K, A, N, T>
-where
-    K: DataTrait + ?Sized,
-    A: DataTrait + ?Sized,
-{
-    fn cursor(&self, position: Position<K, A>) -> AsyncCursor<'a, K, A, N, T> {
-        AsyncCursor {
-            row_group: self.clone(),
-            position,
-        }
-    }
-
-    /// Returns `true` if the row group contains no rows.
-    ///
-    /// The row group for column 0 is empty if and only if the layer file is
-    /// empty.  A row group obtained from [`Cursor::next_column`] is never
-    /// empty.
-    pub fn is_empty(&self) -> bool {
-        self.row_group.is_empty()
-    }
-
-    /// Returns the number of rows in the row group.
-    pub fn len(&self) -> u64 {
-        self.row_group.len()
-    }
-
-    /// Return a cursor for the first row in the row group, or just after the
-    /// row group if it is empty.
-    pub async fn first(&self) -> Result<AsyncCursor<'a, K, A, N, T>, Error> {
-        let position = if self.is_empty() {
-            Position::After { hint: None }
-        } else {
-            Position::for_row_async(self, self.row_group.rows.start).await?
-        };
-        Ok(self.cursor(position))
-    }
-
-    /// Return a cursor for the first row in the row group, or just after the
-    /// row group if it is empty, using `hint` as an internal starting point for
-    /// searching the B-tree. For best performance, use a `hint` near the first
-    /// row in the row group (but the result will be correct regardless of
-    /// `hint`).
-    pub async fn first_with_hint(
-        &self,
-        hint: &AsyncCursor<'a, K, A, N, T>,
-    ) -> Result<AsyncCursor<'a, K, A, N, T>, Error> {
-        let position = if self.is_empty() {
-            Position::After { hint: None }
-        } else {
-            Position::for_row_from_hint_async(self, &hint.position, self.row_group.rows.start)
-                .await?
-        };
-        Ok(self.cursor(position))
-    }
-
-    /// Return a cursor for the last row in the row group, or just after the
-    /// row group if it is empty.
-    pub async fn last(&self) -> Result<AsyncCursor<'a, K, A, N, T>, Error> {
-        let position = if self.is_empty() {
-            Position::After { hint: None }
-        } else {
-            Position::for_row_async(self, self.row_group.rows.end - 1).await?
-        };
-        Ok(self.cursor(position))
-    }
-
-    /// If `row` is less than the number of rows in the row group, returns a
-    /// cursor for that row; otherwise, returns a cursor for just after the row
-    /// group.
-    pub async fn nth(&self, row: u64) -> Result<AsyncCursor<'a, K, A, N, T>, Error> {
-        let position = if row < self.len() {
-            Position::for_row_async(self, self.row_group.rows.start + row).await?
-        } else {
-            Position::After { hint: None }
-        };
-        Ok(self.cursor(position))
-    }
-
-    /// If `target` exists in the row group, returns a cursor for it; otherwise,
-    /// returns `Ok(None)`.
-    pub async unsafe fn find_exact(
-        &self,
-        target: &K,
-    ) -> Result<Option<AsyncCursor<'a, K, A, N, T>>, Error>
-    where
-        T: ColumnSpec,
-    {
-        let mut cursor = self.before();
-        match cursor.seek_exact(target).await? {
-            true => Ok(Some(cursor)),
-            false => Ok(None),
-        }
-    }
-
-    /// Returns a cursor for just before the row group.
-    pub fn before(&self) -> AsyncCursor<'a, K, A, N, T> {
-        self.cursor(Position::Before)
-    }
-
-    /// Return a cursor for just after the row group.
-    pub fn after(&self) -> AsyncCursor<'a, K, A, N, T> {
-        self.cursor(Position::After { hint: None })
-    }
-
-    /// Returns a row group for a subset of the rows in this one.
-    pub fn subset<B>(&self, range: B) -> Self
-    where
-        B: RangeBounds<u64>,
-    {
-        Self {
-            row_group: self.row_group.subset(range),
-            context: self.context,
-        }
-    }
-}
-
-/// A [Cursor] for use with Rust `async` and overlapping I/O.
-pub struct AsyncCursor<'a, K, A, N, T>
-where
-    K: DataTrait + ?Sized,
-    A: DataTrait + ?Sized,
-{
-    row_group: AsyncRowGroup<'a, K, A, N, T>,
-    position: Position<K, A>,
-}
-
-impl<'a, K, A, N, T> AsyncCursor<'a, K, A, N, T>
-where
-    K: DataTrait + ?Sized,
-    A: DataTrait + ?Sized,
-{
-    /// Returns `true` if the cursor is on a row.
-    pub fn has_value(&self) -> bool {
-        self.position.has_value()
-    }
-
-    /// Returns the number of rows in the cursor's row group.
-    pub fn len(&self) -> u64 {
-        self.row_group.len()
-    }
-
-    /// Returns true if this cursor's row group has no rows.
-    pub fn is_empty(&self) -> bool {
-        self.row_group.is_empty()
-    }
-
-    fn rows(&self) -> &Range<u64> {
-        &self.row_group.row_group.rows
-    }
-
-    /// Moves to the next row in the row group.  If the cursor was previously
-    /// before the row group, it moves to the first row; if it was on the last
-    /// row, it moves after the row group.
-    pub async fn move_next(&mut self) -> Result<(), Error> {
-        self.position
-            .move_to_async(&self.row_group, self.position.row().next(self.rows()))
-            .await
-    }
-
-    /// Moves to the previous row in the row group.  If the cursor was
-    /// previously after the row group, it moves to the last row; if it was
-    /// on the first row, it moves before the row group.
-    pub async fn move_prev(&mut self) -> Result<(), Error> {
-        self.position
-            .move_to_async(&self.row_group, self.position.row().prev(self.rows()))
-            .await
-    }
-
-    /// Moves to the first row in the row group.  If the row group is empty,
-    /// this has no effect.
-    pub async fn move_first(&mut self) -> Result<(), Error> {
-        self.position
-            .move_to_async(&self.row_group, Row::first(self.rows()))
-            .await
-    }
-
-    /// Moves just before the row group.
-    pub fn move_before(&mut self) {
-        self.position = Position::Before;
-    }
-
-    /// Moves just after the row group.
-    pub fn move_after(&mut self) {
-        self.position.move_after();
-    }
-
-    /// Moves to the last row in the row group.  If the row group is empty,
-    /// this has no effect.
-    pub async fn move_last(&mut self) -> Result<(), Error> {
-        self.position
-            .move_to_async(&self.row_group, Row::last(self.rows()))
-            .await
-    }
-
-    /// Moves to row `row`.  If `row >= self.len()`, moves after the row group.
-    pub async fn move_to_row(&mut self, row: u64) -> Result<(), Error> {
-        self.position
-            .move_to_async(&self.row_group, Row::nth(self.rows(), row))
-            .await
-    }
-
-    /// Returns the row number of the current row, as an absolute number
-    /// relative to the top of the column rather than the top of the row group.
-    /// If the cursor is before the row group or on the first row, returns the
-    /// row number of the first row in the row group; if the cursor is after the
-    /// row group, returns the row number of the row just after the row group.
-    pub fn absolute_position(&self) -> u64 {
-        self.position.absolute_position(&self.row_group.row_group)
-    }
-
-    /// Returns the number of times [`move_next`](Self::move_next) may be called
-    /// before the cursor is after the row group.
-    pub fn remaining_rows(&self) -> u64 {
-        self.position.remaining_rows(&self.row_group.row_group)
-    }
-
-    /// Returns the key in the current row, or `None` if the cursor is before or
-    /// after the row group.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn key(&self, key: &'a mut K) -> Option<&'a mut K> {
-        self.position.key(&self.row_group.row_group.factories, key)
-    }
-
-    /// Returns the auxiliary data in the current row, or `None` if the cursor
-    /// is before or after the row group.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn aux<'b>(&self, aux: &'b mut A) -> Option<&'b mut A> {
-        self.position.aux(&self.row_group.row_group.factories, aux)
-    }
-
-    /// Returns the key and auxiliary data in the current row, or `None` if the
-    /// cursor is before or after the row group.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn item<'b>(&self, item: (&'b mut K, &'b mut A)) -> Option<(&'b mut K, &'b mut A)> {
-        self.position
-            .item(&self.row_group.row_group.factories, item)
-    }
-
-    /// Returns archived representation of the key and auxiliary data in the
-    /// current row, or `None` if the cursor is before or after the row
-    /// group.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub unsafe fn archived_item(&self) -> Option<&dyn ArchivedItem<'_, K, A>> {
-        self.position
-            .archived_item(&self.row_group.row_group.factories)
-    }
-
-    /// Moves the cursor to the row whose key is exactly `target`.  This
-    /// function does not move the cursor if no key is exactly `target`.
-    ///
-    /// # Safety
-    ///
-    /// Unsafe because `rkyv` deserialization is unsafe.
-    pub async unsafe fn seek_exact(&mut self, target: &K) -> Result<bool, Error>
-    where
-        T: ColumnSpec,
-    {
-        match Position::find_exact_async::<N, T, _>(&self.row_group, &|key| target.cmp(key)).await?
-        {
-            Some(position) => {
-                self.position = position;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-}
-
-impl<'a, K, A, NK, NA, NN, T> AsyncCursor<'a, K, A, (&'static NK, &'static NA, NN), T>
-where
-    K: DataTrait + ?Sized,
-    A: DataTrait + ?Sized,
-    NK: DataTrait + ?Sized,
-    NA: DataTrait + ?Sized,
-    T: ColumnSpec,
-{
-    /// Obtains the row group in the next column associated with the current
-    /// row.  If the cursor is on a row, the returned row group will contain at
-    /// least one row.  If the cursor is before or after the row group, the
-    /// returned row group will be empty.
-    ///
-    /// This method does not do I/O, but it can report [Error::Corruption].
-    pub async fn next_column<'b>(&'b self) -> Result<AsyncRowGroup<'a, NK, NA, NN, T>, Error> {
-        Ok(AsyncRowGroup {
-            row_group: RowGroup::new(
-                self.row_group.row_group.reader,
-                self.row_group.row_group.column + 1,
-                self.position.row_group()?,
-            ),
-            context: self.row_group.context,
-        })
     }
 }
