@@ -528,14 +528,14 @@ where
 
         Ok(entry)
     }
+
     fn n_values(&self) -> usize {
         self.value_map.len()
     }
     fn rows(&self) -> Range<u64> {
         self.first_row..(self.first_row + self.n_values() as u64)
     }
-    fn row_group(&self, row: u64) -> Result<Range<u64>, Error> {
-        let index = (row - self.first_row) as usize;
+    fn row_group(&self, index: usize) -> Result<Range<u64>, Error> {
         let row_groups = self.row_groups.as_ref().unwrap();
         let start = row_groups.get(&self.raw, index);
         let end = row_groups.get(&self.raw, index + 1);
@@ -550,6 +550,10 @@ where
             }
             .into())
         }
+    }
+    fn row_group_for_row(&self, row: u64) -> Result<Range<u64>, Error> {
+        let index = (row - self.first_row) as usize;
+        self.row_group(index)
     }
     unsafe fn archived_item(
         &self,
@@ -737,8 +741,8 @@ where
                 }
             }
             Self::Index(index_block) => {
-                if let Some(child_node) = index_block.get_child_by_row(row)? {
-                    return Ok(Some(child_node));
+                if index_block.rows().contains(&row) {
+                    return Ok(Some(index_block.get_child_by_row(row)?));
                 }
             }
         }
@@ -746,6 +750,7 @@ where
     }
 }
 
+/// Index block.
 pub(super) struct IndexBlock<K>
 where
     K: DataTrait + ?Sized,
@@ -920,10 +925,8 @@ where
         })
     }
 
-    fn get_child_by_row(&self, row: u64) -> Result<Option<TreeNode>, Error> {
-        self.find_row(row)
-            .map(|child_idx| self.get_child(child_idx))
-            .transpose()
+    fn get_child_by_row(&self, row: u64) -> Result<TreeNode, Error> {
+        self.get_child(self.find_row(row)?)
     }
 
     fn get_rows(&self, index: usize) -> Range<u64> {
@@ -946,7 +949,7 @@ where
         }
     }
 
-    fn find_row(&self, row: u64) -> Option<usize> {
+    fn find_row(&self, row: u64) -> Result<usize, Error> {
         let mut indexes = 0..self.n_children();
         while !indexes.is_empty() {
             let mid = indexes.start.midpoint(indexes.end);
@@ -956,10 +959,10 @@ where
             } else if row >= rows.end {
                 indexes.start = mid + 1;
             } else {
-                return Some(mid);
+                return Ok(mid);
             }
         }
-        None
+        Err(CorruptionError::MissingRow(row).into())
     }
 
     unsafe fn get_bound(&self, index: usize, bound: &mut K) {
@@ -2140,7 +2143,8 @@ where
             });
         }
         for (idx, index_block) in hint.indexes.iter().enumerate().rev() {
-            if let Some(node) = index_block.get_child_by_row(row)? {
+            if index_block.rows().contains(&row) {
+                let node = index_block.get_child_by_row(row)?;
                 return Self::for_row_from_ancestor(
                     row_group,
                     hint.indexes[0..=idx].to_vec(),
@@ -2165,7 +2169,7 @@ where
     }
 
     fn row_group(&self) -> Result<Range<u64>, Error> {
-        self.data.row_group(self.row)
+        self.data.row_group_for_row(self.row)
     }
     fn move_to_row<N, T>(
         &mut self,
@@ -2351,12 +2355,12 @@ where
         for index in &self.indexes {
             let n = index.n_children();
             match index.find_row(self.row) {
-                Some(i) => {
+                Ok(i) => {
                     let min_row = index.get_row_bound(i * 2);
                     let max_row = index.get_row_bound(i * 2 + 1);
                     write!(f, "\n[child {i} of {n}: rows {min_row}..={max_row}]",)?;
                 }
-                None => {
+                Err(_) => {
                     // This should not be possible because it indicates an
                     // invariant violation.  Possibly we should panic.
                     write!(f, " [unknown child of {n}]")?
