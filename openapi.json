@@ -3783,6 +3783,19 @@
           }
         }
       },
+      "ClockConfig": {
+        "type": "object",
+        "required": [
+          "clock_resolution_usecs"
+        ],
+        "properties": {
+          "clock_resolution_usecs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "ColumnType": {
         "type": "object",
         "description": "A SQL column type description.\n\nMatches the Calcite JSON format.",
