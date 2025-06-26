@@ -24,7 +24,7 @@ members = [
   "crates/datagen",
   "crates/iceberg",
   "crates/storage"
-, "crates/rest-api", "crates/ir", "crates/feldera-fp"]
+, "crates/rest-api", "crates/ir", "crates/fp"]
 exclude = [
   "sql-to-dbsp-compiler/temp",
   "sql-to-dbsp-compiler/experiments",

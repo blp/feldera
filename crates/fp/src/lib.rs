@@ -270,12 +270,22 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     }
 
     /// Integer division, as defined for `divide-integer` in [General Decimal
-    /// Arithmetic].  Returns `None` if `other` is zero or the result is out of
-    /// range for the result type.
+    /// Arithmetic].  Returns `None` if `other` is zero or the result is greater
+    /// than `i128::MAX`.
     ///
     /// [General Decimal Arithmetic]: https://speleotrove.com/decimal/decarith.pdf
     pub const fn checked_div_integer(self, other: Self) -> Option<i128> {
         self.0.checked_div(other.0)
+    }
+
+    /// Integer division like [checked_div_integer](Self::checked_div_integer),
+    /// but panic on error.
+    ///
+    /// # Panic
+    ///
+    /// Panics if `other` is zero or the result is greater than `i128::MAX`.
+    pub const fn strict_div_integer(self, other: Self) -> i128 {
+        self.checked_div_integer(other).unwrap()
     }
 
     /// Integer remainder, as defined for `remainder` in [General Decimal
@@ -285,6 +295,16 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     /// [General Decimal Arithmetic]: https://speleotrove.com/decimal/decarith.pdf
     pub const fn checked_rem_integer(self, other: Self) -> Option<i128> {
         self.0.checked_rem(other.0)
+    }
+
+    /// Integer remainder like [checked_rem_integer](Self::checked_rem_integer),
+    /// but panic on error.
+    ///
+    /// # Panic
+    ///
+    /// Panics if `other` is zero or the result is greater than `i128::MAX`.
+    pub const fn strict_rem_integer(self, other: Self) -> i128 {
+        self.checked_rem_integer(other).unwrap()
     }
 
     /// Returns the absolute value.
@@ -426,6 +446,59 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
                 )
             }
         }
+    }
+
+    /// Compute `self + other`, panicking if overflow occurs.
+    pub fn strict_add_generic<
+        const P1: usize,
+        const S1: usize,
+        const P2: usize,
+        const S2: usize,
+    >(
+        self,
+        other: Fixed<P1, S1>,
+    ) -> Fixed<P2, S2> {
+        self.checked_add_generic(other).unwrap()
+    }
+
+    /// Compute `self - other`, panicking if overflow occurs.
+    pub fn strict_sub_generic<
+        const P1: usize,
+        const S1: usize,
+        const P2: usize,
+        const S2: usize,
+    >(
+        self,
+        other: Fixed<P1, S1>,
+    ) -> Fixed<P2, S2> {
+        self.checked_sub_generic(other).unwrap()
+    }
+
+    /// Compute `self * other`, panicking if overflow occurs.
+    pub fn strict_mul_generic<
+        const P1: usize,
+        const S1: usize,
+        const P2: usize,
+        const S2: usize,
+    >(
+        self,
+        other: Fixed<P1, S1>,
+    ) -> Fixed<P2, S2> {
+        self.checked_mul_generic(other).unwrap()
+    }
+
+    /// Compute `self / other`, panicking if overflow occurs or if `other` is
+    /// zero.
+    pub fn strict_div_generic<
+        const P1: usize,
+        const S1: usize,
+        const P2: usize,
+        const S2: usize,
+    >(
+        self,
+        other: Fixed<P1, S1>,
+    ) -> Fixed<P2, S2> {
+        self.checked_div_generic(other).unwrap()
     }
 }
 
@@ -639,64 +712,69 @@ impl<const P: usize, const S: usize> FromStr for Fixed<P, S> {
     type Err = ParseFixedError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Accumulate digits into `value`.  Adjust `exponent` such that the
-        // parsed value is `value / 10**exponent`.
-        let mut value = 0;
-        let mut exponent = S as i32;
+        // Non-generic inner function to reduce monomorphization cost.
+        fn inner(s: &str, scale: i32) -> Option<(i128, i32)> {
+            // Accumulate digits into `value`.  Adjust `exponent` such that the
+            // parsed value is `value / 10**exponent`.
+            let mut value = 0;
+            let mut exponent = scale;
 
-        let mut saw_dot = false;
-        let mut saw_digit = false;
+            let mut saw_dot = false;
+            let mut saw_digit = false;
 
-        let mut sign = None;
-        enum Sign {
-            Positive,
-            Negative,
-        }
-
-        let mut iter = s.chars();
-        while let Some(c) = iter.next() {
-            match c {
-                '-' | '+' if sign.is_some() => return Err(ParseFixedError),
-                '-' => {
-                    sign = Some(Sign::Negative);
-                }
-                '+' => {
-                    sign = Some(Sign::Positive);
-                }
-                '0'..='9' => {
-                    saw_digit = true;
-                    if value < i128::MAX / 10 {
-                        value = value * 10 + (c as u8 - b'0') as i128;
-                        if saw_dot {
-                            exponent -= 1;
-                        }
-                    } else if !saw_dot {
-                        exponent += 1;
-                    }
-                }
-                '.' => {
-                    if saw_dot {
-                        return Err(ParseFixedError);
-                    }
-                    saw_dot = true;
-                }
-                'e' | 'E' => {
-                    exponent = exponent
-                        .checked_add(iter.as_str().parse().map_err(|_| ParseFixedError)?)
-                        .ok_or(ParseFixedError)?;
-                    break;
-                }
-                _ => return Err(ParseFixedError),
+            let mut sign = None;
+            enum Sign {
+                Positive,
+                Negative,
             }
+
+            let mut iter = s.chars();
+            while let Some(c) = iter.next() {
+                match c {
+                    '-' | '+' if sign.is_some() => return None,
+                    '-' => {
+                        sign = Some(Sign::Negative);
+                    }
+                    '+' => {
+                        sign = Some(Sign::Positive);
+                    }
+                    '0'..='9' => {
+                        saw_digit = true;
+                        if value < i128::MAX / 10 {
+                            value = value * 10 + (c as u8 - b'0') as i128;
+                            if saw_dot {
+                                exponent = exponent.checked_sub(1)?;
+                            }
+                        } else if !saw_dot {
+                            exponent = exponent.checked_add(1)?;
+                        }
+                    }
+                    '.' => {
+                        if saw_dot {
+                            return None;
+                        }
+                        saw_dot = true;
+                    }
+                    'e' | 'E' => {
+                        exponent = exponent.checked_add(iter.as_str().parse().ok()?)?;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            if !saw_digit {
+                return None;
+            }
+            let value = match sign {
+                Some(Sign::Negative) => -value,
+                _ => value,
+            };
+            Some((value, exponent))
         }
-        if !saw_digit {
-            return Err(ParseFixedError);
-        }
-        let value = match sign {
-            Some(Sign::Negative) => -value,
-            _ => value,
-        };
-        Self::try_new_with_exponent(value, exponent).ok_or(ParseFixedError)
+
+        inner(s, S as i32)
+            .and_then(|(value, exponent)| Self::try_new_with_exponent(value, exponent))
+            .ok_or(ParseFixedError)
     }
 }
 
