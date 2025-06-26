@@ -307,7 +307,7 @@ where
     }
 
     fn approximate_byte_size(&self) -> usize {
-        self.size_of().total_bytes()
+        self.layer.approximate_byte_size()
     }
 
     fn sample_keys<RG>(&self, rng: &mut RG, sample_size: usize, sample: &mut DynVec<Self::Key>)

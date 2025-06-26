@@ -313,6 +313,12 @@ where
             }
         }
     }
+
+    fn approximate_byte_size(&self) -> usize {
+        self.keys.approximate_byte_size()
+            + self.offs.size_of().total_bytes()
+            + self.vals.approximate_byte_size()
+    }
 }
 
 impl<K, L, O> Display for Layer<K, L, O>

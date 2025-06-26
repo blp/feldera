@@ -130,6 +130,8 @@ pub trait Trie: Sized {
         merger.push_merge(self.cursor(), other.cursor(), None);
         merger.done()
     }
+
+    fn approximate_byte_size(&self) -> usize;
 }
 
 /// A type used to assemble collections.
@@ -313,6 +315,9 @@ impl Trie for () {
     }
     fn cursor_from(&self, _lower: usize, _upper: usize) -> Self::Cursor<'_> {}
     fn merge(&self, _other: &Self) -> Self {}
+    fn approximate_byte_size(&self) -> usize {
+        0
+    }
 }
 
 impl Builder for () {

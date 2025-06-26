@@ -385,6 +385,10 @@ impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> Trie for Leaf<K, R> {
     fn cursor_from(&self, lower: usize, upper: usize) -> Self::Cursor<'_> {
         LeafCursor::new(lower, self, (lower, upper))
     }
+
+    fn approximate_byte_size(&self) -> usize {
+        self.keys.approximate_byte_size() + self.diffs.approximate_byte_size()
+    }
 }
 
 impl<K: DataTrait + ?Sized, R: WeightTrait + ?Sized> AddAssignByRef for Leaf<K, R> {
