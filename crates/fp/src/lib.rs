@@ -217,17 +217,21 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
                 };
 
                 // Round toward even.
-                let quotient = value.abs() / divisor;
-                let remainder = value.abs() % divisor;
-                let new_value = match remainder.cmp(&(divisor / 2)) {
-                    Ordering::Less => quotient,
-                    Ordering::Equal => quotient + quotient % 2,
-                    Ordering::Greater => quotient + 1,
+                //
+                // For negative `x` and positive `y`, `x / y` rounds toward 0
+                // and `x % y` is zero or negative.
+                debug_assert!(divisor >= 2);
+                let quotient = value / divisor;
+                let remainder = value % divisor;
+                let round_away_from_zero = match remainder.abs().cmp(&(divisor / 2)) {
+                    Ordering::Less => false,
+                    Ordering::Equal => (quotient % 2) != 0,
+                    Ordering::Greater => true,
                 };
-                if value < 0 {
-                    -new_value
+                if round_away_from_zero {
+                    quotient + quotient.signum()
                 } else {
-                    new_value
+                    quotient
                 }
             }
             Ordering::Equal => value,
