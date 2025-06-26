@@ -5,7 +5,7 @@ use std::{
     ops::{Deref, DerefMut, Index, IndexMut},
 };
 
-use rand::{thread_rng, Rng, RngCore};
+use rand::RngCore;
 
 use crate::{
     declare_trait_object,
@@ -262,21 +262,6 @@ pub trait Vector<T: DataTrait + ?Sized>: Data {
     ///
     /// This method will not be needed once trait downcasting has been stabilized.
     fn as_vec_mut(&mut self) -> &mut DynVec<T>;
-
-    fn approximate_byte_size(&self) -> usize {
-        if self.len() < 100 {
-            self.size_of().total_bytes()
-        } else {
-            let mut rng = thread_rng();
-            let total: usize = (0..100)
-                .map(|_| {
-                    let index = rng.gen_range(0..self.len());
-                    self.index(index).size_of().total_bytes()
-                })
-                .sum();
-            (total as f64 * self.len() as f64 / 100.0) as usize
-        }
-    }
 }
 
 pub trait VecTrait<T: DataTrait + ?Sized>: Vector<T> + DataTrait {}
