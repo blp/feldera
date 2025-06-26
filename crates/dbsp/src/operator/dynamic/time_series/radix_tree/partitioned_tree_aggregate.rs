@@ -21,9 +21,10 @@ use crate::{
         BatchReaderFactories, Builder, Cursor, Spine,
     },
     utils::Tup2,
-    Circuit, DBData, DynZWeight, RootCircuit, Stream, ZWeight,
+    Circuit, DBData, DynZWeight, RootCircuit, Runtime, Stream, ZWeight,
 };
 use dyn_clone::clone_box;
+use futures::future::join;
 use minitrace::trace;
 use num::PrimInt;
 use size_of::SizeOf;
@@ -385,8 +386,27 @@ where
             .default_box();
 
         let mut delta_cursor = delta.cursor();
-        let mut input_cursor = input_trace.cursor();
-        let mut output_cursor = output_trace.cursor();
+
+        let (input_fetched, output_fetched) =
+            if Runtime::with_dev_tweaks(|dev_tweaks| dev_tweaks.fetch_tree) {
+                join(
+                    input_trace.fetch(delta.as_ref()),
+                    output_trace.fetch(delta.as_ref()),
+                )
+                .await
+            } else {
+                (None, None)
+            };
+        let mut input_cursor = if let Some(input_fetched) = input_fetched.as_ref() {
+            input_fetched.get_cursor()
+        } else {
+            Box::new(input_trace.cursor())
+        };
+        let mut output_cursor = if let Some(output_fetched) = output_fetched.as_ref() {
+            output_fetched.get_cursor()
+        } else {
+            Box::new(output_trace.cursor())
+        };
 
         let mut pair = self.factories.output_factories.val_factory().default_box();
         let mut key = self.factories.input_factories.key_factory().default_box();

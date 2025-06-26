@@ -279,6 +279,12 @@ pub struct DevTweaks {
     /// memory if the number of keys fetched is very large.
     pub fetch_distinct: bool,
 
+    /// Whether to asynchronously fetch keys needed for partitioned tree
+    /// aggregates from storage.  Asynchronous fetching should be faster for
+    /// high-latency storage, such as object storage, but it could use excessive
+    /// amounts of memory if the number of keys fetched is very large.
+    pub fetch_tree: bool,
+
     /// Which merger to use.
     pub merger: MergerType,
 
