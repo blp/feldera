@@ -320,6 +320,17 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     pub const fn is_negative(self) -> bool {
         self.0.is_negative()
     }
+
+    /// Returns the square root of this value, rounded down, or `None` if this
+    /// value is negative.
+    ///
+    /// It probably makes more sense to convert to `f64` and take the
+    /// floating-point square root.
+    pub fn checked_sqrt(self) -> Option<Self> {
+        Some(Self(
+            I256::from_product(self.0, Self::scale()).checked_isqrt()?,
+        ))
+    }
 }
 
 impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
@@ -976,6 +987,8 @@ mod test {
             a.checked_div_integer(d).unwrap(),
             a.checked_rem_integer(d).unwrap()
         );
+
+        println!("sqrt({b}): {:?}", b.checked_sqrt());
     }
 
     #[test]

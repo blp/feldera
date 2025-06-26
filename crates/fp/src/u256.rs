@@ -1,6 +1,6 @@
 //! Routines for 256-bit integer arithmetic.
 
-use std::ops::{Add, Sub};
+use std::ops::{Add, Shr, Sub};
 
 const fn lo(x: u128) -> u128 {
     x & ((1 << 64) - 1)
@@ -12,10 +12,12 @@ const fn hi_lo(x: u128) -> (u128, u128) {
     (hi(x), lo(x))
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct U256(u128, u128);
 
 impl U256 {
+    pub const ZERO: Self = U256(0, 0);
+
     /// Returns `x * y`.
     ///
     /// This could use [u128::widening_mul] if that's ever stabilized.
@@ -53,6 +55,22 @@ impl U256 {
             .wrapping_add(carry0 as u128)
             .wrapping_add(carry1 as u128);
         Self(sum1, sum0)
+    }
+
+    pub fn isqrt(&self) -> u128 {
+        if self.0 == 0 {
+            self.1.isqrt()
+        } else if self.1 < 2 {
+            self.1
+        } else {
+            let small_candidate = (self >> 2).isqrt() << 1;
+            let large_candidate = small_candidate + 1;
+            if U256::from_product(large_candidate, large_candidate) > *self {
+                small_candidate
+            } else {
+                large_candidate
+            }
+        }
     }
 
     /// Divides by `v` and returns the result if it fits in `u128` or `None`
@@ -131,13 +149,26 @@ impl Sub for U256 {
     }
 }
 
+impl Shr<u32> for &U256 {
+    type Output = U256;
+
+    fn shr(self, n: u32) -> Self::Output {
+        U256(
+            self.0.unbounded_shr(n),
+            self.1.unbounded_shr(n)
+                | self.0.unbounded_shl(32u32.wrapping_sub(n))
+                | self.0.unbounded_shr(n.wrapping_sub(32)),
+        )
+    }
+}
+
 impl From<u128> for U256 {
     fn from(value: u128) -> Self {
         Self(0, value)
     }
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct I256 {
     value: U256,
     negative: bool,
@@ -164,6 +195,18 @@ impl I256 {
             Some(-result)
         } else {
             Some(result)
+        }
+    }
+
+    pub fn is_negative(&self) -> bool {
+        self.negative && self.value != U256::ZERO
+    }
+
+    pub fn checked_isqrt(self) -> Option<i128> {
+        if self.is_negative() {
+            None
+        } else {
+            Some(self.value.isqrt().try_into().ok()?)
         }
     }
 }
