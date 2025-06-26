@@ -6,6 +6,7 @@ use super::{
 };
 use crate::circuit::metrics::{FILES_CREATED, FILES_DELETED};
 use crate::storage::{buffer_cache::FBuf, init};
+use crate::Runtime;
 use feldera_storage::tokio::TOKIO;
 use feldera_storage::{
     append_to_path, default_read_async, StorageBackend, StorageBackendFactory, StorageFileType,
@@ -17,9 +18,10 @@ use feldera_types::config::{
 use metrics::counter;
 use std::ffi::OsString;
 use std::fs::{create_dir_all, DirEntry};
+use std::hint::spin_loop;
 use std::io::{ErrorKind, IoSlice, Write};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     fs::{self, File, OpenOptions},
     io::Error as IoError,
@@ -30,6 +32,8 @@ use std::{
         Arc,
     },
 };
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::TryRecvError;
 use tracing::warn;
 
 pub(super) struct PosixReader {
@@ -42,6 +46,8 @@ pub(super) struct PosixReader {
 
     /// Per-I/O operation sleep delay, for simulating slow storage devices.
     ioop_delay: Duration,
+
+    busy_wait: bool,
 }
 
 impl PosixReader {
@@ -58,6 +64,7 @@ impl PosixReader {
             drop,
             async_threads,
             ioop_delay,
+            busy_wait: Runtime::with_dev_tweaks(|tweaks| tweaks.busy_wait),
         }
     }
     fn open(
@@ -95,12 +102,36 @@ impl FileReader for PosixReader {
     }
 
     fn read_block(&self, location: BlockLocation) -> Result<Arc<FBuf>, StorageError> {
-        sleep(self.ioop_delay);
-        let mut buffer = FBuf::with_capacity(location.size);
+        fn inner(file: &File, location: BlockLocation) -> Result<Arc<FBuf>, StorageError> {
+            let mut buffer = FBuf::with_capacity(location.size);
+            match buffer.read_exact_at(file, location.offset, location.size) {
+                Ok(()) => Ok(Arc::new(buffer)),
+                Err(e) => Err(e.into()),
+            }
+        }
 
-        match buffer.read_exact_at(&self.file, location.offset, location.size) {
-            Ok(()) => Ok(Arc::new(buffer)),
-            Err(e) => Err(e.into()),
+        if self.busy_wait {
+            let end = Instant::now() + self.ioop_delay;
+            while Instant::now() < end {
+                spin_loop();
+            }
+
+            let (sender, mut receiver) = oneshot::channel();
+            let file = self.file.clone();
+            TOKIO.spawn_blocking(move || {
+                sender.send(inner(&file, location)).unwrap();
+            });
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => break result,
+                    Err(TryRecvError::Closed) => unreachable!(),
+                    Err(TryRecvError::Empty) => (),
+                }
+                spin_loop();
+            }
+        } else {
+            sleep(self.ioop_delay);
+            inner(&self.file, location)
         }
     }
 

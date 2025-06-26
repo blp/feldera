@@ -281,6 +281,15 @@ pub struct DevTweaks {
 
     /// Which merger to use.
     pub merger: MergerType,
+
+    /// If true, the [file backend] will busy-wait while it waits for data to be
+    /// read or for any configured I/O operation delay.  This wastes CPU time
+    /// but it makes I/O wait time more obvious in profiles.
+    ///
+    /// Only blocking reads busy-wait, not async reads.
+    ///
+    /// [file backend]: crate::storage::backend::posixio_impl::PosixBackend
+    pub busy_wait: bool,
 }
 
 impl DevTweaks {
