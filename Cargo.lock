@@ -4724,6 +4724,7 @@ dependencies = [
 name = "feldera-fp"
 version = "0.92.0"
 dependencies = [
+ "dbsp",
  "feldera-size-of",
  "num-traits",
  "rkyv",

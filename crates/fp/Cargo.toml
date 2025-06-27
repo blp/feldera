@@ -17,6 +17,7 @@ smallstr = "0.3.0"
 smallvec.workspace = true
 size-of.workspace = true
 rkyv = { workspace = true, features = ["size_64"] }
+dbsp.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

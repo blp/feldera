@@ -12,6 +12,7 @@ use smallvec::{Array, SmallVec};
 
 use crate::u256::I256;
 
+mod dbsp_impl;
 mod serde_impl;
 mod u256;
 
@@ -51,6 +52,9 @@ mod u256;
 )]
 #[archive_attr(doc(hidden))]
 pub struct Fixed<const P: usize, const S: usize>(i128);
+
+/// A maximum-precision `Fixed` with no decimal places.
+pub type FixedInteger = Fixed<38, 0>;
 
 impl<const P: usize, const S: usize> Debug for Fixed<P, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -196,6 +200,114 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         }
     };
 
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics (at compile time) if this type cannot hold every `i64` value.
+    pub const fn for_i64(value: i64) -> Self {
+        assert!(P.saturating_sub(S) >= 19);
+        Self(value as i128 * Self::scale())
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics (at compile time) if this type cannot hold every `u64` value.
+    pub const fn for_u64(value: u64) -> Self {
+        assert!(P.saturating_sub(S) >= 19);
+        Self(value as i128 * Self::scale())
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics (at compile time) if this type cannot hold every `i32` value.
+    pub const fn for_i32(value: i32) -> Self {
+        assert!(P.saturating_sub(S) >= 10);
+        Self(value as i128 * Self::scale())
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics (at compile time) if this type cannot hold every `u32` value.
+    pub const fn for_u32(value: u32) -> Self {
+        assert!(P.saturating_sub(S) >= 10);
+        Self(value as i128 * Self::scale())
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics (at compile time) if this type cannot hold every `i16` value.
+    pub const fn for_i16(value: i16) -> Self {
+        assert!(P.saturating_sub(S) >= 5);
+        Self(value as i128 * Self::scale())
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics (at compile time) if this type cannot hold every `u16` value.
+    pub const fn for_u16(value: u16) -> Self {
+        assert!(P.saturating_sub(S) >= 5);
+        Self(value as i128 * Self::scale())
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics (at compile time) if this type cannot hold every `i8` value.
+    pub const fn for_i8(value: i8) -> Self {
+        assert!(P.saturating_sub(S) >= 3);
+        Self(value as i128 * Self::scale())
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics (at compile time) if this type cannot hold every `u8` value.
+    pub const fn for_u8(value: u8) -> Self {
+        assert!(P.saturating_sub(S) >= 3);
+        Self(value as i128 * Self::scale())
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics (at compile time) if this type cannot hold every `isize` value.
+    pub const fn for_isize(value: isize) -> Self {
+        match isize::BITS {
+            64 => Self::for_i64(value as i64),
+            32 => Self::for_i32(value as i32),
+            16 => Self::for_i16(value as i16),
+            _ => panic!(),
+        }
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics (at compile time) if this type cannot hold every `usize` value.
+    pub const fn for_usize(value: usize) -> Self {
+        match usize::BITS {
+            64 => Self::for_u64(value as u64),
+            32 => Self::for_u32(value as u32),
+            16 => Self::for_u16(value as u16),
+            _ => panic!(),
+        }
+    }
+
     /// Returns `Self(value)`, if `value` is in the correct range for this type.
     fn try_new(value: i128) -> Option<Self> {
         Self::check_constraints();
@@ -207,37 +319,43 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     /// Returns `Self(value * 10**exponent)`, rounding to even if `exponent` is
     /// negative, if the computed value is in the correct range for the type.
     fn try_new_with_exponent(value: i128, exponent: i32) -> Option<Self> {
-        let result = match exponent.cmp(&0) {
-            Ordering::Less => {
-                // Divide by a negative exponent.
-                let Some(divisor) = checked_pow10(exponent.unsigned_abs()) else {
-                    // `10**-exponent` is greater than `i128::MAX`.  The result
-                    // must be zero.
-                    return Some(Self::ZERO);
-                };
-
-                // Round toward even.
-                //
-                // For negative `x` and positive `y`, `x / y` rounds toward 0
-                // and `x % y` is zero or negative.
-                debug_assert!(divisor >= 2);
-                let quotient = value / divisor;
-                let remainder = value % divisor;
-                let round_away_from_zero = match remainder.abs().cmp(&(divisor / 2)) {
-                    Ordering::Less => false,
-                    Ordering::Equal => (quotient % 2) != 0,
-                    Ordering::Greater => true,
-                };
-                if round_away_from_zero {
-                    quotient + quotient.signum()
-                } else {
-                    quotient
+        // Non-generic inner function to reduce monomorphization cost.
+        fn inner(value: i128, exponent: i32) -> Option<i128> {
+            Some(match exponent.cmp(&0) {
+                Ordering::Less => {
+                    // Divide by a negative exponent.
+                    if let Some(divisor) = checked_pow10(exponent.unsigned_abs()) {
+                        // Round toward even.
+                        //
+                        // For negative `x` and positive `y`, `x / y` rounds toward 0
+                        // and `x % y` is zero or negative.
+                        debug_assert!(divisor >= 2);
+                        let quotient = value / divisor;
+                        let remainder = value % divisor;
+                        let round_away_from_zero = match remainder.abs().cmp(&(divisor / 2)) {
+                            Ordering::Less => false,
+                            Ordering::Equal => (quotient % 2) != 0,
+                            Ordering::Greater => true,
+                        };
+                        if round_away_from_zero {
+                            quotient + quotient.signum()
+                        } else {
+                            quotient
+                        }
+                    } else {
+                        // `10**-exponent` is greater than `i128::MAX`.  The result
+                        // must be zero.
+                        0
+                    }
                 }
-            }
-            Ordering::Equal => value,
-            Ordering::Greater => value.checked_mul(checked_pow10(exponent.cast_unsigned())?)?,
-        };
-        Self::try_new(result)
+                Ordering::Equal => value,
+                Ordering::Greater => {
+                    // Multiply by a positive exponent.
+                    value.checked_mul(checked_pow10(exponent.cast_unsigned())?)?
+                }
+            })
+        }
+        inner(value, exponent).and_then(Self::try_new)
     }
 
     /// Validates the constraints on `S` and `P`.
@@ -331,6 +449,84 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
             I256::from_product(self.0, Self::scale()).checked_isqrt()?,
         ))
     }
+
+    /// Returns this value rounded to `n` digits after the decimal point, or
+    /// `None` if rounding caused overflow.  `n` may be negative.
+    pub fn checked_round(&self, n: i32) -> Option<Self> {
+        // Non-generic inner function to reduce monomorphization cost.
+        fn inner(value: i128, scale: i32, n: i32) -> Option<i128> {
+            let position = scale.saturating_sub(n);
+            if position <= 0 {
+                Some(value)
+            } else if position < scale {
+                let divisor = pow10(position as usize);
+                let quotient = value / divisor;
+                let remainder = value % divisor;
+                let round_away_from_zero = match remainder.abs().cmp(&(divisor / 2)) {
+                    Ordering::Less => false,
+                    Ordering::Equal => (quotient % 2) != 0,
+                    Ordering::Greater => true,
+                };
+                let rounded_quotient = if round_away_from_zero {
+                    quotient + quotient.signum()
+                } else {
+                    quotient
+                };
+                Some(divisor * rounded_quotient)
+            } else if position > scale || value.abs() >= 5 * pow10(scale as usize - 1) {
+                Some(0)
+            } else {
+                None
+            }
+        }
+
+        inner(self.0, S as i32, n).and_then(Self::try_new)
+    }
+
+    /// Rounds to `n` digits after the decimal point, like [checked_round].
+    ///
+    /// # Panic
+    ///
+    /// Panics if rounding causes overflow.
+    ///
+    /// [checked_round]: Self::checked_round
+    pub fn round(&self, n: i32) -> Self {
+        self.checked_round(n).unwrap()
+    }
+
+    /// Rounds down to the nearest integer.
+    pub fn floor(&self) -> Self {
+        if S > 0 {
+            Self(self.0 / Self::scale() * Self::scale())
+        } else {
+            *self
+        }
+    }
+
+    /// Returns this value rounded up to the nearest integer, or `None` if
+    /// rounding caused overflow.
+    pub fn checked_ceil(&self) -> Option<Self> {
+        if S > 0 {
+            Self::try_new(self.0.checked_add(Self::scale() - 1)? / Self::scale() * Self::scale())
+        } else {
+            Some(*self)
+        }
+    }
+
+    /// Rounds up to the nearest integer, like [checked_ceil].
+    ///
+    /// # Panic
+    ///
+    /// Panics if rounding causes overflow.
+    pub fn ceil(&self) -> Self {
+        self.checked_ceil().unwrap()
+    }
+
+    /// Returns -1 if this value is less than zero, 0 if this value is zero, and
+    /// 1 if this value is greater than zero, as `Fixed<1,0>`.
+    pub fn sign(&self) -> Fixed<1, 0> {
+        self.checked_sign_generic().unwrap()
+    }
 }
 
 impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
@@ -344,6 +540,19 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
     /// implementation](https://users.rust-lang.org/t/conflicting-implementations-of-trait-from/92994).
     pub fn convert<const P1: usize, const S1: usize>(&self) -> Option<Fixed<P1, S1>> {
         Fixed::try_new_with_exponent(self.0, (S1 - S0) as i32)
+    }
+
+    /// Returns -1 if this value is less than zero, 0 if this value is zero, and
+    /// 1 if this value is greater than zero, in an arbitrary `Fixed` type.
+    /// Returns `None` on overflow (if this value is nonzero and `S1 >= P1`).
+    pub fn checked_sign_generic<const P1: usize, const S1: usize>(&self) -> Option<Fixed<P1, S1>> {
+        let one = Fixed::<P1, S1>::scale();
+        match self.0.cmp(&0) {
+            Ordering::Less if S1 < P1 => Some(Fixed(-one)),
+            Ordering::Equal => Some(Fixed::ZERO),
+            Ordering::Greater if S1 < P1 => Some(Fixed(one)),
+            _ => None,
+        }
     }
 
     /// Calculates `self + other`, for operands with scale and precision `(S0,P0)` and
@@ -791,10 +1000,6 @@ impl<const P: usize, const S: usize> FromStr for Fixed<P, S> {
             .and_then(|(value, exponent)| Self::try_new_with_exponent(value, exponent))
             .ok_or(ParseFixedError)
     }
-}
-
-pub fn add(x: Fixed<38, 10>, y: Fixed<38, 10>) -> Fixed<38, 10> {
-    x + y
 }
 
 #[cfg(test)]
