@@ -103,6 +103,7 @@ fastbloom = "0.8.0"
 fdlimit = "0.3.0"
 feldera-adapterlib = { path = "crates/adapterlib" }
 feldera-datagen = { path = "crates/datagen" }
+feldera-fp = { path = "crates/fp", features = ["dbsp", "serde", "rkyv"] }
 feldera-iceberg = { path = "crates/iceberg" }
 feldera-sqllib = { path = "crates/sqllib" }
 feldera-storage = { version = "0.92.0", path = "crates/storage" }

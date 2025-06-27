@@ -4726,6 +4726,7 @@ version = "0.92.0"
 dependencies = [
  "dbsp",
  "feldera-size-of",
+ "feldera-types",
  "num-traits",
  "rkyv",
  "serde",

@@ -12,45 +12,44 @@ use smallvec::{Array, SmallVec};
 
 use crate::u256::I256;
 
+#[cfg(feature = "dbsp")]
 mod dbsp_impl;
+
+#[cfg(feature = "serde")]
 mod serde_impl;
 mod u256;
 
 /// Fixed-point decimal with fixed precision and scale.
 ///
-/// `Fixed<P,S>`, with `1 <= P <= 38` and `S <= P`, represents a signed decimal
-/// number with fixed `S - P` digits before the decimal point and `S` digits
-/// after.  Some examples:
+/// `Fixed<P, S>`, where `P` in `1..=38` is the "precision" and `S` in `0..=P`
+/// is the "scale", represents a signed decimal number in which `S - P` digits
+/// precede the decimal point and `S` digits follow it.  The table below shows
+/// the maximum values for a few combinations of `P` and `S`.  For each type,
+/// the minimum value is the negation of the maximum:
 ///
-/// |         Type |Minimum Value | Maximum Value |
-/// |:-------------|-------------:|--------------:|
-/// | `Fixed<5,5>` |     -0.99999 |       0.99999 |
-/// | `Fixed<5,4>` |      -9.9999 |        9.9999 |
-/// | `Fixed<5,3>` |      -99.999 |        99.999 |
-/// | `Fixed<5,2>` |      -999.99 |        999.99 |
-/// | `Fixed<5,1>` |      -9999.9 |        9999.9 |
-/// | `Fixed<5,0>` |       -99999 |         99999 |
+/// |          Type |                                              Maximum Value |
+/// |:--------------|-----------------------------------------------------------:|
+/// | `Fixed<5,5>`  | `                                                 0.99999` |
+/// | `Fixed<5,4>`  | `                                                 9.9999 ` |
+/// | `Fixed<5,3>`  | `                                                99.999  ` |
+/// | `Fixed<5,2>`  | `                                               999.99   ` |
+/// | `Fixed<5,1>`  | `                                             9,999.9    ` |
+/// | `Fixed<5,0>`  | `                                            99,999      ` |
+/// | `Fixed<38,0>` | `99,999,999,999,999,999,999,999,999,999,999,999,999      ` |
+/// | `Fixed<38,5>` | `       999,999,999,999,999,999,999,999,999,999,999.99999` |
 ///
-/// # Representation
+/// # Implementation
 ///
-/// `Fixed` internally contains a single `i128`, which limits `S` to 38 because
-/// `10**38 < 2**127 - 1 < 10**39`.  A single `i64` would be sufficient for `S
-/// <= 18`, and a single `i32` for `S <= 9`, but the implementation does not
-/// optimize for those cases.
-#[derive(
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-    SizeOf,
+/// `Fixed<P, S>` internally contains a single `i128` that represents a value
+/// `x` as `x * 10**P`.  This limits `S` to 38 because `10**38 ≤ 2**127 - 1 <
+/// 10**39`.  A single `i64` would be sufficient for `S ≤ 18`, and a single
+/// `i32` for `S ≤ 9`, but the implementation does not optimize for those cases.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, SizeOf)]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
-#[archive_attr(doc(hidden))]
+#[cfg_attr(feature = "rkyv", archive_attr(doc(hidden)))]
 pub struct Fixed<const P: usize, const S: usize>(i128);
 
 /// A maximum-precision `Fixed` with no decimal places.
@@ -518,6 +517,8 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     /// # Panic
     ///
     /// Panics if rounding causes overflow.
+    ///
+    /// [checked_ceil]: Self::checked_ceil
     pub fn ceil(&self) -> Self {
         self.checked_ceil().unwrap()
     }
