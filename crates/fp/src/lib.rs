@@ -7,7 +7,6 @@ use std::{
 };
 
 use num_traits::{cast, CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Zero};
-use size_of::SizeOf;
 use smallvec::{Array, SmallVec};
 
 use crate::u256::I256;
@@ -44,11 +43,13 @@ mod u256;
 /// `x` as `x * 10**P`.  This limits `S` to 38 because `10**38 ≤ 2**127 - 1 <
 /// 10**39`.  A single `i64` would be sufficient for `S ≤ 18`, and a single
 /// `i32` for `S ≤ 9`, but the implementation does not optimize for those cases.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, SizeOf)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "size_of", derive(size_of::SizeOf))]
 #[cfg_attr(
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
+#[cfg_attr(feature = "validation", derive(rkyv::CheckBytes))]
 #[cfg_attr(feature = "rkyv", archive_attr(doc(hidden)))]
 pub struct Fixed<const P: usize, const S: usize>(i128);
 
@@ -850,6 +851,14 @@ impl<const P: usize, const S: usize> Add for Fixed<P, S> {
     }
 }
 
+impl<const P: usize, const S: usize> Add for &Fixed<P, S> {
+    type Output = Fixed<P, S>;
+
+    fn add(self, other: Self) -> Self::Output {
+        self.checked_add(other).unwrap()
+    }
+}
+
 impl<const P: usize, const S: usize> CheckedAdd for Fixed<P, S> {
     fn checked_add(&self, other: &Self) -> Option<Self> {
         self.checked_add_generic(*other)
@@ -862,11 +871,25 @@ impl<const P: usize, const S: usize> AddAssign for Fixed<P, S> {
     }
 }
 
+impl<const P: usize, const S: usize> AddAssign<&Fixed<P, S>> for Fixed<P, S> {
+    fn add_assign(&mut self, other: &Fixed<P, S>) {
+        *self = *self + *other;
+    }
+}
+
 impl<const P: usize, const S: usize> Sub for Fixed<P, S> {
     type Output = Self;
 
     fn sub(self, other: Self) -> Self::Output {
         self.checked_sub(&other).unwrap()
+    }
+}
+
+impl<const P: usize, const S: usize> Sub for &Fixed<P, S> {
+    type Output = Fixed<P, S>;
+
+    fn sub(self, other: Self) -> Self::Output {
+        self.checked_sub(other).unwrap()
     }
 }
 
@@ -890,6 +913,14 @@ impl<const P: usize, const S: usize> Mul for Fixed<P, S> {
     }
 }
 
+impl<const P: usize, const S: usize> Mul for &Fixed<P, S> {
+    type Output = Fixed<P, S>;
+
+    fn mul(self, other: Self) -> Self::Output {
+        self.checked_mul(other).unwrap()
+    }
+}
+
 impl<const P: usize, const S: usize> CheckedMul for Fixed<P, S> {
     fn checked_mul(&self, other: &Self) -> Option<Self> {
         Self::checked_mul_generic(*self, *other)
@@ -910,6 +941,14 @@ impl<const P: usize, const S: usize> Div for Fixed<P, S> {
     }
 }
 
+impl<const P: usize, const S: usize> Div for &Fixed<P, S> {
+    type Output = Fixed<P, S>;
+
+    fn div(self, other: Self) -> Self::Output {
+        self.checked_div(other).unwrap()
+    }
+}
+
 impl<const P: usize, const S: usize> CheckedDiv for Fixed<P, S> {
     fn checked_div(&self, other: &Self) -> Option<Self> {
         Self::checked_div_generic(*self, *other)
@@ -927,6 +966,14 @@ impl<const P: usize, const S: usize> Neg for Fixed<P, S> {
 
     fn neg(self) -> Self::Output {
         Self(-self.0)
+    }
+}
+
+impl<const P: usize, const S: usize> Neg for &Fixed<P, S> {
+    type Output = Fixed<P, S>;
+
+    fn neg(self) -> Self::Output {
+        Fixed(-self.0)
     }
 }
 

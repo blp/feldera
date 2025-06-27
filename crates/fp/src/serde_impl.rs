@@ -7,6 +7,8 @@ use std::{
     str::FromStr,
 };
 
+const FIXED_KEY_TOKEN: &str = "$serde_json::private::Number";
+
 struct FixedVisitor<const P: usize, const S: usize>;
 
 impl<const P: usize, const S: usize> Serialize for Fixed<P, S> {
@@ -91,7 +93,6 @@ impl<'de, const P: usize, const S: usize> serde::de::Visitor<'de> for FixedVisit
 }
 
 struct FixedKey;
-const FIXED_KEY_TOKEN: &str = "$serde_json::private::Number";
 
 impl<'de> serde::de::Deserialize<'de> for FixedKey {
     fn deserialize<D>(deserializer: D) -> Result<FixedKey, D::Error>

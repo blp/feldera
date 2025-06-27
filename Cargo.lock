@@ -4724,6 +4724,7 @@ dependencies = [
 name = "feldera-fp"
 version = "0.92.0"
 dependencies = [
+ "bytecheck",
  "dbsp",
  "feldera-size-of",
  "feldera-types",

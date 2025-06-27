@@ -1,18 +1,31 @@
-use dbsp::algebra::{MulByRef, OptionWeightType};
+use dbsp::algebra::{HasOne, HasZero, MulByRef, OptionWeightType};
 use feldera_types::serde_with_context::{
     serde_config::DecimalFormat, DeserializeWithContext, SerializeWithContext, SqlSerdeConfig,
 };
 use serde::{Deserializer, Serialize, Serializer};
+use smallstr::SmallString;
+use std::fmt::Write;
 
 use crate::{Fixed, FixedInteger};
 
 impl<const P: usize, const S: usize> OptionWeightType for Fixed<P, S> {}
+impl<const P: usize, const S: usize> OptionWeightType for &Fixed<P, S> {}
 
-impl<const P: usize, const S: usize> MulByRef for Fixed<P, S> {
-    type Output = Self;
+impl<const P: usize, const S: usize> HasZero for Fixed<P, S> {
+    fn is_zero(&self) -> bool {
+        *self == Self::ZERO
+    }
 
-    fn mul_by_ref(&self, other: &Self) -> Self::Output {
-        *self * *other
+    fn zero() -> Self {
+        Self::ZERO
+    }
+}
+
+impl<const P: usize, const S: usize> HasOne for Fixed<P, S> {
+    /// This will panic if 1 can't be represented in this type (that is, if `S
+    /// >= P`).
+    fn one() -> Self {
+        Self::ONE
     }
 }
 
@@ -53,10 +66,11 @@ impl<const P: usize, const S: usize> SerializeWithContext<SqlSerdeConfig> for Fi
         Ser: Serializer,
     {
         match context.decimal_format {
-            DecimalFormat::Numeric => Serialize::serialize(&self, serializer),
+            DecimalFormat::Numeric => self.serialize(serializer),
             DecimalFormat::String => {
-                // serde_arrow doesn't support scientific notation.
-                serializer.serialize_str(&self.value.to_standard_notation_string())
+                let mut string = SmallString::<[u8; 64]>::new();
+                write!(&mut string, "{}", self).unwrap();
+                serializer.serialize_str(&string)
             }
         }
     }
