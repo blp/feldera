@@ -4728,6 +4728,7 @@ dependencies = [
  "dbsp",
  "feldera-size-of",
  "feldera-types",
+ "num-bigint",
  "num-traits",
  "rkyv",
  "serde",

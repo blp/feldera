@@ -174,6 +174,45 @@ const fn pow10(exponent: usize) -> i128 {
     10i128.checked_pow(exponent as u32).unwrap()
 }
 
+/// How to round values halfway between two integer.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Halfway {
+    /// Round away from zero.
+    AwayFromZero,
+
+    /// Round to even.
+    Even,
+}
+
+fn round_inner(value: i128, scale: i32, n: i32, halfway: Halfway) -> Option<i128> {
+    let position = scale.saturating_sub(n);
+    if position <= 0 {
+        Some(value)
+    } else if position < scale {
+        let divisor = pow10(position as usize);
+        let quotient = value / divisor;
+        let remainder = value % divisor;
+        let round_away_from_zero = match remainder.abs().cmp(&(divisor / 2)) {
+            Ordering::Less => false,
+            Ordering::Equal => match halfway {
+                Halfway::AwayFromZero => true,
+                Halfway::Even => (quotient % 2) != 0,
+            },
+            Ordering::Greater => true,
+        };
+        let rounded_quotient = if round_away_from_zero {
+            quotient + quotient.signum()
+        } else {
+            quotient
+        };
+        Some(divisor * rounded_quotient)
+    } else if position > scale || value.abs() >= 5 * pow10(scale as usize - 1) {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 impl<const P: usize, const S: usize> Fixed<P, S> {
     /// Largest value for this type, e.g. 999.99 for `Fixed<5,2>`.
     pub const MAX: Self = Self(pow10(P) - 1);
@@ -410,13 +449,12 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         self.checked_div_integer(other).unwrap()
     }
 
-    /// Integer remainder, as defined for `remainder` in [General Decimal
-    /// Arithmetic].  Returns `None` if `other` is zero or the result is out of
-    /// range for the result type.
+    /// Remainder, as defined for `remainder` in [General Decimal Arithmetic].
+    /// Returns `None` if `other` is zero.
     ///
     /// [General Decimal Arithmetic]: https://speleotrove.com/decimal/decarith.pdf
-    pub const fn checked_rem_integer(self, other: Self) -> Option<i128> {
-        self.0.checked_rem(other.0)
+    pub const fn checked_rem_integer(self, _other: Self) -> Option<Self> {
+        todo!()
     }
 
     /// Integer remainder like [checked_rem_integer](Self::checked_rem_integer),
@@ -424,8 +462,8 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics if `other` is zero or the result is greater than `i128::MAX`.
-    pub const fn strict_rem_integer(self, other: Self) -> i128 {
+    /// Panics if `other` is zero.
+    pub const fn strict_rem_integer(self, other: Self) -> Self {
         self.checked_rem_integer(other).unwrap()
     }
 
@@ -451,39 +489,15 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     }
 
     /// Returns this value rounded to `n` digits after the decimal point, or
-    /// `None` if rounding caused overflow.  `n` may be negative.
+    /// `None` if rounding caused overflow, `n` may be negative.
+    ///
+    /// If the value is halfway between two integers, rounds away from zero.
     pub fn checked_round(&self, n: i32) -> Option<Self> {
-        // Non-generic inner function to reduce monomorphization cost.
-        fn inner(value: i128, scale: i32, n: i32) -> Option<i128> {
-            let position = scale.saturating_sub(n);
-            if position <= 0 {
-                Some(value)
-            } else if position < scale {
-                let divisor = pow10(position as usize);
-                let quotient = value / divisor;
-                let remainder = value % divisor;
-                let round_away_from_zero = match remainder.abs().cmp(&(divisor / 2)) {
-                    Ordering::Less => false,
-                    Ordering::Equal => (quotient % 2) != 0,
-                    Ordering::Greater => true,
-                };
-                let rounded_quotient = if round_away_from_zero {
-                    quotient + quotient.signum()
-                } else {
-                    quotient
-                };
-                Some(divisor * rounded_quotient)
-            } else if position > scale || value.abs() >= 5 * pow10(scale as usize - 1) {
-                Some(0)
-            } else {
-                None
-            }
-        }
-
-        inner(self.0, S as i32, n).and_then(Self::try_new)
+        round_inner(self.0, S as i32, n, Halfway::AwayFromZero).and_then(Self::try_new)
     }
 
     /// Rounds to `n` digits after the decimal point, like [checked_round].
+    /// If the value is halfway between two integers, rounds away from zero.
     ///
     /// # Panic
     ///
@@ -494,10 +508,47 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         self.checked_round(n).unwrap()
     }
 
+    /// Returns this value rounded to `n` digits after the decimal point, or
+    /// `None` if rounding caused overflow, `n` may be negative.  If the value
+    /// is halfway between two integers, rounds toward an even least significant
+    /// digit.
+    pub fn checked_round_ties_even(&self, n: i32) -> Option<Self> {
+        round_inner(self.0, S as i32, n, Halfway::Even).and_then(Self::try_new)
+    }
+
+    /// Rounds to `n` digits after the decimal point, like
+    /// [checked_round_ties_even].  If the value is halfway between two
+    /// integers, rounds toward an even least significant digit.
+    ///
+    /// # Panic
+    ///
+    /// Panics if rounding causes overflow.
+    ///
+    /// [checked_round]: Self::checked_round
+    pub fn round_ties_even(&self, n: i32) -> Self {
+        self.checked_round_ties_even(n).unwrap()
+    }
+
     /// Rounds down to the nearest integer.
     pub fn floor(&self) -> Self {
         if S > 0 {
             Self(self.0 / Self::scale() * Self::scale())
+        } else {
+            *self
+        }
+    }
+
+    /// Returns the integer part of this value, truncating non-integers toward zero.
+    pub fn truncate(&self) -> Self {
+        if S > 0 {
+            fn round(x: i128, s: i128) -> i128 {
+                x / s * s
+            }
+            if self.0 >= 0 {
+                Self(round(self.0, Self::scale()))
+            } else {
+                Self(-round(-self.0, Self::scale()))
+            }
         } else {
             *self
         }
@@ -528,6 +579,26 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     /// 1 if this value is greater than zero, as `Fixed<1,0>`.
     pub fn sign(&self) -> Fixed<1, 0> {
         self.checked_sign_generic().unwrap()
+    }
+
+    pub fn checked_powi(&self, _other: i32) -> Self {
+        todo!()
+    }
+
+    pub fn next_up(&self) -> Option<Self> {
+        if *self < Self::MAX {
+            Some(Self(self.0 + 1))
+        } else {
+            None
+        }
+    }
+
+    pub fn next_down(&self) -> Option<Self> {
+        if *self > Self::MIN {
+            Some(Self(self.0 - 1))
+        } else {
+            None
+        }
     }
 }
 
@@ -1235,11 +1306,12 @@ mod test {
         );
         println!("{:?}", a.checked_div(&b));
 
+/*
         println!(
             "{a} div {d}: {:?} {}",
             a.checked_div_integer(d).unwrap(),
             a.checked_rem_integer(d).unwrap()
-        );
+        );*/
 
         println!("sqrt({b}): {:?}", b.checked_sqrt());
     }

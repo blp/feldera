@@ -242,3 +242,58 @@ impl From<i128> for I256 {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use num_bigint::BigInt;
+
+    use crate::u256::U256;
+
+    struct Values64(u64);
+    impl Iterator for Values64 {
+        type Item = u64;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.0 < (1 << 6) {
+                // Bits 61,62,63 come from bits 3,4,5.
+                let high = (self.0 & 0b111000) << 58;
+
+                // Copy bit 3 into all the middle bits 3..=60.
+                //
+                // This ensures that we test cases that require carries.
+                let mid = if (self.0 & 0b1000) != 0 {
+                    (u64::MAX >> 6) << 3
+                } else {
+                    0
+                };
+
+                // Bits 0,1,2 come from bits 0,1,2.
+                let low = self.0 & 0b111;
+
+                self.0 += 1;
+                Some(low | mid | high)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn u256_from_product() {
+        for x_hi in Values64(0) {
+            for x_lo in Values64(0) {
+                for y_hi in Values64(0) {
+                    for y_lo in Values64(0) {
+                        let x = ((x_hi as u128) << 64) | (x_lo as u128);
+                        let y = ((y_hi as u128) << 64) | (y_lo as u128);
+                        let z = U256::from_product(x, y);
+                        assert_eq!(
+                            BigInt::from(x) * BigInt::from(y),
+                            (BigInt::from(z.0) << 128) | BigInt::from(z.1)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
