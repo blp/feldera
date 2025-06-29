@@ -84,20 +84,24 @@ impl U256 {
         } else if u1 >= v {
             None
         } else {
+            //println!("\n{u1:016x} {u0:016x} / {v:016x}");
             // We're doing grade-school division in base 2**64.  This is the number
             // base.
-            const BASE: u128 = (1 << 64) - 1;
+            const BASE: u128 = 1 << 64;
 
             // Shift `v` so that it occupies the most-significant bits.
             let s = v.leading_zeros();
+            //dbg!(s);
             let v = v << s;
+            //println!("{v:016x}");
 
             let (vn1, vn0) = hi_lo(v);
-            let un128 = (u1 << s) | u0.unbounded_shr(128 - s);
+            let un32 = (u1 << s) | u0.unbounded_shr(128 - s);
+            //println!("un128={un32:016x}");
             let (un1, un0) = hi_lo(u0 << s);
 
-            let mut q1 = un128 / vn1;
-            let mut rhat = un128 - q1 * vn1;
+            let mut q1 = un32 / vn1;
+            let mut rhat = un32 - q1 * vn1;
             while q1 >= BASE || q1 * vn0 > BASE * rhat + un1 {
                 q1 -= 1;
                 rhat += vn1;
@@ -106,7 +110,12 @@ impl U256 {
                 }
             }
 
-            let un21 = un128 * BASE + un1 - q1 * v;
+            //dbg!((un32, un1, q1, v));
+            //println!("un32={un32:016x} un1={un1:016x} q1={q1:016x} v={v:016x}");
+            let un21 = un32
+                .wrapping_mul(BASE)
+                .wrapping_add(un1)
+                .wrapping_sub(q1.wrapping_mul(v));
 
             let mut q0 = un21 / vn1;
             let mut rhat = un21 - q0 * vn1;
@@ -245,30 +254,41 @@ impl From<i128> for I256 {
 
 #[cfg(test)]
 mod test {
-    use num_bigint::BigInt;
+    use num_bigint::BigUint;
 
     use crate::u256::U256;
 
+    /// Iterator for key values of `u64`.
+    ///
+    /// This iterates through all the possible 1-bit values of `a`, `b`, `c`,
+    /// `d`, and `e`, producing the bit patterns shown below:
+    ///
+    /// ```ignore
+    /// abccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccde
+    /// ```
+    ///
+    /// This tries to exercise arithmetic tests for all the ways that carry may
+    /// or may not occur (especially with `c = 1`).
     struct Values64(u64);
     impl Iterator for Values64 {
         type Item = u64;
 
         fn next(&mut self) -> Option<Self::Item> {
-            if self.0 < (1 << 6) {
-                // Bits 61,62,63 come from bits 3,4,5.
-                let high = (self.0 & 0b111000) << 58;
+            if self.0 < (1 << 5) {
+                // Bits 62,63 come from bits 3,4.
+                let high = (self.0 & 0b11000) << 59;
 
-                // Copy bit 3 into all the middle bits 3..=60.
+                // Copy bit 3 into all the middle bits 2..=61.
                 //
                 // This ensures that we test cases that require carries.
-                let mid = if (self.0 & 0b1000) != 0 {
-                    (u64::MAX >> 6) << 3
+                let mid = if (self.0 & 0b100) != 0 {
+                    (u64::MAX >> 4) << 2
                 } else {
                     0
                 };
 
-                // Bits 0,1,2 come from bits 0,1,2.
-                let low = self.0 & 0b111;
+                // Bits 0,1 come from bits 0,1.
+                let low = self.0 & 0b11;
 
                 self.0 += 1;
                 Some(low | mid | high)
@@ -286,11 +306,30 @@ mod test {
                     for y_lo in Values64(0) {
                         let x = ((x_hi as u128) << 64) | (x_lo as u128);
                         let y = ((y_hi as u128) << 64) | (y_lo as u128);
-                        let z = U256::from_product(x, y);
+                        let product_u256 = U256::from_product(x, y);
+                        let product_biguint = BigUint::from(x) * BigUint::from(y);
                         assert_eq!(
-                            BigInt::from(x) * BigInt::from(y),
-                            (BigInt::from(z.0) << 128) | BigInt::from(z.1)
+                            product_biguint,
+                            (BigUint::from(product_u256.0) << 128) | BigUint::from(product_u256.1)
                         );
+
+                        for z_hi in Values64(0) {
+                            for z_lo in Values64(0) {
+                                let z = ((z_hi as u128) << 64) | (z_lo as u128);
+                                if z != 0 {
+                                    let quotient_u256 =
+                                        product_u256.narrowing_div(z).map(BigUint::from);
+                                    let quotient_biguint = &product_biguint / BigUint::from(z);
+                                    let quotient_biguint =
+                                        if quotient_biguint > BigUint::from(u128::MAX) {
+                                            None
+                                        } else {
+                                            Some(quotient_biguint)
+                                        };
+                                    assert_eq!(quotient_u256, quotient_biguint);
+                                }
+                            }
+                        }
                     }
                 }
             }
