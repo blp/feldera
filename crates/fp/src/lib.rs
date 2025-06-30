@@ -357,7 +357,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
 
     /// Returns `Self(value * 10**exponent)`, rounding to even if `exponent` is
     /// negative, if the computed value is in the correct range for the type.
-    fn try_new_with_exponent(value: i128, exponent: i32) -> Option<Self> {
+    fn try_new_with_exponent_round_even(value: i128, exponent: i32) -> Option<Self> {
         // Non-generic inner function to reduce monomorphization cost.
         fn inner(value: i128, exponent: i32) -> Option<i128> {
             Some(match exponent.cmp(&0) {
@@ -381,6 +381,32 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
                         } else {
                             quotient
                         }
+                    } else {
+                        // `10**-exponent` is greater than `i128::MAX`.  The result
+                        // must be zero.
+                        0
+                    }
+                }
+                Ordering::Equal => value,
+                Ordering::Greater => {
+                    // Multiply by a positive exponent.
+                    value.checked_mul(checked_pow10(exponent.cast_unsigned())?)?
+                }
+            })
+        }
+        inner(value, exponent).and_then(Self::try_new)
+    }
+
+    /// Returns `Self(value * 10**exponent)`, rounding toward zero, if the
+    /// computed value is in the correct range for the type.
+    fn try_new_with_exponent(value: i128, exponent: i32) -> Option<Self> {
+        // Non-generic inner function to reduce monomorphization cost.
+        fn inner(value: i128, exponent: i32) -> Option<i128> {
+            Some(match exponent.cmp(&0) {
+                Ordering::Less => {
+                    // Divide by a negative exponent.
+                    if let Some(divisor) = checked_pow10(exponent.unsigned_abs()) {
+                        value / divisor
                     } else {
                         // `10**-exponent` is greater than `i128::MAX`.  The result
                         // must be zero.
@@ -467,7 +493,8 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         self.checked_rem_integer(other).unwrap()
     }
 
-    /// Returns the absolute value.
+    /// Returns the absolute value.  This is an exact calculation that cannot
+    /// overflow.
     pub const fn abs(self) -> Self {
         Self(self.0.abs())
     }
@@ -524,7 +551,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// Panics if rounding causes overflow.
     ///
-    /// [checked_round]: Self::checked_round
+    /// [checked_round_ties_even]: Self::checked_round_ties_even
     pub fn round_ties_even(&self, n: i32) -> Self {
         self.checked_round_ties_even(n).unwrap()
     }
@@ -581,10 +608,81 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         self.checked_sign_generic().unwrap()
     }
 
-    pub fn checked_powi(&self, _other: i32) -> Self {
-        todo!()
+    /// Returns the reciprocal (inverse) of this value, `1/x`, or `None` if `x`
+    /// is zero or `1/x` is out of range.
+    ///
+    /// This works even if `1` is out of range for this type, as long as `1/x`
+    /// is in range.
+    pub fn checked_recip(&self) -> Option<Self> {
+        Fixed::<1, 0>(1).checked_div_generic(*self)
     }
 
+    /// Returns the reciprocal (inverse) of this value, `1/x`.
+    /// This works even if `1` is out of range for this type, as long as `1/x`
+    /// is in range.
+    ///
+    /// # Panic
+    ///
+    /// Panics if `x` is zero or `1/x` is out of range.
+    pub fn recip(&self) -> Self {
+        self.checked_recip().unwrap()
+    }
+
+    pub fn checked_powi(&self, exp: i32) -> Option<Self> {
+        if self.is_zero() {
+            (exp > 0).then_some(Self::ZERO)
+        } else if exp == 0 {
+            if S < P {
+                Some(Self::ONE)
+            } else {
+                // 1 is not representable.
+                None
+            }
+        } else if exp > 0 {
+            let mut exp = exp.unsigned_abs();
+            let mut base = *self;
+            let mut acc: Option<Fixed<P, S>> = None;
+            loop {
+                if (exp & 1) == 1 {
+                    acc = if let Some(acc) = acc {
+                        Some(acc.checked_mul(&base)?)
+                    } else {
+                        Some(base)
+                    };
+                }
+                exp /= 2;
+                if exp == 0 {
+                    return acc;
+                }
+                base *= base;
+            }
+        } else {
+            let mut exp = exp.unsigned_abs();
+            let mut base = *self;
+            let mut acc: Option<Fixed<P, S>> = None;
+            loop {
+                if (exp & 1) == 1 {
+                    acc = Some(if let Some(acc) = acc {
+                        acc.checked_div(&base)
+                    } else {
+                        base.checked_recip()
+                    }?)
+                }
+                exp /= 2;
+                if exp == 0 {
+                    return acc;
+                }
+                base *= base;
+            }
+        }
+    }
+
+    pub fn powi(&self, exp: i32) -> Self {
+        self.checked_powi(exp).unwrap()
+    }
+
+    /// Returns the least number greater than `self`, or `None` if this is
+    /// `Self::MAX`.
     pub fn next_up(&self) -> Option<Self> {
         if *self < Self::MAX {
             Some(Self(self.0 + 1))
@@ -593,6 +691,8 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         }
     }
 
+    /// Returns the greatest number less than `self`, or `None` if this is
+    /// `Self::MAX`.
     pub fn next_down(&self) -> Option<Self> {
         if *self > Self::MIN {
             Some(Self(self.0 - 1))
@@ -645,10 +745,10 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
         match S0.cmp(&S1) {
             Ordering::Less => {
                 let factor = pow10(S1 - S0);
-                if self.0 <= i128::MAX / factor {
+                if self.0 <= i128::MAX / factor / 10 {
                     Fixed::try_new_with_exponent(
                         other.0.checked_add(self.0 * factor)?,
-                        (S1 - S0) as i32,
+                        S2 as i32 - S1 as i32,
                     )
                 } else {
                     let result = (I256::from_product(self.0, factor) + I256::from(other.0))
@@ -661,10 +761,10 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
             }
             Ordering::Greater => {
                 let factor = pow10(S0 - S1);
-                if other.0 <= i128::MAX / factor {
+                if other.0 <= i128::MAX / factor / 10 {
                     Fixed::try_new_with_exponent(
                         self.0.checked_add(other.0 * factor)?,
-                        (S0 - S1) as i32,
+                        S2 as i32 - S0 as i32,
                     )
                 } else {
                     let result = (I256::from_product(other.0, factor) + I256::from(self.0))
@@ -745,7 +845,8 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
         }
     }
 
-    /// Compute `self + other`, panicking if overflow occurs.
+    /// Compute `self + other`, rounding toward zero, panicking if overflow
+    /// occurs.
     pub fn strict_add_generic<
         const P1: usize,
         const S1: usize,
@@ -758,7 +859,8 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
         self.checked_add_generic(other).unwrap()
     }
 
-    /// Compute `self - other`, panicking if overflow occurs.
+    /// Compute `self - other`, rounding toward zero, panicking if overflow
+    /// occurs.
     pub fn strict_sub_generic<
         const P1: usize,
         const S1: usize,
@@ -771,7 +873,8 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
         self.checked_sub_generic(other).unwrap()
     }
 
-    /// Compute `self * other`, panicking if overflow occurs.
+    /// Compute `self * other`, rounding toward zero, panicking if overflow
+    /// occurs.
     pub fn strict_mul_generic<
         const P1: usize,
         const S1: usize,
@@ -784,8 +887,8 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
         self.checked_mul_generic(other).unwrap()
     }
 
-    /// Compute `self / other`, panicking if overflow occurs or if `other` is
-    /// zero.
+    /// Compute `self / other`, rounding toward zero, panicking if overflow
+    /// occurs or if `other` is zero.
     pub fn strict_div_generic<
         const P1: usize,
         const S1: usize,
@@ -917,6 +1020,11 @@ impl<const P: usize, const S: usize> From<Fixed<P, S>> for i128 {
 impl<const P: usize, const S: usize> Add for Fixed<P, S> {
     type Output = Self;
 
+    /// Returns the sum, rounding toward zero.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the result is out of range.
     fn add(self, other: Self) -> Self::Output {
         self.checked_add(&other).unwrap()
     }
@@ -925,24 +1033,41 @@ impl<const P: usize, const S: usize> Add for Fixed<P, S> {
 impl<const P: usize, const S: usize> Add for &Fixed<P, S> {
     type Output = Fixed<P, S>;
 
+    /// Returns the sum, which is exact if the result is in range.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the result is out of range.
     fn add(self, other: Self) -> Self::Output {
         self.checked_add(other).unwrap()
     }
 }
 
 impl<const P: usize, const S: usize> CheckedAdd for Fixed<P, S> {
+    /// Returns the sum, which is exact, or `None` if the result is out of
+    /// range.
     fn checked_add(&self, other: &Self) -> Option<Self> {
         self.checked_add_generic(*other)
     }
 }
 
 impl<const P: usize, const S: usize> AddAssign for Fixed<P, S> {
+    /// Adds `other` to `self`, which is an exact calculation.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the result is out of range.
     fn add_assign(&mut self, other: Self) {
         *self = *self + other;
     }
 }
 
 impl<const P: usize, const S: usize> AddAssign<&Fixed<P, S>> for Fixed<P, S> {
+    /// Adds `other` to `self`, which is an exact calculation.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the result is out of range.
     fn add_assign(&mut self, other: &Fixed<P, S>) {
         *self = *self + *other;
     }
@@ -951,6 +1076,11 @@ impl<const P: usize, const S: usize> AddAssign<&Fixed<P, S>> for Fixed<P, S> {
 impl<const P: usize, const S: usize> Sub for Fixed<P, S> {
     type Output = Self;
 
+    /// Returns the difference, which is exact if the result is in range.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the result is out of range.
     fn sub(self, other: Self) -> Self::Output {
         self.checked_sub(&other).unwrap()
     }
@@ -959,18 +1089,30 @@ impl<const P: usize, const S: usize> Sub for Fixed<P, S> {
 impl<const P: usize, const S: usize> Sub for &Fixed<P, S> {
     type Output = Fixed<P, S>;
 
+    /// Returns the difference, which is exact if the result is in range.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the result is out of range.
     fn sub(self, other: Self) -> Self::Output {
         self.checked_sub(other).unwrap()
     }
 }
 
 impl<const P: usize, const S: usize> CheckedSub for Fixed<P, S> {
+    /// Returns the difference, which is exact, or `None` if the result is out
+    /// of range.
     fn checked_sub(&self, other: &Self) -> Option<Self> {
         self.checked_sub_generic(*other)
     }
 }
 
 impl<const P: usize, const S: usize> SubAssign for Fixed<P, S> {
+    /// Subtracts `other` from `self`, which is an exact calculation.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the result is out of range.
     fn sub_assign(&mut self, other: Self) {
         *self = *self - other;
     }
@@ -979,6 +1121,11 @@ impl<const P: usize, const S: usize> SubAssign for Fixed<P, S> {
 impl<const P: usize, const S: usize> Mul for Fixed<P, S> {
     type Output = Self;
 
+    /// Returns the product, rounding toward zero.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the result is out of range.
     fn mul(self, other: Self) -> Self::Output {
         self.checked_mul(&other).unwrap()
     }
@@ -987,18 +1134,30 @@ impl<const P: usize, const S: usize> Mul for Fixed<P, S> {
 impl<const P: usize, const S: usize> Mul for &Fixed<P, S> {
     type Output = Fixed<P, S>;
 
+    /// Returns the product, rounding toward zero.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the result is out of range.
     fn mul(self, other: Self) -> Self::Output {
         self.checked_mul(other).unwrap()
     }
 }
 
 impl<const P: usize, const S: usize> CheckedMul for Fixed<P, S> {
+    /// Returns the product, rounding toward zero, or `None` if the result is
+    /// out of range.
     fn checked_mul(&self, other: &Self) -> Option<Self> {
         Self::checked_mul_generic(*self, *other)
     }
 }
 
 impl<const P: usize, const S: usize> MulAssign for Fixed<P, S> {
+    /// Multiplies `self` by `other`, rounding toward zero.
+    ///
+    /// # Panic
+    ///
+    /// Panics if the result is out of range.
     fn mul_assign(&mut self, other: Self) {
         *self = *self * other;
     }
@@ -1007,6 +1166,11 @@ impl<const P: usize, const S: usize> MulAssign for Fixed<P, S> {
 impl<const P: usize, const S: usize> Div for Fixed<P, S> {
     type Output = Self;
 
+    /// Returns the quotient, rounding toward zero.
+    ///
+    /// # Panic
+    ///
+    /// Panics if `other` is zero or the result is out of range.
     fn div(self, other: Self) -> Self::Output {
         self.checked_div(&other).unwrap()
     }
@@ -1015,18 +1179,30 @@ impl<const P: usize, const S: usize> Div for Fixed<P, S> {
 impl<const P: usize, const S: usize> Div for &Fixed<P, S> {
     type Output = Fixed<P, S>;
 
+    /// Returns the quotient, rounding toward zero.
+    ///
+    /// # Panic
+    ///
+    /// Panics if `other` is zero or the result is out of range.
     fn div(self, other: Self) -> Self::Output {
         self.checked_div(other).unwrap()
     }
 }
 
 impl<const P: usize, const S: usize> CheckedDiv for Fixed<P, S> {
+    /// Returns the quotient, rounding toward zero, or `None` if `other` is zero
+    /// or the result is out of range.
     fn checked_div(&self, other: &Self) -> Option<Self> {
         Self::checked_div_generic(*self, *other)
     }
 }
 
 impl<const P: usize, const S: usize> DivAssign for Fixed<P, S> {
+    /// Divides `self` by `other`, rounding toward zero.
+    ///
+    /// # Panic
+    ///
+    /// Panics if `other` is zero or the result is out of range.
     fn div_assign(&mut self, other: Self) {
         *self = *self / other;
     }
@@ -1035,6 +1211,7 @@ impl<const P: usize, const S: usize> DivAssign for Fixed<P, S> {
 impl<const P: usize, const S: usize> Neg for Fixed<P, S> {
     type Output = Self;
 
+    /// Returns `-self`.  This is an exact calculation that cannot overflow.
     fn neg(self) -> Self::Output {
         Self(-self.0)
     }
@@ -1043,6 +1220,7 @@ impl<const P: usize, const S: usize> Neg for Fixed<P, S> {
 impl<const P: usize, const S: usize> Neg for &Fixed<P, S> {
     type Output = Fixed<P, S>;
 
+    /// Returns `-self`.  This is an exact calculation that cannot overflow.
     fn neg(self) -> Self::Output {
         Fixed(-self.0)
     }
@@ -1054,6 +1232,12 @@ pub struct ParseFixedError;
 impl<const P: usize, const S: usize> FromStr for Fixed<P, S> {
     type Err = ParseFixedError;
 
+    /// Parses `s` as `Fixed`.
+    ///
+    /// This accepts the same forms as [f64::from_str], except that it rejects
+    /// infinities and NaNs (which `Fixed` does not support), as well as
+    /// out-of-range values.  Rounds overprecise values to the nearest
+    /// representable value, rounding halfway values to even.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Non-generic inner function to reduce monomorphization cost.
         fn inner(s: &str, scale: i32) -> Option<(i128, i32)> {
@@ -1116,14 +1300,25 @@ impl<const P: usize, const S: usize> FromStr for Fixed<P, S> {
         }
 
         inner(s, S as i32)
-            .and_then(|(value, exponent)| Self::try_new_with_exponent(value, exponent))
+            .and_then(|(value, exponent)| Self::try_new_with_exponent_round_even(value, exponent))
             .ok_or(ParseFixedError)
     }
 }
 
+/// This is a doc-test to check that trying to instantiate the value 1 for a
+/// type that can't represent it properly fails, with an error like "all values
+/// of Fixed::<S,P>::one() for S >= P have magnitude less than one"
+///
+/// ```compile_fail
+/// use feldera_fp::Fixed;
+///
+/// let _ = Fixed::<5,5>::ONE;
+/// ```
+fn _invalid_constant_test() {}
+
 #[cfg(test)]
 mod test {
-    use num_traits::{CheckedDiv, CheckedMul};
+    use num_traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub};
 
     use crate::Fixed;
     use std::{fmt::Write, hint::black_box, str::FromStr, time::Instant};
@@ -1255,20 +1450,38 @@ mod test {
 
     #[test]
     fn mul() {
-        for a in -1000..1000 {
+        // A few specific handwritten cases.
+        assert_eq!(f(1.23) * f(2.34), f(2.87));
+        assert_eq!(f(-1.23) * f(2.34), f(-2.87));
+        assert_eq!(f(1.23) * f(-2.34), f(-2.87));
+        assert_eq!(f(-1.23) * f(-2.34), f(2.87));
+
+        // General case.
+        for a in -999..=999 {
             let af: Fixed<10, 2> = Fixed(a);
-            for b in -1000..1000 {
+            for b in -999..=999 {
                 let bf: Fixed<10, 2> = Fixed(b);
                 assert_eq!(af * bf, Fixed(a * b / 100));
+            }
+        }
+
+        // General case with overflow.
+        for a in -999..=999 {
+            let af: Fixed<3, 2> = Fixed(a);
+            for b in -999..=999 {
+                let bf: Fixed<3, 2> = Fixed(b);
+                let c = a * b / 100;
+                let expected = (c.unsigned_abs() < 1000).then(|| Fixed(c));
+                assert_eq!(af.checked_mul(&bf), expected);
             }
         }
     }
 
     #[test]
     fn mul_generic() {
-        for a in -1000..1000 {
+        for a in -999..=999 {
             let af: Fixed<10, 2> = Fixed(a);
-            for b in -1000..1000 {
+            for b in -999..=999 {
                 let bf: Fixed<10, 3> = Fixed(b);
                 let cf: Fixed<10, 5> = af.checked_mul_generic(bf).unwrap();
                 assert_eq!(cf, Fixed(a * b));
@@ -1282,6 +1495,7 @@ mod test {
 
     #[test]
     fn div() {
+        // A few specific handwritten cases.
         assert_eq!(f(1.23) / f(2.34), f(0.52));
         assert_eq!(f(-1.23) / f(2.34), f(-0.52));
         assert_eq!(f(1.23) / f(-2.34), f(-0.52));
@@ -1295,6 +1509,179 @@ mod test {
             f38_0(123.0).checked_div_generic::<38, 38, 38, 38>(f38_38("0.456")),
             None
         );
+
+        // General case.
+        for a in -999..=999 {
+            let af: Fixed<10, 2> = Fixed(a);
+            for b in -999..=999 {
+                let bf: Fixed<10, 2> = Fixed(b);
+                assert_eq!(af.checked_div(&bf), (b != 0).then(|| Fixed(a * 100 / b)));
+            }
+        }
+
+        // General case with overflow.
+        for a in -999..=999 {
+            let af: Fixed<3, 2> = Fixed(a);
+            for b in -999..=999 {
+                let bf: Fixed<3, 2> = Fixed(b);
+                let expected = if b != 0 {
+                    let result = a * 100 / b;
+                    (result.unsigned_abs() <= 999).then_some(Fixed(result))
+                } else {
+                    None
+                };
+                assert_eq!(af.checked_div(&bf), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn div_generic() {
+        for a in -999..=999 {
+            let af: Fixed<10, 2> = Fixed(a);
+            for b in -999..=999 {
+                if b != 0 {
+                    let bf: Fixed<10, 3> = Fixed(b);
+                    let cf: Fixed<10, 5> = af.checked_div_generic(bf).unwrap();
+                    assert_eq!(cf, Fixed(a * 1_000_000 / b));
+                    let df: Fixed<10, 6> = af.checked_div_generic(bf).unwrap();
+                    assert_eq!(df, Fixed(a * 10_000_000 / b));
+                    let ef: Fixed<10, 0> = af.checked_div_generic(bf).unwrap();
+                    assert_eq!(ef, Fixed(a * 10 / b));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn add() {
+        // A few specific handwritten cases.
+        assert_eq!(f(1.23) + f(2.34), f(3.57));
+        assert_eq!(f(-1.23) + f(2.34), f(1.11));
+        assert_eq!(f(1.23) + f(-2.34), f(-1.11));
+        assert_eq!(f(-1.23) + f(-2.34), f(-3.57));
+
+        // General case.
+        for a in -999..=999 {
+            let af: Fixed<10, 2> = Fixed(a);
+            for b in -999..=999 {
+                let bf: Fixed<10, 2> = Fixed(b);
+                assert_eq!(af + bf, Fixed(a + b));
+            }
+        }
+
+        // General case with overflow.
+        for a in -999..=999 {
+            let af: Fixed<3, 2> = Fixed(a);
+            for b in -999..=999 {
+                let bf: Fixed<3, 2> = Fixed(b);
+                let c = a + b;
+                let expected = (c.unsigned_abs() < 1000).then(|| Fixed(c));
+                assert_eq!(af.checked_add(&bf), expected);
+            }
+        }
+
+        // General case with type conversion.
+        for a in -999..=999 {
+            let af: Fixed<10, 2> = Fixed(a);
+            for b in -999..=999 {
+                let bf: Fixed<10, 3> = Fixed(b);
+                let cf: Fixed<10, 5> = af.checked_add_generic(bf).unwrap();
+                assert_eq!(cf, Fixed(a * 1000 + b * 100), "{af} + {bf} ?= {cf}");
+                let cf: Fixed<10, 5> = bf.checked_add_generic(af).unwrap();
+                assert_eq!(cf, Fixed(a * 1000 + b * 100), "{bf} + {af} ?= {cf}");
+                let df: Fixed<10, 6> = af.checked_add_generic(bf).unwrap();
+                assert_eq!(df, Fixed(a * 10_000 + b * 1000), "{af} + {bf} ?= {df}");
+                let ef: Fixed<10, 0> = af.checked_add_generic(bf).unwrap();
+                assert_eq!(ef, Fixed((a * 10 + b) / 1000), "{af} + {bf} ?= {ef}");
+            }
+        }
+    }
+
+    #[test]
+    fn sub() {
+        // A few specific handwritten cases.
+        assert_eq!(f(1.23) - f(2.34), f(-1.11));
+        assert_eq!(f(-1.23) - f(2.34), f(-3.57));
+        assert_eq!(f(1.23) - f(-2.34), f(3.57));
+        assert_eq!(f(-1.23) - f(-2.34), f(1.11));
+
+        // General case.
+        for a in -999..=999 {
+            let af: Fixed<10, 2> = Fixed(a);
+            for b in -999..=999 {
+                let bf: Fixed<10, 2> = Fixed(b);
+                assert_eq!(af - bf, Fixed(a - b));
+            }
+        }
+
+        // General case with overflow.
+        for a in -999..=999 {
+            let af: Fixed<3, 2> = Fixed(a);
+            for b in -999..=999 {
+                let bf: Fixed<3, 2> = Fixed(b);
+                let c = a - b;
+                let expected = (c.unsigned_abs() < 1000).then(|| Fixed(c));
+                assert_eq!(af.checked_sub(&bf), expected);
+            }
+        }
+
+        // General case with type conversion.
+        for a in -999..=999 {
+            let af: Fixed<10, 2> = Fixed(a);
+            for b in -999..=999 {
+                let bf: Fixed<10, 3> = Fixed(b);
+                let cf: Fixed<10, 5> = af.checked_sub_generic(bf).unwrap();
+                assert_eq!(cf, Fixed(a * 1000 - b * 100), "{af} - {bf} ?= {cf}");
+                let cf: Fixed<10, 5> = bf.checked_sub_generic(af).unwrap();
+                assert_eq!(cf, Fixed(b * 100 - a * 1000), "{bf} - {af} ?= {cf}");
+                let df: Fixed<10, 6> = af.checked_sub_generic(bf).unwrap();
+                assert_eq!(df, Fixed(a * 10_000 - b * 1000));
+            }
+        }
+    }
+
+    #[test]
+    fn powi() {
+        assert_eq!(f(2.0).powi(3), f(8.0));
+        assert_eq!(f(-2.0).powi(3), f(-8.0));
+        assert_eq!(f(1.7).powi(8), f(69.76));
+        assert_eq!(f(0.0).powi(1), f(1.0));
+        assert_eq!(f(0.0).checked_powi(0), None);
+    }
+
+    #[test]
+    fn constants() {
+        assert_eq!(Fixed::<5, 0>::MAX, Fixed(99999));
+        assert_eq!(Fixed::<5, 0>::MIN, Fixed(-99999));
+        assert_eq!(Fixed::<5, 0>::ZERO, Fixed(0));
+        assert_eq!(Fixed::<5, 0>::ONE, Fixed(1));
+
+        assert_eq!(Fixed::<5, 1>::MAX, Fixed(99999));
+        assert_eq!(Fixed::<5, 1>::MIN, Fixed(-99999));
+        assert_eq!(Fixed::<5, 1>::ZERO, Fixed(0));
+        assert_eq!(Fixed::<5, 1>::ONE, Fixed(10));
+
+        assert_eq!(Fixed::<5, 2>::MAX, Fixed(99999));
+        assert_eq!(Fixed::<5, 2>::MIN, Fixed(-99999));
+        assert_eq!(Fixed::<5, 2>::ZERO, Fixed(0));
+        assert_eq!(Fixed::<5, 2>::ONE, Fixed(100));
+
+        assert_eq!(Fixed::<5, 3>::MAX, Fixed(99999));
+        assert_eq!(Fixed::<5, 3>::MIN, Fixed(-99999));
+        assert_eq!(Fixed::<5, 3>::ZERO, Fixed(0));
+        assert_eq!(Fixed::<5, 3>::ONE, Fixed(1000));
+
+        assert_eq!(Fixed::<5, 4>::MAX, Fixed(99999));
+        assert_eq!(Fixed::<5, 4>::MIN, Fixed(-99999));
+        assert_eq!(Fixed::<5, 4>::ZERO, Fixed(0));
+        assert_eq!(Fixed::<5, 4>::ONE, Fixed(10000));
+
+        assert_eq!(Fixed::<5, 5>::MAX, Fixed(99999));
+        assert_eq!(Fixed::<5, 5>::MIN, Fixed(-99999));
+        assert_eq!(Fixed::<5, 5>::ZERO, Fixed(0));
+        // This would panic at compile time.  See [super::_invalid_constant_test].
+        //let _ = Fixed::<5, 5>::ONE;
     }
 
     #[test]
