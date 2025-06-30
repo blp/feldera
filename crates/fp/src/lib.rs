@@ -1255,10 +1255,29 @@ mod test {
 
     #[test]
     fn mul() {
-        assert_eq!(f(1.23) * f(2.34), f(2.87));
-        assert_eq!(f(-1.23) * f(2.34), f(-2.87));
-        assert_eq!(f(1.23) * f(-2.34), f(-2.87));
-        assert_eq!(f(-1.23) * f(-2.34), f(2.87));
+        for a in -1000..1000 {
+            let af: Fixed<10, 2> = Fixed(a);
+            for b in -1000..1000 {
+                let bf: Fixed<10, 2> = Fixed(b);
+                assert_eq!(af * bf, Fixed(a * b / 100));
+            }
+        }
+    }
+
+    #[test]
+    fn mul_generic() {
+        for a in -1000..1000 {
+            let af: Fixed<10, 2> = Fixed(a);
+            for b in -1000..1000 {
+                let bf: Fixed<10, 3> = Fixed(b);
+                let cf: Fixed<10, 5> = af.checked_mul_generic(bf).unwrap();
+                assert_eq!(cf, Fixed(a * b));
+                let df: Fixed<10, 6> = af.checked_mul_generic(bf).unwrap();
+                assert_eq!(df, Fixed(a * b * 10));
+                let ef: Fixed<10, 0> = af.checked_mul_generic(bf).unwrap();
+                assert_eq!(ef, Fixed(a * b / 100_000));
+            }
+        }
     }
 
     #[test]
@@ -1306,7 +1325,7 @@ mod test {
         );
         println!("{:?}", a.checked_div(&b));
 
-/*
+        /*
         println!(
             "{a} div {d}: {:?} {}",
             a.checked_div_integer(d).unwrap(),

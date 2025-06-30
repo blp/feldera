@@ -86,20 +86,16 @@ impl U256 {
         } else if u1 >= v {
             None
         } else {
-            //println!("\n{u1:016x} {u0:016x} / {v:016x}");
             // We're doing grade-school division in base 2**64.  This is the number
             // base.
             const BASE: u128 = 1 << 64;
 
             // Shift `v` so that it occupies the most-significant bits.
             let s = v.leading_zeros();
-            //dbg!(s);
             let v = v << s;
-            //println!("{v:016x}");
 
             let (vn1, vn0) = hi_lo(v);
             let un32 = (u1 << s) | u0.unbounded_shr(128 - s);
-            //println!("un128={un32:016x}");
             let (un1, un0) = hi_lo(u0 << s);
 
             let mut q1 = un32 / vn1;
@@ -112,8 +108,6 @@ impl U256 {
                 }
             }
 
-            //dbg!((un32, un1, q1, v));
-            //println!("un32={un32:016x} un1={un1:016x} q1={q1:016x} v={v:016x}");
             let un21 = un32
                 .wrapping_mul(BASE)
                 .wrapping_add(un1)
