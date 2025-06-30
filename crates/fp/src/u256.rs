@@ -214,6 +214,21 @@ impl I256 {
             Some(self.value.isqrt().try_into().ok()?)
         }
     }
+
+    /// Shifts this value just enough bits right that it fits in an `i128`.
+    /// Returns the shifted value and the number of bits that were shifted.
+    pub fn reduce_to_i128(self) -> (i128, usize) {
+        let (value, shift) = if self.value.0 != 0 {
+            let shift = (128 - self.value.0.leading_zeros()) + 1;
+            ((&self.value >> shift).1.cast_signed(), shift as usize)
+        } else if self.value.1 > i128::MAX.cast_unsigned() {
+            ((self.value.1 >> 1).cast_signed(), 1)
+        } else {
+            (self.value.1.cast_signed(), 0)
+        };
+        let value = if self.negative { -value } else { value };
+        (value, shift)
+    }
 }
 
 impl Add for I256 {

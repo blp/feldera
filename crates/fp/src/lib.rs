@@ -617,9 +617,8 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         Fixed::<1, 0>(1).checked_div_generic(*self)
     }
 
-    /// Returns the reciprocal (inverse) of this value, `1/x`.
-    /// This works even if `1` is out of range for this type, as long as `1/x`
-    /// is in range.
+    /// Returns the reciprocal (inverse) of this value, `1/x`.  This works even
+    /// if `1` is out of range for this type, as long as `1/x` is in range.
     ///
     /// # Panic
     ///
@@ -628,6 +627,15 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         self.checked_recip().unwrap()
     }
 
+    /// Returns this value raised to `exp` power, rounding toward zero, or
+    /// `None` if the result is out of range or if this value is 0 and `exp` is
+    /// nonpositive.
+    ///
+    /// # Accuracy
+    ///
+    /// For `exp > 0`, this computes intermediate results with more than `S`
+    /// digits of precision, if possible, to allow to better accuracy in the
+    /// result.  For `exp < 0`, this isn't implemented yet.
     pub fn checked_powi(&self, exp: i32) -> Option<Self> {
         if self.is_zero() {
             (exp > 0).then_some(Self::ZERO)
@@ -640,21 +648,27 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
             }
         } else if exp > 0 {
             let mut exp = exp.unsigned_abs();
-            let mut base = *self;
-            let mut acc: Option<Fixed<P, S>> = None;
+            let mut base = self.0;
+            let mut base_scale = S;
+            let mut acc: Option<(i128, usize)> = None;
             loop {
                 if (exp & 1) == 1 {
-                    acc = if let Some(acc) = acc {
-                        Some(acc.checked_mul(&base)?)
+                    acc = if let Some((acc, acc_scale)) = acc {
+                        let (acc, shift) = I256::from_product(acc, base).reduce_to_i128();
+                        Some((acc, (acc_scale + base_scale) - shift))
                     } else {
-                        Some(base)
+                        Some((base, base_scale))
                     };
                 }
                 exp /= 2;
                 if exp == 0 {
-                    return acc;
+                    let (acc, acc_scale) = acc.unwrap();
+                    return Self::try_new_with_exponent(acc, S as i32 - acc_scale as i32);
                 }
-                base *= base;
+
+                let (next_base, shift) = I256::from_product(base, base).reduce_to_i128();
+                base = next_base;
+                base_scale = base_scale * 2 - shift;
             }
         } else {
             let mut exp = exp.unsigned_abs();
@@ -1645,9 +1659,11 @@ mod test {
     fn powi() {
         assert_eq!(f(2.0).powi(3), f(8.0));
         assert_eq!(f(-2.0).powi(3), f(-8.0));
-        assert_eq!(f(1.7).powi(8), f(69.76));
-        assert_eq!(f(0.0).powi(1), f(1.0));
+        assert_eq!(f(1.7).powi(8), f(69.75));
+        assert_eq!(f(1.7).powi(-8), f(0.01));
+        assert_eq!(f(0.0).powi(1), f(0.0));
         assert_eq!(f(0.0).checked_powi(0), None);
+        assert_eq!(f(0.0).checked_powi(-1), None);
     }
 
     #[test]
