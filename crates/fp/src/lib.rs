@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     fmt::{Debug, Display},
     io::Write,
-    ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Range, Sub, SubAssign},
+    ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign},
     str::FromStr,
 };
 
@@ -213,6 +213,42 @@ fn round_inner(value: i128, scale: i32, n: i32, halfway: Halfway) -> Option<i128
     }
 }
 
+/// Returns `floor(x / y)`.  This is copied out of `i128::div_floor` in the
+/// standard library, which is not yet stable.
+const fn div_floor(x: i128, y: i128) -> i128 {
+    let d = x / y;
+    let r = x % y;
+
+    // If the remainder is non-zero, we need to subtract one if the
+    // signs of lhs and rhs differ, as this means we rounded upwards
+    // instead of downwards. We do this branchlessly by creating a mask
+    // which is all-ones iff the signs differ, and 0 otherwise. Then by
+    // adding this mask (which corresponds to the signed value -1), we
+    // get our correction.
+    let correction = (x ^ y) >> (i128::BITS - 1);
+    if r != 0 {
+        d + correction
+    } else {
+        d
+    }
+}
+
+/// Returns `ceil(x / y)`.  This is copied out of `i128::div_ceil` in the
+/// standard library, which is not yet stable.
+const fn div_ceil(x: i128, y: i128) -> i128 {
+    let d = x / y;
+    let r = x % y;
+
+    // When remainder is non-zero we have a.div_ceil(b) == 1 + a.div_floor(b),
+    // so we can re-use the algorithm from div_floor, just adding 1.
+    let correction = 1 + ((x ^ y) >> (i128::BITS - 1));
+    if r != 0 {
+        d + correction
+    } else {
+        d
+    }
+}
+
 impl<const P: usize, const S: usize> Fixed<P, S> {
     /// Largest value for this type, e.g. 999.99 for `Fixed<5,2>`.
     pub const MAX: Self = Self(pow10(P) - 1);
@@ -243,7 +279,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics (at compile time) if this type cannot hold every `i64` value.
+    /// Panics if this type cannot hold every `i64` value.
     pub const fn for_i64(value: i64) -> Self {
         assert!(P.saturating_sub(S) >= 19);
         Self(value as i128 * Self::scale())
@@ -253,7 +289,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics (at compile time) if this type cannot hold every `u64` value.
+    /// Panics if this type cannot hold every `u64` value.
     pub const fn for_u64(value: u64) -> Self {
         assert!(P.saturating_sub(S) >= 19);
         Self(value as i128 * Self::scale())
@@ -263,7 +299,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics (at compile time) if this type cannot hold every `i32` value.
+    /// Panics if this type cannot hold every `i32` value.
     pub const fn for_i32(value: i32) -> Self {
         assert!(P.saturating_sub(S) >= 10);
         Self(value as i128 * Self::scale())
@@ -273,7 +309,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics (at compile time) if this type cannot hold every `u32` value.
+    /// Panics if this type cannot hold every `u32` value.
     pub const fn for_u32(value: u32) -> Self {
         assert!(P.saturating_sub(S) >= 10);
         Self(value as i128 * Self::scale())
@@ -283,7 +319,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics (at compile time) if this type cannot hold every `i16` value.
+    /// Panics if this type cannot hold every `i16` value.
     pub const fn for_i16(value: i16) -> Self {
         assert!(P.saturating_sub(S) >= 5);
         Self(value as i128 * Self::scale())
@@ -293,7 +329,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics (at compile time) if this type cannot hold every `u16` value.
+    /// Panics if this type cannot hold every `u16` value.
     pub const fn for_u16(value: u16) -> Self {
         assert!(P.saturating_sub(S) >= 5);
         Self(value as i128 * Self::scale())
@@ -303,7 +339,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics (at compile time) if this type cannot hold every `i8` value.
+    /// Panics if this type cannot hold every `i8` value.
     pub const fn for_i8(value: i8) -> Self {
         assert!(P.saturating_sub(S) >= 3);
         Self(value as i128 * Self::scale())
@@ -313,7 +349,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics (at compile time) if this type cannot hold every `u8` value.
+    /// Panics if this type cannot hold every `u8` value.
     pub const fn for_u8(value: u8) -> Self {
         assert!(P.saturating_sub(S) >= 3);
         Self(value as i128 * Self::scale())
@@ -323,7 +359,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics (at compile time) if this type cannot hold every `isize` value.
+    /// Panics if this type cannot hold every `isize` value.
     pub const fn for_isize(value: isize) -> Self {
         match isize::BITS {
             64 => Self::for_i64(value as i64),
@@ -337,7 +373,7 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics (at compile time) if this type cannot hold every `usize` value.
+    /// Panics if this type cannot hold every `usize` value.
     pub const fn for_usize(value: usize) -> Self {
         match usize::BITS {
             64 => Self::for_u64(value as u64),
@@ -433,27 +469,6 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
     const fn scale() -> i128 {
         Self::check_constraints();
         pow10(S)
-    }
-
-    /// Returns the maximum `i128` that can be converted to this type.
-    pub const fn max_i128() -> i128 {
-        if P > S {
-            pow10(P - S) - 1
-        } else {
-            0
-        }
-    }
-
-    /// Returns the minimum `i128` that can be converted to this type.
-    pub const fn min_i128() -> i128 {
-        -Self::max_i128()
-    }
-
-    /// Returns the range of `i128`s that can be converted to this type.
-    ///
-    /// If `S == P`, the range contains only 0.
-    pub const fn i128_range() -> Range<i128> {
-        Self::min_i128()..Self::max_i128() + 1
     }
 
     /// Integer division, as defined for `divide-integer` in [General Decimal
@@ -556,36 +571,38 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         self.checked_round_ties_even(n).unwrap()
     }
 
-    /// Rounds down to the nearest integer.
-    pub fn floor(&self) -> Self {
+    /// Returns this value rounded down to the nearest integer, or `None` if
+    /// rounding caused overflow.
+    pub fn checked_floor(&self) -> Option<Self> {
         if S > 0 {
-            Self(self.0 / Self::scale() * Self::scale())
+            Self::try_new(div_floor(self.0, Self::scale()) * Self::scale())
         } else {
-            *self
+            Some(*self)
         }
     }
 
-    /// Returns the integer part of this value, truncating non-integers toward zero.
+    /// Rounds down to the nearest integer, like [checked_floor].
+    ///
+    /// # Panic
+    ///
+    /// Panics if rounding causes overflow.
+    ///
+    /// [checked_floor]: Self::checked_floor
+    pub fn floor(&self) -> Self {
+        self.checked_floor().unwrap()
+    }
+
+    /// Returns the integer part of this value, truncating non-integers toward
+    /// zero.  This is an exact calculation that cannot overflow.
     pub fn truncate(&self) -> Self {
-        if S > 0 {
-            fn round(x: i128, s: i128) -> i128 {
-                x / s * s
-            }
-            if self.0 >= 0 {
-                Self(round(self.0, Self::scale()))
-            } else {
-                Self(-round(-self.0, Self::scale()))
-            }
-        } else {
-            *self
-        }
+        Self(self.0 / Self::scale() * Self::scale())
     }
 
     /// Returns this value rounded up to the nearest integer, or `None` if
     /// rounding caused overflow.
     pub fn checked_ceil(&self) -> Option<Self> {
         if S > 0 {
-            Self::try_new(self.0.checked_add(Self::scale() - 1)? / Self::scale() * Self::scale())
+            Self::try_new(div_ceil(self.0, Self::scale()) * Self::scale())
         } else {
             Some(*self)
         }
@@ -610,11 +627,15 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
 
     /// Returns the reciprocal (inverse) of this value, `1/x`, or `None` if `x`
     /// is zero or `1/x` is out of range.
-    ///
-    /// This works even if `1` is out of range for this type, as long as `1/x`
-    /// is in range.
     pub fn checked_recip(&self) -> Option<Self> {
-        Fixed::<1, 0>(1).checked_div_generic(*self)
+        if S < P {
+            Self(Self::scale()).checked_div(self)
+        } else {
+            // `1` is out of range for this type, therefore `abs(self) < 1`,
+            // therefore `abs(1/self) > 1`, therefore the result is out of
+            // range.
+            None
+        }
     }
 
     /// Returns the reciprocal (inverse) of this value, `1/x`.  This works even
@@ -649,13 +670,13 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         } else if exp > 0 {
             let mut exp = exp.unsigned_abs();
             let mut base = self.0;
-            let mut base_scale = S;
-            let mut acc: Option<(i128, usize)> = None;
+            let mut base_scale = S as i32;
+            let mut acc = None;
             loop {
                 if (exp & 1) == 1 {
                     acc = if let Some((acc, acc_scale)) = acc {
-                        let (acc, shift) = I256::from_product(acc, base).reduce_to_i128();
-                        Some((acc, (acc_scale + base_scale) - shift))
+                        let (acc, shift) = dbg!(I256::from_product(acc, base).reduce_to_i128());
+                        Some((acc, (acc_scale + base_scale) - shift as i32))
                     } else {
                         Some((base, base_scale))
                     };
@@ -663,12 +684,12 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
                 exp /= 2;
                 if exp == 0 {
                     let (acc, acc_scale) = acc.unwrap();
-                    return Self::try_new_with_exponent(acc, S as i32 - acc_scale as i32);
+                    return Self::try_new_with_exponent(acc, S as i32 - acc_scale);
                 }
 
-                let (next_base, shift) = I256::from_product(base, base).reduce_to_i128();
+                let (next_base, shift) = dbg!(I256::from_product(base, base).reduce_to_i128());
                 base = next_base;
-                base_scale = base_scale * 2 - shift;
+                base_scale = base_scale * 2 - shift as i32;
             }
         } else {
             let mut exp = exp.unsigned_abs();
@@ -691,6 +712,16 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         }
     }
 
+    /// Returns this value raised to `exp` power, rounding toward zero.
+    ///
+    /// For `exp > 0`, this computes intermediate results with more than `S`
+    /// digits of precision, if possible, to allow to better accuracy in the
+    /// result.  For `exp < 0`, this isn't implemented yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the result is out of range or if this value is 0 and `exp` is
+    /// nonpositive.
     pub fn powi(&self, exp: i32) -> Self {
         self.checked_powi(exp).unwrap()
     }
@@ -720,13 +751,21 @@ impl<const P0: usize, const S0: usize> Fixed<P0, S0> {
     /// Returns this value converted into another type `Fixed<P1, S1>`, or
     /// `None` if this value is outside the range of the target type.  If the
     /// conversion is successful, then the result is exactly the same as the
-    /// original value if `S1 >= S0`, and rounded to even otherwise.
+    /// original value if `S1 >= S0`, and rounded down otherwise.
     ///
     /// This should be implemented as `TryFrom` but that [conflicts with the
     /// standard library
     /// implementation](https://users.rust-lang.org/t/conflicting-implementations-of-trait-from/92994).
     pub fn convert<const P1: usize, const S1: usize>(&self) -> Option<Fixed<P1, S1>> {
-        Fixed::try_new_with_exponent(self.0, (S1 - S0) as i32)
+        Fixed::try_new_with_exponent(self.0, S1 as i32 - S0 as i32)
+    }
+
+    /// Returns this value converted into another type `Fixed<P1, S1>`, or
+    /// `None` if this value is outside the range of the target type.  If the
+    /// conversion is successful, then the result is exactly the same as the
+    /// original value if `S1 >= S0`, and rounded to even otherwise.
+    pub fn convert_round_even<const P1: usize, const S1: usize>(&self) -> Option<Fixed<P1, S1>> {
+        Fixed::try_new_with_exponent_round_even(self.0, S1 as i32 - S0 as i32)
     }
 
     /// Returns -1 if this value is less than zero, 0 if this value is zero, and
@@ -958,7 +997,7 @@ impl<const P: usize, const S: usize> TryFrom<i128> for Fixed<P, S> {
     /// range.  This is an exact conversion that cannot lose precision if it
     /// succeeds.
     fn try_from(value: i128) -> Result<Self, Self::Error> {
-        if Self::i128_range().contains(&value) {
+        if value.unsigned_abs() <= Self::max_u128() {
             Ok(Self(value * Self::scale()))
         } else {
             Err(OutOfRange)
@@ -1021,6 +1060,68 @@ try_from_unsigned_int!(u64);
 try_from_unsigned_int!(u32);
 try_from_unsigned_int!(u16);
 try_from_unsigned_int!(u8);
+
+macro_rules! min_max_int {
+    ($signed_type:ty, $max_signed:ident, $min_signed:ident, $unsigned_type:ty, $max_unsigned:ident) => {
+        #[doc = "Returns the maximum `"]
+        #[doc = stringify!($signed_type)]
+        #[doc = "` that can be converted to this type."]
+        pub const fn $max_signed() -> $signed_type {
+            if Self::max_i128() > <$signed_type>::MAX as i128 {
+                <$signed_type>::MAX
+            } else {
+                Self::max_i128() as $signed_type
+            }
+        }
+
+        #[doc = "Returns the minimum `"]
+        #[doc = stringify!($signed_type)]
+        #[doc = "` that can be converted to this type."]
+        pub const fn $min_signed() -> $signed_type {
+            -Self::$max_signed()
+        }
+
+        #[doc = "Returns the maximum `"]
+        #[doc = stringify!($unsigned_type)]
+        #[doc = "` that can be converted to this type.\n\nThe minimum is 0."]
+        pub const fn $max_unsigned() -> $unsigned_type {
+            if Self::max_u128() > <$unsigned_type>::MAX as u128 {
+                <$unsigned_type>::MAX
+            } else {
+                Self::max_u128() as $unsigned_type
+            }
+        }
+    };
+}
+
+impl<const P: usize, const S: usize> Fixed<P, S> {
+    /// Returns the maximum `i128` that can be converted to this type.
+    pub const fn max_i128() -> i128 {
+        if P > S {
+            pow10(P - S) - 1
+        } else {
+            0
+        }
+    }
+
+    /// Returns the minimum `i128` that can be converted to this type.
+    pub const fn min_i128() -> i128 {
+        -Self::max_i128()
+    }
+
+    /// Returns the maximum `u128` that can be converted to this type.
+    ///
+    /// The minimum is 0.
+    pub const fn max_u128() -> u128 {
+        Self::max_i128().cast_unsigned()
+    }
+
+    min_max_int!(isize, max_isize, min_isize, usize, max_usize);
+    min_max_int!(i64, max_i64, min_i64, u64, max_u64);
+    min_max_int!(i32, max_i32, min_i32, u32, max_u32);
+    min_max_int!(i16, max_i16, min_i16, u16, max_u16);
+    min_max_int!(i8, max_i8, min_i8, u8, max_u8);
+}
 
 impl<const P: usize, const S: usize> From<Fixed<P, S>> for i128 {
     /// Convert from `Fixed` to integer, rounding toward zero (the same
@@ -1335,7 +1436,7 @@ mod test {
     use num_traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub};
 
     use crate::Fixed;
-    use std::{fmt::Write, hint::black_box, str::FromStr, time::Instant};
+    use std::{fmt::Write, str::FromStr};
 
     #[test]
     fn from_str() {
@@ -1657,6 +1758,14 @@ mod test {
 
     #[test]
     fn powi() {
+        assert_eq!(
+            Fixed::<10, 8>::from_str("1.12345678")
+                .unwrap()
+                .powi(8)
+                .to_string()
+                .as_str(),
+            "2.53776238"
+        );
         assert_eq!(f(2.0).powi(3), f(8.0));
         assert_eq!(f(-2.0).powi(3), f(-8.0));
         assert_eq!(f(1.7).powi(8), f(69.75));
@@ -1664,6 +1773,102 @@ mod test {
         assert_eq!(f(0.0).powi(1), f(0.0));
         assert_eq!(f(0.0).checked_powi(0), None);
         assert_eq!(f(0.0).checked_powi(-1), None);
+    }
+
+    #[test]
+    fn convert() {
+        let a = Fixed::<10, 10>::from_str("0.0123456789").unwrap();
+        assert_eq!(&a.convert::<10, 0>().unwrap().to_string(), "0");
+        assert_eq!(&a.convert::<10, 1>().unwrap().to_string(), "0");
+        assert_eq!(&a.convert::<10, 2>().unwrap().to_string(), "0.01");
+        assert_eq!(&a.convert::<10, 3>().unwrap().to_string(), "0.012");
+        assert_eq!(&a.convert::<10, 4>().unwrap().to_string(), "0.0123");
+        assert_eq!(&a.convert::<10, 5>().unwrap().to_string(), "0.01234");
+        assert_eq!(&a.convert::<10, 6>().unwrap().to_string(), "0.012345");
+        assert_eq!(&a.convert::<10, 7>().unwrap().to_string(), "0.0123456");
+        assert_eq!(&a.convert::<10, 8>().unwrap().to_string(), "0.01234567");
+        assert_eq!(&a.convert::<10, 9>().unwrap().to_string(), "0.012345678");
+        assert_eq!(&a.convert::<10, 10>().unwrap().to_string(), "0.0123456789");
+        assert_eq!(&a.convert_round_even::<10, 0>().unwrap().to_string(), "0");
+        assert_eq!(&a.convert_round_even::<10, 1>().unwrap().to_string(), "0");
+        assert_eq!(
+            &a.convert_round_even::<10, 2>().unwrap().to_string(),
+            "0.01"
+        );
+        assert_eq!(
+            &a.convert_round_even::<10, 3>().unwrap().to_string(),
+            "0.012"
+        );
+        assert_eq!(
+            &a.convert_round_even::<10, 4>().unwrap().to_string(),
+            "0.0123"
+        );
+        assert_eq!(
+            &a.convert_round_even::<10, 5>().unwrap().to_string(),
+            "0.01235"
+        );
+        assert_eq!(
+            &a.convert_round_even::<10, 6>().unwrap().to_string(),
+            "0.012346"
+        );
+        assert_eq!(
+            &a.convert_round_even::<10, 7>().unwrap().to_string(),
+            "0.0123457"
+        );
+        assert_eq!(
+            &a.convert_round_even::<10, 8>().unwrap().to_string(),
+            "0.01234568"
+        );
+        assert_eq!(
+            &a.convert_round_even::<10, 9>().unwrap().to_string(),
+            "0.012345679"
+        );
+        assert_eq!(
+            &a.convert_round_even::<10, 10>().unwrap().to_string(),
+            "0.0123456789"
+        );
+
+        let b = Fixed::<10, 5>::from_str("12345.67895").unwrap();
+        assert_eq!(&b.convert::<10, 0>().unwrap().to_string(), "12345");
+        assert_eq!(&b.convert::<10, 1>().unwrap().to_string(), "12345.6");
+        assert_eq!(&b.convert::<10, 2>().unwrap().to_string(), "12345.67");
+        assert_eq!(&b.convert::<10, 3>().unwrap().to_string(), "12345.678");
+        assert_eq!(&b.convert::<10, 4>().unwrap().to_string(), "12345.6789");
+        assert_eq!(&b.convert::<10, 5>().unwrap().to_string(), "12345.67895");
+        assert_eq!(b.convert::<10, 6>(), None);
+        assert_eq!(b.convert::<10, 7>(), None);
+        assert_eq!(b.convert::<10, 8>(), None);
+        assert_eq!(b.convert::<10, 9>(), None);
+        assert_eq!(b.convert::<10, 10>(), None);
+        assert_eq!(
+            &b.convert_round_even::<10, 0>().unwrap().to_string(),
+            "12346"
+        );
+        assert_eq!(
+            &b.convert_round_even::<10, 1>().unwrap().to_string(),
+            "12345.7"
+        );
+        assert_eq!(
+            &b.convert_round_even::<10, 2>().unwrap().to_string(),
+            "12345.68"
+        );
+        assert_eq!(
+            &b.convert_round_even::<10, 3>().unwrap().to_string(),
+            "12345.679"
+        );
+        assert_eq!(
+            &b.convert_round_even::<10, 4>().unwrap().to_string(),
+            "12345.679"
+        );
+        assert_eq!(
+            &b.convert_round_even::<10, 5>().unwrap().to_string(),
+            "12345.67895"
+        );
+        assert_eq!(b.convert_round_even::<10, 6>(), None);
+        assert_eq!(b.convert_round_even::<10, 7>(), None);
+        assert_eq!(b.convert_round_even::<10, 8>(), None);
+        assert_eq!(b.convert_round_even::<10, 9>(), None);
+        assert_eq!(b.convert_round_even::<10, 10>(), None);
     }
 
     #[test]
@@ -1701,53 +1906,85 @@ mod test {
     }
 
     #[test]
-    fn one() {
-        println!("{}", Fixed::<5, 1>::max_i128());
-        println!("{}", Fixed::<5, 1>::min_i128());
-        println!("{}", Fixed::<5, 2>::max_i128());
-        println!("{}", Fixed::<5, 2>::min_i128());
-        println!("{}", Fixed::<5, 3>::max_i128());
-        println!("{}", Fixed::<5, 3>::min_i128());
-        println!("{}", Fixed::<5, 4>::max_i128());
-        println!("{}", Fixed::<5, 4>::min_i128());
-        println!("{}", Fixed::<5, 5>::max_i128());
-        println!("{}", Fixed::<5, 5>::min_i128());
-
-        type F10_2 = Fixed<10, 2>;
-        let a = F10_2::try_from(-5).unwrap();
-        let b = F10_2::try_from(6).unwrap();
-        let c = F10_2::try_from(-1.23).unwrap();
-        let d = F10_2::try_from(2).unwrap();
-        println!("{a:?} {b:?} {c:?} {:?} {:?}", a + b, a + b + c);
-        println!("{a} {b} {c} {} {}", a + b, a + b + c);
-        println!("{a} {b} {c} {}", a * b);
-        println!("{a} {b} {c} {}", b * c);
-        println!(
-            "{:?}",
-            F10_2::MAX.checked_mul(&F10_2::try_from(0.5).unwrap())
-        );
-        println!("{:?}", a.checked_div(&b));
-
-        /*
-        println!(
-            "{a} div {d}: {:?} {}",
-            a.checked_div_integer(d).unwrap(),
-            a.checked_rem_integer(d).unwrap()
-        );*/
-
-        println!("sqrt({b}): {:?}", b.checked_sqrt());
+    fn floor() {
+        assert_eq!(f(5.0).floor(), f(5.0));
+        assert_eq!(f(5.1).floor(), f(5.0));
+        assert_eq!(f(5.5).floor(), f(5.0));
+        assert_eq!(f(5.9).floor(), f(5.0));
+        assert_eq!(f(-5.0).floor(), f(-5.0));
+        assert_eq!(f(-5.1).floor(), f(-6.0));
+        assert_eq!(f(-5.5).floor(), f(-6.0));
+        assert_eq!(f(-5.6).floor(), f(-6.0));
+        assert_eq!(f(4.0).floor(), f(4.0));
+        assert_eq!(f(4.1).floor(), f(4.0));
+        assert_eq!(f(4.5).floor(), f(4.0));
+        assert_eq!(f(4.9).floor(), f(4.0));
+        assert_eq!(f(-4.0).floor(), f(-4.0));
+        assert_eq!(f(-4.1).floor(), f(-5.0));
+        assert_eq!(f(-4.5).floor(), f(-5.0));
+        assert_eq!(f(-4.6).floor(), f(-5.0));
+        assert_eq!(f(-99_999_999.0).floor(), f(-99_999_999.0));
+        assert_eq!(f(-99_999_999.1).checked_floor(), None);
+        assert_eq!(f(-99_999_999.5).checked_floor(), None);
+        assert_eq!(f(-99_999_999.6).checked_floor(), None);
     }
 
     #[test]
-    fn add_bench() {
-        let start = Instant::now();
-        let mut value = Fixed::<38, 10>::ZERO;
-        for _ in 0..1_000_000 {
-            value += black_box(Fixed::ONE);
-        }
-        println!(
-            "fixed calculate {value} in {:.3}s",
-            start.elapsed().as_secs_f64()
-        );
+    fn ceil() {
+        assert_eq!(f(5.0).ceil(), f(5.0));
+        assert_eq!(f(5.1).ceil(), f(6.0));
+        assert_eq!(f(5.5).ceil(), f(6.0));
+        assert_eq!(f(5.9).ceil(), f(6.0));
+        assert_eq!(f(-5.0).ceil(), f(-5.0));
+        assert_eq!(f(-5.1).ceil(), f(-5.0));
+        assert_eq!(f(-5.5).ceil(), f(-5.0));
+        assert_eq!(f(-5.6).ceil(), f(-5.0));
+        assert_eq!(f(4.0).ceil(), f(4.0));
+        assert_eq!(f(4.1).ceil(), f(5.0));
+        assert_eq!(f(4.5).ceil(), f(5.0));
+        assert_eq!(f(4.9).ceil(), f(5.0));
+        assert_eq!(f(-4.0).ceil(), f(-4.0));
+        assert_eq!(f(-4.1).ceil(), f(-4.0));
+        assert_eq!(f(-4.5).ceil(), f(-4.0));
+        assert_eq!(f(-4.6).ceil(), f(-4.0));
+        assert_eq!(f(99_999_999.0).ceil(), f(99_999_999.0));
+        assert_eq!(f(99_999_999.1).checked_ceil(), None);
+        assert_eq!(f(99_999_999.5).checked_ceil(), None);
+        assert_eq!(f(99_999_999.6).checked_ceil(), None);
+    }
+
+    #[test]
+    fn truncate() {
+        assert_eq!(f(5.0).truncate(), f(5.0));
+        assert_eq!(f(5.1).truncate(), f(5.0));
+        assert_eq!(f(5.5).truncate(), f(5.0));
+        assert_eq!(f(5.9).truncate(), f(5.0));
+        assert_eq!(f(-5.0).truncate(), f(-5.0));
+        assert_eq!(f(-5.1).truncate(), f(-5.0));
+        assert_eq!(f(-5.5).truncate(), f(-5.0));
+        assert_eq!(f(-5.6).truncate(), f(-5.0));
+        assert_eq!(f(4.0).truncate(), f(4.0));
+        assert_eq!(f(4.1).truncate(), f(4.0));
+        assert_eq!(f(4.5).truncate(), f(4.0));
+        assert_eq!(f(4.9).truncate(), f(4.0));
+        assert_eq!(f(-4.0).truncate(), f(-4.0));
+        assert_eq!(f(-4.1).truncate(), f(-4.0));
+        assert_eq!(f(-4.5).truncate(), f(-4.0));
+        assert_eq!(f(-4.6).truncate(), f(-4.0));
+        assert_eq!(f(99_999_999.0).truncate(), f(99_999_999.0));
+        assert_eq!(f(99_999_999.1).truncate(), f(99_999_999.0));
+        assert_eq!(f(99_999_999.5).truncate(), f(99_999_999.0));
+        assert_eq!(f(99_999_999.6).truncate(), f(99_999_999.0));
+        assert_eq!(f(-99_999_999.0).truncate(), f(-99_999_999.0));
+        assert_eq!(f(-99_999_999.1).truncate(), f(-99_999_999.0));
+        assert_eq!(f(-99_999_999.5).truncate(), f(-99_999_999.0));
+        assert_eq!(f(-99_999_999.6).truncate(), f(-99_999_999.0));
+    }
+
+    #[test]
+    fn sign() {
+        assert_eq!(f(-0.1).sign(), Fixed::try_from(-1).unwrap());
+        assert_eq!(f(0.0).sign(), Fixed::try_from(0).unwrap());
+        assert_eq!(f(0.5).sign(), Fixed::try_from(1).unwrap());
     }
 }

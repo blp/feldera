@@ -2,6 +2,8 @@
 
 use std::ops::{Add, Shr, Sub};
 
+use crate::pow10;
+
 const fn lo(x: u128) -> u128 {
     x & ((1 << 64) - 1)
 }
@@ -132,6 +134,20 @@ impl U256 {
             Some(q1 * BASE + q0)
         }
     }
+
+    /// Shifts this value just enough digits right that it fits in `u128`.
+    /// Returns the shifted value and the number of digits that were shifted.
+    pub fn reduce_to_u128(self) -> (u128, usize) {
+        if self.0 > 0 {
+            let shift = self.0.ilog10() as usize + 1;
+            (
+                self.narrowing_div(pow10(shift).cast_unsigned()).unwrap(),
+                shift,
+            )
+        } else {
+            (self.1, 0)
+        }
+    }
 }
 
 impl Add for U256 {
@@ -161,8 +177,8 @@ impl Shr<u32> for &U256 {
         U256(
             self.0.unbounded_shr(n),
             self.1.unbounded_shr(n)
-                | self.0.unbounded_shl(32u32.wrapping_sub(n))
-                | self.0.unbounded_shr(n.wrapping_sub(32)),
+                | self.0.unbounded_shl(128u32.wrapping_sub(n))
+                | self.0.unbounded_shr(n.wrapping_sub(128)),
         )
     }
 }
@@ -215,19 +231,25 @@ impl I256 {
         }
     }
 
-    /// Shifts this value just enough bits right that it fits in an `i128`.
-    /// Returns the shifted value and the number of bits that were shifted.
+    /// Shifts this value just enough gitis right that it fits in an `i128`.
+    /// Returns the shifted value and the number of digits that were shifted.
     pub fn reduce_to_i128(self) -> (i128, usize) {
-        let (value, shift) = if self.value.0 != 0 {
-            let shift = (128 - self.value.0.leading_zeros()) + 1;
-            ((&self.value >> shift).1.cast_signed(), shift as usize)
-        } else if self.value.1 > i128::MAX.cast_unsigned() {
-            ((self.value.1 >> 1).cast_signed(), 1)
+        // First reduce to the range of `u128`.
+        let (value, shift) = self.value.reduce_to_u128();
+
+        // Then if it's too big for `i128`, reduce one more time.
+        let (value, shift) = if value <= i128::MAX.cast_unsigned() {
+            (value.cast_signed(), shift)
         } else {
-            (self.value.1.cast_signed(), 0)
+            ((value / 10).cast_signed(), shift + 1)
         };
-        let value = if self.negative { -value } else { value };
-        (value, shift)
+
+        // Reattach sign.
+        if self.negative {
+            (-value, shift)
+        } else {
+            (value, shift)
+        }
     }
 }
 
