@@ -31,3 +31,4 @@ feldera-types = { workspace = true, optional = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 num-bigint = { workspace = true }
+itertools.workspace = true

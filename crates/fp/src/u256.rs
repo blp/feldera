@@ -79,7 +79,9 @@ impl U256 {
     /// Algorithm from H. S. Warren, _Hacker's Delight, 2nd Ed._, Fig. 9-3.
     pub fn narrowing_div(self, v: u128) -> Option<u128> {
         let Self(u1, u0) = self;
-        if u1 == 0 {
+        if v == 0 {
+            None
+        } else if u1 == 0 {
             Some(u0 / v)
         } else if u1 >= v {
             None
@@ -254,11 +256,12 @@ impl From<i128> for I256 {
 
 #[cfg(test)]
 mod test {
+    use itertools::Itertools;
     use num_bigint::BigUint;
 
     use crate::u256::U256;
 
-    /// Iterator for key values of `u64`.
+    /// Iterator for 32 key values of `u64`.
     ///
     /// This iterates through all the possible 1-bit values of `a`, `b`, `c`,
     /// `d`, and `e`, producing the bit patterns shown below:
@@ -269,6 +272,7 @@ mod test {
     ///
     /// This tries to exercise arithmetic tests for all the ways that carry may
     /// or may not occur (especially with `c = 1`).
+    #[derive(Clone)]
     struct Values64(u64);
     impl Iterator for Values64 {
         type Item = u64;
@@ -298,38 +302,49 @@ mod test {
         }
     }
 
+    fn u128_from_hi_lo(hi: u64, lo: u64) -> u128 {
+        (u128::from(hi) << 64) | u128::from(lo)
+    }
+
+    // Iterator for 1,024 key values of u128.
+    fn values128() -> impl Iterator<Item = u128> + Clone {
+        Values64(0)
+            .cartesian_product(Values64(0))
+            .map(|(a, b)| u128_from_hi_lo(a, b))
+    }
+
+    // Iterator for 32,768 key values of U256.
+    fn values256() -> impl Iterator<Item = U256> {
+        Values64(0)
+            .cartesian_product(Values64(0))
+            .cartesian_product(Values64(0))
+            .map(|((a, b), c)| U256(u128_from_hi_lo(a, b), u128_from_hi_lo(b, c)))
+    }
+
     #[test]
     fn u256_from_product() {
-        for x_hi in Values64(0) {
-            for x_lo in Values64(0) {
-                for y_hi in Values64(0) {
-                    for y_lo in Values64(0) {
-                        let x = ((x_hi as u128) << 64) | (x_lo as u128);
-                        let y = ((y_hi as u128) << 64) | (y_lo as u128);
-                        let product_u256 = U256::from_product(x, y);
-                        let product_biguint = BigUint::from(x) * BigUint::from(y);
-                        assert_eq!(
-                            product_biguint,
-                            (BigUint::from(product_u256.0) << 128) | BigUint::from(product_u256.1)
-                        );
+        for x in values128() {
+            for y in values128() {
+                let product_u256 = U256::from_product(x, y);
+                let product_biguint = BigUint::from(x) * BigUint::from(y);
+                assert_eq!(
+                    product_biguint,
+                    (BigUint::from(product_u256.0) << 128) | BigUint::from(product_u256.1)
+                );
+            }
+        }
+    }
 
-                        for z_hi in Values64(0) {
-                            for z_lo in Values64(0) {
-                                let z = ((z_hi as u128) << 64) | (z_lo as u128);
-                                if z != 0 {
-                                    let quotient_u256 =
-                                        product_u256.narrowing_div(z).map(BigUint::from);
-                                    let quotient_biguint = &product_biguint / BigUint::from(z);
-                                    let quotient_biguint =
-                                        if quotient_biguint > BigUint::from(u128::MAX) {
-                                            None
-                                        } else {
-                                            Some(quotient_biguint)
-                                        };
-                                    assert_eq!(quotient_u256, quotient_biguint);
-                                }
-                            }
-                        }
+    #[test]
+    fn u256_narrowing_div() {
+        for u in values256() {
+            for v in values128() {
+                match u.narrowing_div(v) {
+                    None => assert!(u.0 >= v || v == 0,),
+                    Some(q) => {
+                        let product = U256::from_product(q, v);
+                        assert!(product <= u);
+                        assert!(product + U256::from(v) > u);
                     }
                 }
             }
