@@ -1,5 +1,5 @@
 [package]
-name = "feldera-fp"
+name = "feldera-fxp"
 authors = { workspace = true }
 version = { workspace = true }
 license = { workspace = true }

@@ -24,7 +24,7 @@ members = [
   "crates/datagen",
   "crates/iceberg",
   "crates/storage"
-, "crates/rest-api", "crates/ir", "crates/fp"]
+, "crates/rest-api", "crates/ir", "crates/fxp"]
 exclude = [
   "sql-to-dbsp-compiler/temp",
   "sql-to-dbsp-compiler/experiments",
@@ -103,7 +103,7 @@ fastbloom = "0.8.0"
 fdlimit = "0.3.0"
 feldera-adapterlib = { path = "crates/adapterlib" }
 feldera-datagen = { path = "crates/datagen" }
-feldera-fp = { path = "crates/fp", features = ["dbsp", "serde", "rkyv"] }
+feldera-fxp = { path = "crates/fxp", features = ["dbsp", "serde", "rkyv"] }
 feldera-iceberg = { path = "crates/iceberg" }
 feldera-sqllib = { path = "crates/sqllib" }
 feldera-storage = { version = "0.92.0", path = "crates/storage" }

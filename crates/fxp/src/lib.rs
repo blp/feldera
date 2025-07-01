@@ -1437,7 +1437,7 @@ impl<const P: usize, const S: usize> FromStr for Fixed<P, S> {
 /// of Fixed::<S,P>::one() for S >= P have magnitude less than one"
 ///
 /// ```compile_fail
-/// use feldera_fp::Fixed;
+/// use feldera_fxp::Fixed;
 ///
 /// let _ = Fixed::<5,5>::ONE;
 /// ```

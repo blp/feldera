@@ -4721,7 +4721,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "feldera-fp"
+name = "feldera-fxp"
 version = "0.92.0"
 dependencies = [
  "bytecheck",
