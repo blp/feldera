@@ -530,6 +530,18 @@ impl<const P: usize, const S: usize> Fixed<P, S> {
         ))
     }
 
+    /// Returns the square root of this value, rounded down.
+    ///
+    /// It probably makes more sense to convert to `f64` and take the
+    /// floating-point square root.
+    ///
+    /// # Panic
+    ///
+    /// Panics if this value is negative.
+    pub fn sqrt(self) -> Self {
+        self.checked_sqrt().unwrap()
+    }
+
     /// Returns this value rounded to `n` digits after the decimal point, or
     /// `None` if rounding caused overflow, `n` may be negative.
     ///
@@ -1986,5 +1998,22 @@ mod test {
         assert_eq!(f(-0.1).sign(), Fixed::try_from(-1).unwrap());
         assert_eq!(f(0.0).sign(), Fixed::try_from(0).unwrap());
         assert_eq!(f(0.5).sign(), Fixed::try_from(1).unwrap());
+    }
+
+    #[test]
+    fn sqrt() {
+        // A few selected values.
+        assert_eq!(f(0.0).sqrt(), f(0.0));
+        assert_eq!(f(1.0).sqrt(), f(1.0));
+        assert_eq!(f(2.0).sqrt(), f(1.41));
+        assert_eq!(f(3.0).sqrt(), f(1.73));
+        assert_eq!(f(4.0).sqrt(), f(2.0));
+        assert_eq!(f(-1.0).checked_sqrt(), None);
+
+        // General case.
+        for a in 0..=999 {
+            let af: Fixed<10, 2> = Fixed(a);
+            assert_eq!(af.sqrt(), Fixed((a * 100).isqrt()));
+        }
     }
 }

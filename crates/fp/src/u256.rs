@@ -1,6 +1,9 @@
 //! Routines for 256-bit integer arithmetic.
 
-use std::ops::{Add, Shr, Sub};
+use std::{
+    fmt::Debug,
+    ops::{Add, Shr, Sub},
+};
 
 use crate::pow10;
 
@@ -14,7 +17,7 @@ const fn hi_lo(x: u128) -> (u128, u128) {
     (hi(x), lo(x))
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct U256(u128, u128);
 
 impl U256 {
@@ -62,12 +65,11 @@ impl U256 {
     pub fn isqrt(&self) -> u128 {
         if self.0 == 0 {
             self.1.isqrt()
-        } else if self.1 < 2 {
-            self.1
         } else {
             let small_candidate = (self >> 2).isqrt() << 1;
             let large_candidate = small_candidate + 1;
-            if U256::from_product(large_candidate, large_candidate) > *self {
+            let product = U256::from_product(large_candidate, large_candidate);
+            if product > *self {
                 small_candidate
             } else {
                 large_candidate
@@ -147,6 +149,12 @@ impl U256 {
         } else {
             (self.1, 0)
         }
+    }
+}
+
+impl Debug for U256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{:032x}:{:032x}]", self.0, self.1)
     }
 }
 
@@ -378,6 +386,22 @@ mod test {
                         assert!(product + U256::from(v) > u);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn u256_isqrt() {
+        for value in values256() {
+            let root = value.isqrt();
+            assert!(U256::from_product(root, root) <= value);
+            if root < u128::MAX {
+                assert!(
+                    U256::from_product(root + 1, root + 1) > value,
+                    "{:032x}:{:032x} => {root:032x}",
+                    value.0,
+                    value.1
+                );
             }
         }
     }
