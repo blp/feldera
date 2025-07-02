@@ -9,38 +9,43 @@ use std::{
 use num_traits::{cast, CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Zero};
 use smallvec::{Array, SmallVec};
 
-/// 64-bit fixed-point decimal with fixed precision and scale.
+use crate::fixed128::u256::I256;
+
+mod u256;
+
+/// 128-bit fixed-point decimal with fixed precision and scale.
 ///
-/// `Fixed64<P, S>`, where `P` in `1..=18` is the "precision" and `S` in `0..=P`
-/// is the "scale", represents a signed decimal number in which `S - P` digits
-/// precede the decimal point and `S` digits follow it.  The table below shows
-/// the maximum values for a few combinations of `P` and `S`.  For each type,
-/// the minimum value is the negation of the maximum:
+/// `Fixed128<P, S>`, where `P` in `1..=38` is the "precision" and `S` in
+/// `0..=P` is the "scale", represents a signed decimal number in which `S - P`
+/// digits precede the decimal point and `S` digits follow it.  The table below
+/// shows the maximum values for a few combinations of `P` and `S`.  For each
+/// type, the minimum value is the negation of the maximum:
 ///
-/// |            Type |                   Maximum Value |
-/// |:----------------|--------------------------------:|
-/// | `Fixed64<5,5>`  | `                      0.99999` |
-/// | `Fixed64<5,4>`  | `                      9.9999 ` |
-/// | `Fixed64<5,3>`  | `                     99.999  ` |
-/// | `Fixed64<5,2>`  | `                    999.99   ` |
-/// | `Fixed64<5,1>`  | `                  9,999.9    ` |
-/// | `Fixed64<5,0>`  | `                 99,999      ` |
-/// | `Fixed64<18,0>` | `999,999,999,999,999,999      ` |
-/// | `Fixed64<18,5>` | `999,999,999,999,999,999.99999` |
+/// |             Type |                                              Maximum Value |
+/// |:-----------------|-----------------------------------------------------------:|
+/// | `Fixed128<5,5>`  | `                                                 0.99999` |
+/// | `Fixed128<5,4>`  | `                                                 9.9999 ` |
+/// | `Fixed128<5,3>`  | `                                                99.999  ` |
+/// | `Fixed128<5,2>`  | `                                               999.99   ` |
+/// | `Fixed128<5,1>`  | `                                             9,999.9    ` |
+/// | `Fixed128<5,0>`  | `                                            99,999      ` |
+/// | `Fixed128<38,0>` | `99,999,999,999,999,999,999,999,999,999,999,999,999      ` |
+/// | `Fixed128<38,5>` | `       999,999,999,999,999,999,999,999,999,999,999.99999` |
 ///
 /// # Implementation
 ///
-/// `Fixed64<P, S>` internally contains a single `i64` that represents a value
-/// `x` as `x * 10**P`.  This limits `S` to 18 because `10**18 ≤ 2**63 - 1 <
-/// 10**18`.
+/// `Fixed128<P, S>` internally contains a single `i128` that represents a value
+/// `x` as `x * 10**P`.  This limits `S` to 38 because `10**38 ≤ 2**127 - 1 <
+/// 10**39`.  A single `i64` would be sufficient for `S ≤ 18`, and a single
+/// `i32` for `S ≤ 9`, but the implementation does not optimize for those cases.
 #[derive(Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "size_of", derive(size_of::SizeOf))]
-pub struct Fixed64<const P: usize, const S: usize>(i64);
+pub struct Fixed128<const P: usize, const S: usize>(i128);
 
-/// A maximum-precision `Fixed64` with no decimal places.
-pub type FixedInteger64 = Fixed64<18, 0>;
+/// A maximum-precision `Fixed128` with no decimal places.
+pub type FixedInteger = Fixed128<38, 0>;
 
-impl<const P: usize, const S: usize> Debug for Fixed64<P, S> {
+impl<const P: usize, const S: usize> Debug for Fixed128<P, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if S == 0 {
             write!(f, "{}", self.0)
@@ -58,7 +63,7 @@ impl<const P: usize, const S: usize> Debug for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> Display for Fixed64<P, S> {
+impl<const P: usize, const S: usize> Display for Fixed128<P, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut buf = SmallVec::<[u8; 64]>::new();
         write!(&mut buf, "{:01$}", self.0.abs(), S + 1).unwrap();
@@ -142,20 +147,20 @@ impl<const P: usize, const S: usize> Display for Fixed64<P, S> {
 #[derive(Copy, Clone, Debug)]
 pub struct OutOfRange;
 
-/// Returns `10**exponent`, or `None` if `exponent > 18` (because the result
-/// would be greater than `i64::MAX`).
-const fn checked_pow10(exponent: u32) -> Option<i64> {
-    10i64.checked_pow(exponent)
+/// Returns `10**exponent`, or `None` if `exponent > 38` (because the result
+/// would be greater than `i128::MAX`).
+const fn checked_pow10(exponent: u32) -> Option<i128> {
+    10i128.checked_pow(exponent)
 }
 
 /// Returns `10**exponent`.
 ///
 /// # Panic
 ///
-/// Panics if `exponent > 18` (because the result would be greater than
-/// `i64::MAX`).
-const fn pow10(exponent: usize) -> i64 {
-    10i64.checked_pow(exponent as u32).unwrap()
+/// Panics if `exponent > 38` (because the result would be greater than
+/// `i128::MAX`).
+const fn pow10(exponent: usize) -> i128 {
+    10i128.checked_pow(exponent as u32).unwrap()
 }
 
 /// How to round values halfway between two integer.
@@ -168,7 +173,7 @@ enum Halfway {
     Even,
 }
 
-fn round_inner(value: i64, scale: i32, n: i32, halfway: Halfway) -> Option<i64> {
+fn round_inner(value: i128, scale: i32, n: i32, halfway: Halfway) -> Option<i128> {
     let position = scale.saturating_sub(n);
     if position <= 0 {
         Some(value)
@@ -197,9 +202,9 @@ fn round_inner(value: i64, scale: i32, n: i32, halfway: Halfway) -> Option<i64> 
     }
 }
 
-/// Returns `floor(x / y)`.  This is copied out of `i64::div_floor` in the
+/// Returns `floor(x / y)`.  This is copied out of `i128::div_floor` in the
 /// standard library, which is not yet stable.
-const fn div_floor(x: i64, y: i64) -> i64 {
+const fn div_floor(x: i128, y: i128) -> i128 {
     let d = x / y;
     let r = x % y;
 
@@ -209,7 +214,7 @@ const fn div_floor(x: i64, y: i64) -> i64 {
     // which is all-ones iff the signs differ, and 0 otherwise. Then by
     // adding this mask (which corresponds to the signed value -1), we
     // get our correction.
-    let correction = (x ^ y) >> (i64::BITS - 1);
+    let correction = (x ^ y) >> (i128::BITS - 1);
     if r != 0 {
         d + correction
     } else {
@@ -217,15 +222,15 @@ const fn div_floor(x: i64, y: i64) -> i64 {
     }
 }
 
-/// Returns `ceil(x / y)`.  This is copied out of `i64::div_ceil` in the
+/// Returns `ceil(x / y)`.  This is copied out of `i128::div_ceil` in the
 /// standard library, which is not yet stable.
-const fn div_ceil(x: i64, y: i64) -> i64 {
+const fn div_ceil(x: i128, y: i128) -> i128 {
     let d = x / y;
     let r = x % y;
 
     // When remainder is non-zero we have a.div_ceil(b) == 1 + a.div_floor(b),
     // so we can re-use the algorithm from div_floor, just adding 1.
-    let correction = 1 + ((x ^ y) >> (i64::BITS - 1));
+    let correction = 1 + ((x ^ y) >> (i128::BITS - 1));
     if r != 0 {
         d + correction
     } else {
@@ -233,11 +238,11 @@ const fn div_ceil(x: i64, y: i64) -> i64 {
     }
 }
 
-impl<const P: usize, const S: usize> Fixed64<P, S> {
-    /// Largest value for this type, e.g. 999.99 for `Fixed64<5,2>`.
+impl<const P: usize, const S: usize> Fixed128<P, S> {
+    /// Largest value for this type, e.g. 999.99 for `Fixed128<5,2>`.
     pub const MAX: Self = Self(pow10(P) - 1);
 
-    /// Smallest value for this type, e.g. -999.99 for `Fixed64<5,2>`.
+    /// Smallest value for this type, e.g. -999.99 for `Fixed128<5,2>`.
     ///
     /// `MIN` is always `-MAX`.
     pub const MIN: Self = Self(-Self::MAX.0);
@@ -255,9 +260,29 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
         if S < P {
             Self(pow10(S))
         } else {
-            panic!("all values of Fixed64::<S,P>::one() for S >= P have magnitude less than one");
+            panic!("all values of Fixed128::<S,P>::one() for S >= P have magnitude less than one");
         }
     };
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics if this type cannot hold every `i64` value.
+    pub const fn for_i64(value: i64) -> Self {
+        assert!(P.saturating_sub(S) >= 19);
+        Self(value as i128 * Self::scale())
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics if this type cannot hold every `u64` value.
+    pub const fn for_u64(value: u64) -> Self {
+        assert!(P.saturating_sub(S) >= 19);
+        Self(value as i128 * Self::scale())
+    }
 
     /// Returns `value` in this type.
     ///
@@ -266,7 +291,7 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
     /// Panics if this type cannot hold every `i32` value.
     pub const fn for_i32(value: i32) -> Self {
         assert!(P.saturating_sub(S) >= 10);
-        Self(value as i64 * Self::scale())
+        Self(value as i128 * Self::scale())
     }
 
     /// Returns `value` in this type.
@@ -276,7 +301,7 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
     /// Panics if this type cannot hold every `u32` value.
     pub const fn for_u32(value: u32) -> Self {
         assert!(P.saturating_sub(S) >= 10);
-        Self(value as i64 * Self::scale())
+        Self(value as i128 * Self::scale())
     }
 
     /// Returns `value` in this type.
@@ -286,7 +311,7 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
     /// Panics if this type cannot hold every `i16` value.
     pub const fn for_i16(value: i16) -> Self {
         assert!(P.saturating_sub(S) >= 5);
-        Self(value as i64 * Self::scale())
+        Self(value as i128 * Self::scale())
     }
 
     /// Returns `value` in this type.
@@ -296,7 +321,7 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
     /// Panics if this type cannot hold every `u16` value.
     pub const fn for_u16(value: u16) -> Self {
         assert!(P.saturating_sub(S) >= 5);
-        Self(value as i64 * Self::scale())
+        Self(value as i128 * Self::scale())
     }
 
     /// Returns `value` in this type.
@@ -306,7 +331,7 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
     /// Panics if this type cannot hold every `i8` value.
     pub const fn for_i8(value: i8) -> Self {
         assert!(P.saturating_sub(S) >= 3);
-        Self(value as i64 * Self::scale())
+        Self(value as i128 * Self::scale())
     }
 
     /// Returns `value` in this type.
@@ -316,11 +341,39 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
     /// Panics if this type cannot hold every `u8` value.
     pub const fn for_u8(value: u8) -> Self {
         assert!(P.saturating_sub(S) >= 3);
-        Self(value as i64 * Self::scale())
+        Self(value as i128 * Self::scale())
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics if this type cannot hold every `isize` value.
+    pub const fn for_isize(value: isize) -> Self {
+        match isize::BITS {
+            64 => Self::for_i64(value as i64),
+            32 => Self::for_i32(value as i32),
+            16 => Self::for_i16(value as i16),
+            _ => panic!(),
+        }
+    }
+
+    /// Returns `value` in this type.
+    ///
+    /// # Panic
+    ///
+    /// Panics if this type cannot hold every `usize` value.
+    pub const fn for_usize(value: usize) -> Self {
+        match usize::BITS {
+            64 => Self::for_u64(value as u64),
+            32 => Self::for_u32(value as u32),
+            16 => Self::for_u16(value as u16),
+            _ => panic!(),
+        }
     }
 
     /// Returns `Self(value)`, if `value` is in the correct range for this type.
-    fn try_new(value: i64) -> Option<Self> {
+    fn try_new(value: i128) -> Option<Self> {
         const { Self::check_constraints() };
         (Self::MIN.0..=Self::MAX.0)
             .contains(&value)
@@ -329,9 +382,9 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
 
     /// Returns `Self(value * 10**exponent)`, rounding to even if `exponent` is
     /// negative, if the computed value is in the correct range for the type.
-    fn try_new_with_exponent_round_even(value: i64, exponent: i32) -> Option<Self> {
+    fn try_new_with_exponent_round_even(value: i128, exponent: i32) -> Option<Self> {
         // Non-generic inner function to reduce monomorphization cost.
-        fn inner(value: i64, exponent: i32) -> Option<i64> {
+        fn inner(value: i128, exponent: i32) -> Option<i128> {
             Some(match exponent.cmp(&0) {
                 Ordering::Less => {
                     // Divide by a negative exponent.
@@ -354,7 +407,7 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
                             quotient
                         }
                     } else {
-                        // `10**-exponent` is greater than `i64::MAX`.  The result
+                        // `10**-exponent` is greater than `i128::MAX`.  The result
                         // must be zero.
                         0
                     }
@@ -371,16 +424,16 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
 
     /// Returns `Self(value * 10**exponent)`, rounding toward zero, if the
     /// computed value is in the correct range for the type.
-    fn try_new_with_exponent(value: i64, exponent: i32) -> Option<Self> {
+    fn try_new_with_exponent(value: i128, exponent: i32) -> Option<Self> {
         // Non-generic inner function to reduce monomorphization cost.
-        fn inner(value: i64, exponent: i32) -> Option<i64> {
+        fn inner(value: i128, exponent: i32) -> Option<i128> {
             Some(match exponent.cmp(&0) {
                 Ordering::Less => {
                     // Divide by a negative exponent.
                     if let Some(divisor) = checked_pow10(exponent.unsigned_abs()) {
                         value / divisor
                     } else {
-                        // `10**-exponent` is greater than `i64::MAX`.  The result
+                        // `10**-exponent` is greater than `i128::MAX`.  The result
                         // must be zero.
                         0
                     }
@@ -397,22 +450,22 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
 
     /// Validates the constraints on `S` and `P`.
     const fn check_constraints() {
-        assert!(P >= 1 && P <= 18, "Fixed64<S,P> must have 1 <= S <= 18");
-        assert!(S <= P, "Fixed64<S,P> must have S <= P");
+        assert!(P >= 1 && P <= 38, "Fixed128<S,P> must have 1 <= S <= 38");
+        assert!(S <= P, "Fixed128<S,P> must have S <= P");
     }
 
     /// Returns `pow10(S)`.
-    const fn scale() -> i64 {
+    const fn scale() -> i128 {
         Self::check_constraints();
         pow10(S)
     }
 
     /// Integer division, as defined for `divide-integer` in [General Decimal
     /// Arithmetic].  Returns `None` if `other` is zero or the result is greater
-    /// than `i64::MAX`.
+    /// than `i128::MAX`.
     ///
     /// [General Decimal Arithmetic]: https://speleotrove.com/decimal/decarith.pdf
-    pub const fn checked_div_integer(self, other: Self) -> Option<i64> {
+    pub const fn checked_div_integer(self, other: Self) -> Option<i128> {
         self.0.checked_div(other.0)
     }
 
@@ -421,8 +474,8 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
     ///
     /// # Panic
     ///
-    /// Panics if `other` is zero or the result is greater than `i64::MAX`.
-    pub const fn strict_div_integer(self, other: Self) -> i64 {
+    /// Panics if `other` is zero or the result is greater than `i128::MAX`.
+    pub const fn strict_div_integer(self, other: Self) -> i128 {
         self.checked_div_integer(other).unwrap()
     }
 
@@ -462,7 +515,7 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
     /// floating-point square root.
     pub fn checked_sqrt(self) -> Option<Self> {
         Some(Self(
-            (self.0 as i128 * Self::scale() as i128).checked_isqrt()? as i64,
+            I256::from_product(self.0, Self::scale()).checked_isqrt()?,
         ))
     }
 
@@ -568,8 +621,8 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
     }
 
     /// Returns -1 if this value is less than zero, 0 if this value is zero, and
-    /// 1 if this value is greater than zero, as `Fixed64<1,0>`.
-    pub fn sign(&self) -> Fixed64<1, 0> {
+    /// 1 if this value is greater than zero, as `Fixed128<1,0>`.
+    pub fn sign(&self) -> Fixed128<1, 0> {
         self.checked_sign_generic().unwrap()
     }
 
@@ -623,7 +676,7 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
             loop {
                 if (exp & 1) == 1 {
                     acc = if let Some((acc, acc_scale)) = acc {
-                        let (acc, shift) = reduce_to_i64(acc as i128 * base as i128);
+                        let (acc, shift) = I256::from_product(acc, base).reduce_to_i128();
                         Some((acc, (acc_scale + base_scale) - shift as i32))
                     } else {
                         Some((base, base_scale))
@@ -635,14 +688,14 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
                     return Self::try_new_with_exponent(acc, S as i32 - acc_scale);
                 }
 
-                let (next_base, shift) = reduce_to_i64(base as i128 * base as i128);
+                let (next_base, shift) = I256::from_product(base, base).reduce_to_i128();
                 base = next_base;
                 base_scale = base_scale * 2 - shift as i32;
             }
         } else {
             let mut exp = exp.unsigned_abs();
             let mut base = *self;
-            let mut acc: Option<Fixed64<P, S>> = None;
+            let mut acc: Option<Fixed128<P, S>> = None;
             loop {
                 if (exp & 1) == 1 {
                     acc = Some(if let Some(acc) = acc {
@@ -695,8 +748,8 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
     }
 }
 
-impl<const P0: usize, const S0: usize> Fixed64<P0, S0> {
-    /// Returns this value converted into another type `Fixed64<P1, S1>`, or
+impl<const P0: usize, const S0: usize> Fixed128<P0, S0> {
+    /// Returns this value converted into another type `Fixed128<P1, S1>`, or
     /// `None` if this value is outside the range of the target type.  If the
     /// conversion is successful, then the result is exactly the same as the
     /// original value if `S1 >= S0`, and rounded down otherwise.
@@ -704,29 +757,29 @@ impl<const P0: usize, const S0: usize> Fixed64<P0, S0> {
     /// This should be implemented as `TryFrom` but that [conflicts with the
     /// standard library
     /// implementation](https://users.rust-lang.org/t/conflicting-implementations-of-trait-from/92994).
-    pub fn convert<const P1: usize, const S1: usize>(&self) -> Option<Fixed64<P1, S1>> {
-        Fixed64::try_new_with_exponent(self.0, S1 as i32 - S0 as i32)
+    pub fn convert<const P1: usize, const S1: usize>(&self) -> Option<Fixed128<P1, S1>> {
+        Fixed128::try_new_with_exponent(self.0, S1 as i32 - S0 as i32)
     }
 
-    /// Returns this value converted into another type `Fixed64<P1, S1>`, or
+    /// Returns this value converted into another type `Fixed128<P1, S1>`, or
     /// `None` if this value is outside the range of the target type.  If the
     /// conversion is successful, then the result is exactly the same as the
     /// original value if `S1 >= S0`, and rounded to even otherwise.
-    pub fn convert_round_even<const P1: usize, const S1: usize>(&self) -> Option<Fixed64<P1, S1>> {
-        Fixed64::try_new_with_exponent_round_even(self.0, S1 as i32 - S0 as i32)
+    pub fn convert_round_even<const P1: usize, const S1: usize>(&self) -> Option<Fixed128<P1, S1>> {
+        Fixed128::try_new_with_exponent_round_even(self.0, S1 as i32 - S0 as i32)
     }
 
     /// Returns -1 if this value is less than zero, 0 if this value is zero, and
-    /// 1 if this value is greater than zero, in an arbitrary `Fixed64` type.
+    /// 1 if this value is greater than zero, in an arbitrary `Fixed128` type.
     /// Returns `None` on overflow (if this value is nonzero and `S1 >= P1`).
     pub fn checked_sign_generic<const P1: usize, const S1: usize>(
         &self,
-    ) -> Option<Fixed64<P1, S1>> {
-        let one = Fixed64::<P1, S1>::scale();
+    ) -> Option<Fixed128<P1, S1>> {
+        let one = Fixed128::<P1, S1>::scale();
         match self.0.cmp(&0) {
-            Ordering::Less if S1 < P1 => Some(Fixed64(-one)),
-            Ordering::Equal => Some(Fixed64::ZERO),
-            Ordering::Greater if S1 < P1 => Some(Fixed64(one)),
+            Ordering::Less if S1 < P1 => Some(Fixed128(-one)),
+            Ordering::Equal => Some(Fixed128::ZERO),
+            Ordering::Greater if S1 < P1 => Some(Fixed128(one)),
             _ => None,
         }
     }
@@ -743,40 +796,36 @@ impl<const P0: usize, const S0: usize> Fixed64<P0, S0> {
         const S2: usize,
     >(
         self,
-        other: Fixed64<P1, S1>,
-    ) -> Option<Fixed64<P2, S2>> {
+        other: Fixed128<P1, S1>,
+    ) -> Option<Fixed128<P2, S2>> {
         match S0.cmp(&S1) {
             Ordering::Less => {
                 let factor = pow10(S1 - S0);
-                if self.0 <= i64::MAX / factor / 10 {
-                    Fixed64::try_new_with_exponent(
+                if self.0 <= i128::MAX / factor / 10 {
+                    Fixed128::try_new_with_exponent(
                         other.0.checked_add(self.0 * factor)?,
                         S2 as i32 - S1 as i32,
                     )
                 } else {
-                    let result: i64 = ((self.0 as i128 * factor as i128 + other.0 as i128)
-                        / pow10(S2.saturating_sub(S1)) as i128)
-                        .try_into()
-                        .ok()?;
-                    Fixed64::try_new_with_exponent(result, S1.saturating_sub(S2) as i32)
+                    let result = (I256::from_product(self.0, factor) + I256::from(other.0))
+                        .narrowing_div(pow10(S2.saturating_sub(S1)))?;
+                    Fixed128::try_new_with_exponent(result, S1.saturating_sub(S2) as i32)
                 }
             }
             Ordering::Equal => {
-                Fixed64::try_new_with_exponent(self.0.checked_add(other.0)?, (S2 - S0) as i32)
+                Fixed128::try_new_with_exponent(self.0.checked_add(other.0)?, (S2 - S0) as i32)
             }
             Ordering::Greater => {
                 let factor = pow10(S0 - S1);
-                if other.0 <= i64::MAX / factor / 10 {
-                    Fixed64::try_new_with_exponent(
+                if other.0 <= i128::MAX / factor / 10 {
+                    Fixed128::try_new_with_exponent(
                         self.0.checked_add(other.0 * factor)?,
                         S2 as i32 - S0 as i32,
                     )
                 } else {
-                    let result: i64 = ((other.0 as i128 * factor as i128 + self.0 as i128)
-                        / pow10(S2.saturating_sub(S0)) as i128)
-                        .try_into()
-                        .ok()?;
-                    Fixed64::try_new_with_exponent(result, S0.saturating_sub(S2) as i32)
+                    let result = (I256::from_product(other.0, factor) + I256::from(self.0))
+                        .narrowing_div(pow10(S2.saturating_sub(S0)))?;
+                    Fixed128::try_new_with_exponent(result, S0.saturating_sub(S2) as i32)
                 }
             }
         }
@@ -794,8 +843,8 @@ impl<const P0: usize, const S0: usize> Fixed64<P0, S0> {
         const S2: usize,
     >(
         self,
-        other: Fixed64<P1, S1>,
-    ) -> Option<Fixed64<P2, S2>> {
+        other: Fixed128<P1, S1>,
+    ) -> Option<Fixed128<P2, S2>> {
         self.checked_add_generic(-other)
     }
 
@@ -811,12 +860,11 @@ impl<const P0: usize, const S0: usize> Fixed64<P0, S0> {
         const S2: usize,
     >(
         self,
-        other: Fixed64<P1, S1>,
-    ) -> Option<Fixed64<P2, S2>> {
-        Fixed64::<P2, S2>::try_new_with_exponent(
-            ((self.0 as i128 * other.0 as i128) / pow10((S0 + S1).saturating_sub(S2)) as i128)
-                .try_into()
-                .ok()?,
+        other: Fixed128<P1, S1>,
+    ) -> Option<Fixed128<P2, S2>> {
+        Fixed128::<P2, S2>::try_new_with_exponent(
+            I256::from_product(self.0, other.0)
+                .narrowing_div(pow10((S0 + S1).saturating_sub(S2)))?,
             S2.saturating_sub(S0 + S1) as i32,
         )
     }
@@ -833,22 +881,20 @@ impl<const P0: usize, const S0: usize> Fixed64<P0, S0> {
         const S2: usize,
     >(
         self,
-        other: Fixed64<P1, S1>,
-    ) -> Option<Fixed64<P2, S2>> {
-        if other == Fixed64::ZERO {
+        other: Fixed128<P1, S1>,
+    ) -> Option<Fixed128<P2, S2>> {
+        if other == Fixed128::ZERO {
             None
         } else {
             let shift_left = (S1 + S2).saturating_sub(S0);
-            if shift_left > 18 {
-                // A shift this big would exceed the range of i128, so we can't
+            if shift_left > 38 {
+                // A shift this big would exceed the range of I256, so we can't
                 // calculate it, but the ultimate result would also overflow, so
                 // we don't have to.
                 None
             } else {
-                Fixed64::try_new_with_exponent(
-                    ((self.0 as i128 * pow10(shift_left) as i128) / other.0 as i128)
-                        .try_into()
-                        .ok()?,
+                Fixed128::try_new_with_exponent(
+                    I256::from_product(self.0, pow10(shift_left)).narrowing_div(other.0)?,
                     S0.saturating_sub(S1 + S2) as i32,
                 )
             }
@@ -864,8 +910,8 @@ impl<const P0: usize, const S0: usize> Fixed64<P0, S0> {
         const S2: usize,
     >(
         self,
-        other: Fixed64<P1, S1>,
-    ) -> Fixed64<P2, S2> {
+        other: Fixed128<P1, S1>,
+    ) -> Fixed128<P2, S2> {
         self.checked_add_generic(other).unwrap()
     }
 
@@ -878,8 +924,8 @@ impl<const P0: usize, const S0: usize> Fixed64<P0, S0> {
         const S2: usize,
     >(
         self,
-        other: Fixed64<P1, S1>,
-    ) -> Fixed64<P2, S2> {
+        other: Fixed128<P1, S1>,
+    ) -> Fixed128<P2, S2> {
         self.checked_sub_generic(other).unwrap()
     }
 
@@ -892,8 +938,8 @@ impl<const P0: usize, const S0: usize> Fixed64<P0, S0> {
         const S2: usize,
     >(
         self,
-        other: Fixed64<P1, S1>,
-    ) -> Fixed64<P2, S2> {
+        other: Fixed128<P1, S1>,
+    ) -> Fixed128<P2, S2> {
         self.checked_mul_generic(other).unwrap()
     }
 
@@ -906,13 +952,13 @@ impl<const P0: usize, const S0: usize> Fixed64<P0, S0> {
         const S2: usize,
     >(
         self,
-        other: Fixed64<P1, S1>,
-    ) -> Fixed64<P2, S2> {
+        other: Fixed128<P1, S1>,
+    ) -> Fixed128<P2, S2> {
         self.checked_div_generic(other).unwrap()
     }
 }
 
-impl<const P: usize, const S: usize> Zero for Fixed64<P, S> {
+impl<const P: usize, const S: usize> Zero for Fixed128<P, S> {
     fn zero() -> Self {
         Self::ZERO
     }
@@ -922,17 +968,17 @@ impl<const P: usize, const S: usize> Zero for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> One for Fixed64<P, S> {
+impl<const P: usize, const S: usize> One for Fixed128<P, S> {
     /// This will panic at compile time if 1 isn't in the range of this type.
     fn one() -> Self {
         Self::ONE
     }
 }
 
-impl<const P: usize, const S: usize> TryFrom<f64> for Fixed64<P, S> {
+impl<const P: usize, const S: usize> TryFrom<f64> for Fixed128<P, S> {
     type Error = OutOfRange;
 
-    /// Convert `value` to `Fixed64`, rounding toward zero, reporting an error if
+    /// Convert `value` to `Fixed128`, rounding toward zero, reporting an error if
     /// `value` is out of range.
     fn try_from(value: f64) -> Result<Self, Self::Error> {
         cast(value * Self::scale() as f64)
@@ -941,20 +987,20 @@ impl<const P: usize, const S: usize> TryFrom<f64> for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> From<Fixed64<P, S>> for f64 {
-    fn from(value: Fixed64<P, S>) -> Self {
-        value.0 as f64 / Fixed64::<P, S>::scale() as f64
+impl<const P: usize, const S: usize> From<Fixed128<P, S>> for f64 {
+    fn from(value: Fixed128<P, S>) -> Self {
+        value.0 as f64 / Fixed128::<P, S>::scale() as f64
     }
 }
 
-impl<const P: usize, const S: usize> TryFrom<i64> for Fixed64<P, S> {
+impl<const P: usize, const S: usize> TryFrom<i128> for Fixed128<P, S> {
     type Error = OutOfRange;
 
-    /// Convert `value` to `Fixed64`, reporting an error if `value` is out of
+    /// Convert `value` to `Fixed128`, reporting an error if `value` is out of
     /// range.  This is an exact conversion that cannot lose precision if it
     /// succeeds.
-    fn try_from(value: i64) -> Result<Self, Self::Error> {
-        if value.unsigned_abs() <= Self::max_u64() {
+    fn try_from(value: i128) -> Result<Self, Self::Error> {
+        if value.unsigned_abs() <= Self::max_u128() {
             Ok(Self(value * Self::scale()))
         } else {
             Err(OutOfRange)
@@ -964,32 +1010,33 @@ impl<const P: usize, const S: usize> TryFrom<i64> for Fixed64<P, S> {
 
 macro_rules! try_from_signed_int {
     ($type_name:ty) => {
-        impl<const P: usize, const S: usize> TryFrom<$type_name> for Fixed64<P, S> {
+        impl<const P: usize, const S: usize> TryFrom<$type_name> for Fixed128<P, S> {
             type Error = OutOfRange;
 
-            /// Convert `value` to `Fixed64`, rounding toward zero, reporting an
+            /// Convert `value` to `Fixed128`, rounding toward zero, reporting an
             /// error if `value` is out of range.
             fn try_from(value: $type_name) -> Result<Self, Self::Error> {
-                (value as i64).try_into()
+                (value as i128).try_into()
             }
         }
     };
 }
 
 try_from_signed_int!(isize);
+try_from_signed_int!(i64);
 try_from_signed_int!(i32);
 try_from_signed_int!(i16);
 try_from_signed_int!(i8);
 
-impl<const P: usize, const S: usize> TryFrom<u64> for Fixed64<P, S> {
+impl<const P: usize, const S: usize> TryFrom<u128> for Fixed128<P, S> {
     type Error = OutOfRange;
 
-    /// Convert `value` to `Fixed64`, reporting an error if `value` is out of
+    /// Convert `value` to `Fixed128`, reporting an error if `value` is out of
     /// range.  This is an exact conversion that cannot lose precision if it
     /// succeeds.
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        if value <= Self::max_i64() as u64 {
-            Ok(Self(value as i64 * Self::scale()))
+    fn try_from(value: u128) -> Result<Self, Self::Error> {
+        if value <= Self::max_i128() as u128 {
+            Ok(Self(value as i128 * Self::scale()))
         } else {
             Err(OutOfRange)
         }
@@ -998,20 +1045,21 @@ impl<const P: usize, const S: usize> TryFrom<u64> for Fixed64<P, S> {
 
 macro_rules! try_from_unsigned_int {
     ($type_name:ty) => {
-        impl<const P: usize, const S: usize> TryFrom<$type_name> for Fixed64<P, S> {
+        impl<const P: usize, const S: usize> TryFrom<$type_name> for Fixed128<P, S> {
             type Error = OutOfRange;
 
-            /// Convert `value` to `Fixed64`, reporting an error if `value` is out
+            /// Convert `value` to `Fixed128`, reporting an error if `value` is out
             /// of range.  This is an exact conversion that cannot lose
             /// precision if it succeeds.
             fn try_from(value: $type_name) -> Result<Self, Self::Error> {
-                (value as u64).try_into()
+                (value as u128).try_into()
             }
         }
     };
 }
 
 try_from_unsigned_int!(usize);
+try_from_unsigned_int!(u64);
 try_from_unsigned_int!(u32);
 try_from_unsigned_int!(u16);
 try_from_unsigned_int!(u8);
@@ -1022,10 +1070,10 @@ macro_rules! min_max_int {
         #[doc = stringify!($signed_type)]
         #[doc = "` that can be converted to this type."]
         pub const fn $max_signed() -> $signed_type {
-            if Self::max_i64() > <$signed_type>::MAX as i64 {
+            if Self::max_i128() > <$signed_type>::MAX as i128 {
                 <$signed_type>::MAX
             } else {
-                Self::max_i64() as $signed_type
+                Self::max_i128() as $signed_type
             }
         }
 
@@ -1040,18 +1088,18 @@ macro_rules! min_max_int {
         #[doc = stringify!($unsigned_type)]
         #[doc = "` that can be converted to this type.\n\nThe minimum is 0."]
         pub const fn $max_unsigned() -> $unsigned_type {
-            if Self::max_u64() > <$unsigned_type>::MAX as u64 {
+            if Self::max_u128() > <$unsigned_type>::MAX as u128 {
                 <$unsigned_type>::MAX
             } else {
-                Self::max_u64() as $unsigned_type
+                Self::max_u128() as $unsigned_type
             }
         }
     };
 }
 
-impl<const P: usize, const S: usize> Fixed64<P, S> {
-    /// Returns the maximum `i64` that can be converted to this type.
-    pub const fn max_i64() -> i64 {
+impl<const P: usize, const S: usize> Fixed128<P, S> {
+    /// Returns the maximum `i128` that can be converted to this type.
+    pub const fn max_i128() -> i128 {
         if P > S {
             pow10(P - S) - 1
         } else {
@@ -1059,34 +1107,35 @@ impl<const P: usize, const S: usize> Fixed64<P, S> {
         }
     }
 
-    /// Returns the minimum `i64` that can be converted to this type.
-    pub const fn min_i64() -> i64 {
-        -Self::max_i64()
+    /// Returns the minimum `i128` that can be converted to this type.
+    pub const fn min_i128() -> i128 {
+        -Self::max_i128()
     }
 
-    /// Returns the maximum `u64` that can be converted to this type.
+    /// Returns the maximum `u128` that can be converted to this type.
     ///
     /// The minimum is 0.
-    pub const fn max_u64() -> u64 {
-        Self::max_i64().cast_unsigned()
+    pub const fn max_u128() -> u128 {
+        Self::max_i128().cast_unsigned()
     }
 
     min_max_int!(isize, max_isize, min_isize, usize, max_usize);
+    min_max_int!(i64, max_i64, min_i64, u64, max_u64);
     min_max_int!(i32, max_i32, min_i32, u32, max_u32);
     min_max_int!(i16, max_i16, min_i16, u16, max_u16);
     min_max_int!(i8, max_i8, min_i8, u8, max_u8);
 }
 
-impl<const P: usize, const S: usize> From<Fixed64<P, S>> for i64 {
-    /// Convert from `Fixed64` to integer, rounding toward zero (the same
+impl<const P: usize, const S: usize> From<Fixed128<P, S>> for i128 {
+    /// Convert from `Fixed128` to integer, rounding toward zero (the same
     /// semantics as Rust casts from float to integer).
-    fn from(value: Fixed64<P, S>) -> Self {
+    fn from(value: Fixed128<P, S>) -> Self {
         // Integer `/` rounds toward zero in Rust.
-        value.0 / <Fixed64<P, S>>::scale()
+        value.0 / <Fixed128<P, S>>::scale()
     }
 }
 
-impl<const P: usize, const S: usize> Add for Fixed64<P, S> {
+impl<const P: usize, const S: usize> Add for Fixed128<P, S> {
     type Output = Self;
 
     /// Returns the sum, rounding toward zero.
@@ -1099,8 +1148,8 @@ impl<const P: usize, const S: usize> Add for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> Add for &Fixed64<P, S> {
-    type Output = Fixed64<P, S>;
+impl<const P: usize, const S: usize> Add for &Fixed128<P, S> {
+    type Output = Fixed128<P, S>;
 
     /// Returns the sum, which is exact if the result is in range.
     ///
@@ -1112,7 +1161,7 @@ impl<const P: usize, const S: usize> Add for &Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> CheckedAdd for Fixed64<P, S> {
+impl<const P: usize, const S: usize> CheckedAdd for Fixed128<P, S> {
     /// Returns the sum, which is exact, or `None` if the result is out of
     /// range.
     fn checked_add(&self, other: &Self) -> Option<Self> {
@@ -1120,7 +1169,7 @@ impl<const P: usize, const S: usize> CheckedAdd for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> AddAssign for Fixed64<P, S> {
+impl<const P: usize, const S: usize> AddAssign for Fixed128<P, S> {
     /// Adds `other` to `self`, which is an exact calculation.
     ///
     /// # Panic
@@ -1131,18 +1180,18 @@ impl<const P: usize, const S: usize> AddAssign for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> AddAssign<&Fixed64<P, S>> for Fixed64<P, S> {
+impl<const P: usize, const S: usize> AddAssign<&Fixed128<P, S>> for Fixed128<P, S> {
     /// Adds `other` to `self`, which is an exact calculation.
     ///
     /// # Panic
     ///
     /// Panics if the result is out of range.
-    fn add_assign(&mut self, other: &Fixed64<P, S>) {
+    fn add_assign(&mut self, other: &Fixed128<P, S>) {
         *self = *self + *other;
     }
 }
 
-impl<const P: usize, const S: usize> Sub for Fixed64<P, S> {
+impl<const P: usize, const S: usize> Sub for Fixed128<P, S> {
     type Output = Self;
 
     /// Returns the difference, which is exact if the result is in range.
@@ -1155,8 +1204,8 @@ impl<const P: usize, const S: usize> Sub for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> Sub for &Fixed64<P, S> {
-    type Output = Fixed64<P, S>;
+impl<const P: usize, const S: usize> Sub for &Fixed128<P, S> {
+    type Output = Fixed128<P, S>;
 
     /// Returns the difference, which is exact if the result is in range.
     ///
@@ -1168,7 +1217,7 @@ impl<const P: usize, const S: usize> Sub for &Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> CheckedSub for Fixed64<P, S> {
+impl<const P: usize, const S: usize> CheckedSub for Fixed128<P, S> {
     /// Returns the difference, which is exact, or `None` if the result is out
     /// of range.
     fn checked_sub(&self, other: &Self) -> Option<Self> {
@@ -1176,7 +1225,7 @@ impl<const P: usize, const S: usize> CheckedSub for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> SubAssign for Fixed64<P, S> {
+impl<const P: usize, const S: usize> SubAssign for Fixed128<P, S> {
     /// Subtracts `other` from `self`, which is an exact calculation.
     ///
     /// # Panic
@@ -1187,7 +1236,7 @@ impl<const P: usize, const S: usize> SubAssign for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> Mul for Fixed64<P, S> {
+impl<const P: usize, const S: usize> Mul for Fixed128<P, S> {
     type Output = Self;
 
     /// Returns the product, rounding toward zero.
@@ -1200,8 +1249,8 @@ impl<const P: usize, const S: usize> Mul for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> Mul for &Fixed64<P, S> {
-    type Output = Fixed64<P, S>;
+impl<const P: usize, const S: usize> Mul for &Fixed128<P, S> {
+    type Output = Fixed128<P, S>;
 
     /// Returns the product, rounding toward zero.
     ///
@@ -1213,7 +1262,7 @@ impl<const P: usize, const S: usize> Mul for &Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> CheckedMul for Fixed64<P, S> {
+impl<const P: usize, const S: usize> CheckedMul for Fixed128<P, S> {
     /// Returns the product, rounding toward zero, or `None` if the result is
     /// out of range.
     fn checked_mul(&self, other: &Self) -> Option<Self> {
@@ -1221,7 +1270,7 @@ impl<const P: usize, const S: usize> CheckedMul for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> MulAssign for Fixed64<P, S> {
+impl<const P: usize, const S: usize> MulAssign for Fixed128<P, S> {
     /// Multiplies `self` by `other`, rounding toward zero.
     ///
     /// # Panic
@@ -1232,7 +1281,7 @@ impl<const P: usize, const S: usize> MulAssign for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> Div for Fixed64<P, S> {
+impl<const P: usize, const S: usize> Div for Fixed128<P, S> {
     type Output = Self;
 
     /// Returns the quotient, rounding toward zero.
@@ -1245,8 +1294,8 @@ impl<const P: usize, const S: usize> Div for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> Div for &Fixed64<P, S> {
-    type Output = Fixed64<P, S>;
+impl<const P: usize, const S: usize> Div for &Fixed128<P, S> {
+    type Output = Fixed128<P, S>;
 
     /// Returns the quotient, rounding toward zero.
     ///
@@ -1258,7 +1307,7 @@ impl<const P: usize, const S: usize> Div for &Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> CheckedDiv for Fixed64<P, S> {
+impl<const P: usize, const S: usize> CheckedDiv for Fixed128<P, S> {
     /// Returns the quotient, rounding toward zero, or `None` if `other` is zero
     /// or the result is out of range.
     fn checked_div(&self, other: &Self) -> Option<Self> {
@@ -1266,7 +1315,7 @@ impl<const P: usize, const S: usize> CheckedDiv for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> DivAssign for Fixed64<P, S> {
+impl<const P: usize, const S: usize> DivAssign for Fixed128<P, S> {
     /// Divides `self` by `other`, rounding toward zero.
     ///
     /// # Panic
@@ -1277,7 +1326,7 @@ impl<const P: usize, const S: usize> DivAssign for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> Neg for Fixed64<P, S> {
+impl<const P: usize, const S: usize> Neg for Fixed128<P, S> {
     type Output = Self;
 
     /// Returns `-self`.  This is an exact calculation that cannot overflow.
@@ -1286,30 +1335,30 @@ impl<const P: usize, const S: usize> Neg for Fixed64<P, S> {
     }
 }
 
-impl<const P: usize, const S: usize> Neg for &Fixed64<P, S> {
-    type Output = Fixed64<P, S>;
+impl<const P: usize, const S: usize> Neg for &Fixed128<P, S> {
+    type Output = Fixed128<P, S>;
 
     /// Returns `-self`.  This is an exact calculation that cannot overflow.
     fn neg(self) -> Self::Output {
-        Fixed64(-self.0)
+        Fixed128(-self.0)
     }
 }
 
 #[derive(Copy, Clone, Debug)]
 pub struct ParseFixedError;
 
-impl<const P: usize, const S: usize> FromStr for Fixed64<P, S> {
+impl<const P: usize, const S: usize> FromStr for Fixed128<P, S> {
     type Err = ParseFixedError;
 
-    /// Parses `s` as `Fixed64`.
+    /// Parses `s` as `Fixed128`.
     ///
     /// This accepts the same forms as [f64::from_str], except that it rejects
-    /// infinities and NaNs (which `Fixed64` does not support), as well as
+    /// infinities and NaNs (which `Fixed128` does not support), as well as
     /// out-of-range values.  Rounds overprecise values to the nearest
     /// representable value, rounding halfway values to even.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Non-generic inner function to reduce monomorphization cost.
-        fn inner(s: &str, scale: i32) -> Option<(i64, i32)> {
+        fn inner(s: &str, scale: i32) -> Option<(i128, i32)> {
             // Accumulate digits into `value`.  Adjust `exponent` such that the
             // parsed value is `value / 10**exponent`.
             let mut value = 0;
@@ -1336,8 +1385,8 @@ impl<const P: usize, const S: usize> FromStr for Fixed64<P, S> {
                     }
                     '0'..='9' => {
                         saw_digit = true;
-                        if value < i64::MAX / 10 {
-                            value = value * 10 + (c as u8 - b'0') as i64;
+                        if value < i128::MAX / 10 {
+                            value = value * 10 + (c as u8 - b'0') as i128;
                             if saw_dot {
                                 exponent = exponent.checked_sub(1)?;
                             }
@@ -1374,26 +1423,14 @@ impl<const P: usize, const S: usize> FromStr for Fixed64<P, S> {
     }
 }
 
-/// Shifts this value just enough digits right that it fits in an `i64`.
-/// Returns the shifted value and the number of digits that were shifted.
-pub fn reduce_to_i64(x: i128) -> (i64, usize) {
-    if let Ok(x) = x.try_into() {
-        (x, 0)
-    } else {
-        let shift = (x.unsigned_abs() / i64::MAX as u128).ilog10() as usize + 1;
-        dbg!(shift);
-        ((x / pow10(shift) as i128).try_into().unwrap(), shift)
-    }
-}
-
 /// This is a doc-test to check that trying to instantiate the value 1 for a
 /// type that can't represent it properly fails, with an error like "all values
-/// of Fixed64::<S,P>::one() for S >= P have magnitude less than one"
+/// of Fixed128::<S,P>::one() for S >= P have magnitude less than one"
 ///
 /// ```compile_fail
-/// use feldera_fxp::Fixed64;
+/// use feldera_fxp::Fixed128;
 ///
-/// let _ = Fixed64::<5,5>::ONE;
+/// let _ = Fixed128::<5,5>::ONE;
 /// ```
 fn _invalid_constant_test() {}
 
@@ -1401,7 +1438,7 @@ fn _invalid_constant_test() {}
 mod test {
     use num_traits::{CheckedAdd, CheckedDiv, CheckedMul, CheckedSub};
 
-    use super::Fixed64;
+    use super::Fixed128;
     use std::{fmt::Write, str::FromStr};
 
     #[test]
@@ -1430,14 +1467,14 @@ mod test {
             ("99999999999e-3", None),
             // But with a `1` at the end rounds down, so it stays in range.
             ("99999999991e-3", Some(9999_9999.99)),
-            // This value overflows the range of `i64` as an integer, so it
+            // This value overflows the range of `i128` as an integer, so it
             // triggers the case where we stop accepting digits and simply
             // adjust the exponent instead.
             (
                 "111111111111111111111111111111111111111111e-34",
                 Some(1111_1111.11),
             ),
-            // This value overflows the range of `i64` in the fraction, so it
+            // This value overflows the range of `i128` in the fraction, so it
             // triggers the case where we stop accepting digits and simply
             // adjust the exponent instead.
             (
@@ -1466,7 +1503,7 @@ mod test {
         }
     }
 
-    fn multidisplay<const P: usize, const S: usize>(number: Fixed64<P, S>) -> String {
+    fn multidisplay<const P: usize, const S: usize>(number: Fixed128<P, S>) -> String {
         let mut s = String::new();
         write!(&mut s, "{number}").unwrap();
         for precision in 0..=S + 1 {
@@ -1478,55 +1515,55 @@ mod test {
     #[test]
     fn display() {
         assert_eq!(
-            multidisplay(Fixed64::<18, 7>::try_from(1.682501).unwrap()),
+            multidisplay(Fixed128::<20, 7>::try_from(1.682501).unwrap()),
             "1.682501 2 1.7 1.68 1.683 1.6825 1.68250 1.682501 1.6825010 1.68250100"
         );
         assert_eq!(
-            multidisplay(Fixed64::<18, 4>::try_from(1.6825).unwrap()),
+            multidisplay(Fixed128::<20, 4>::try_from(1.6825).unwrap()),
             "1.6825 2 1.7 1.68 1.682 1.6825 1.68250"
         );
         assert_eq!(
-            multidisplay(Fixed64::<18, 6>::try_from(1.995670).unwrap()),
+            multidisplay(Fixed128::<20, 6>::try_from(1.995670).unwrap()),
             "1.99567 2 2.0 2.00 1.996 1.9957 1.99567 1.995670 1.9956700"
         );
         assert_eq!(
-            multidisplay(Fixed64::<18, 6>::try_from(0.995670).unwrap()),
+            multidisplay(Fixed128::<20, 6>::try_from(0.995670).unwrap()),
             "0.99567 1 1.0 1.00 0.996 0.9957 0.99567 0.995670 0.9956700"
         );
         assert_eq!(
-            multidisplay(Fixed64::<6, 6>::try_from(0.995670).unwrap()),
+            multidisplay(Fixed128::<6, 6>::try_from(0.995670).unwrap()),
             "0.99567 1 1.0 1.00 0.996 0.9957 0.99567 0.995670 0.9956700"
         );
 
         assert_eq!(
-            multidisplay(Fixed64::<18, 7>::try_from(-1.682501).unwrap()),
+            multidisplay(Fixed128::<20, 7>::try_from(-1.682501).unwrap()),
             "-1.682501 -2 -1.7 -1.68 -1.683 -1.6825 -1.68250 -1.682501 -1.6825010 -1.68250100"
         );
         assert_eq!(
-            multidisplay(Fixed64::<18, 4>::try_from(-1.6825).unwrap()),
+            multidisplay(Fixed128::<20, 4>::try_from(-1.6825).unwrap()),
             "-1.6825 -2 -1.7 -1.68 -1.682 -1.6825 -1.68250"
         );
         assert_eq!(
-            multidisplay(Fixed64::<18, 6>::try_from(-1.995670).unwrap()),
+            multidisplay(Fixed128::<20, 6>::try_from(-1.995670).unwrap()),
             "-1.99567 -2 -2.0 -2.00 -1.996 -1.9957 -1.99567 -1.995670 -1.9956700"
         );
         assert_eq!(
-            multidisplay(Fixed64::<18, 6>::try_from(-0.995670).unwrap()),
+            multidisplay(Fixed128::<20, 6>::try_from(-0.995670).unwrap()),
             "-0.99567 -1 -1.0 -1.00 -0.996 -0.9957 -0.99567 -0.995670 -0.9956700"
         );
     }
 
-    type F = Fixed64<10, 2>;
+    type F = Fixed128<10, 2>;
     fn f(n: f64) -> F {
-        Fixed64::try_from(n).unwrap()
+        Fixed128::try_from(n).unwrap()
     }
 
-    fn f18_0(n: f64) -> Fixed64<18, 0> {
-        Fixed64::try_from(n).unwrap()
+    fn f38_0(n: f64) -> Fixed128<38, 0> {
+        Fixed128::try_from(n).unwrap()
     }
 
-    fn f18_18(s: &str) -> Fixed64<18, 18> {
-        Fixed64::from_str(s).unwrap()
+    fn f38_38(s: &str) -> Fixed128<38, 38> {
+        Fixed128::from_str(s).unwrap()
     }
 
     #[test]
@@ -1539,20 +1576,20 @@ mod test {
 
         // General case.
         for a in -999..=999 {
-            let af: Fixed64<10, 2> = Fixed64(a);
+            let af: Fixed128<10, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<10, 2> = Fixed64(b);
-                assert_eq!(af * bf, Fixed64(a * b / 100));
+                let bf: Fixed128<10, 2> = Fixed128(b);
+                assert_eq!(af * bf, Fixed128(a * b / 100));
             }
         }
 
         // General case with overflow.
         for a in -999..=999 {
-            let af: Fixed64<3, 2> = Fixed64(a);
+            let af: Fixed128<3, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<3, 2> = Fixed64(b);
+                let bf: Fixed128<3, 2> = Fixed128(b);
                 let c = a * b / 100;
-                let expected = (c.unsigned_abs() < 1000).then_some(Fixed64(c));
+                let expected = (c.unsigned_abs() < 1000).then_some(Fixed128(c));
                 assert_eq!(af.checked_mul(&bf), expected);
             }
         }
@@ -1561,15 +1598,15 @@ mod test {
     #[test]
     fn mul_generic() {
         for a in -999..=999 {
-            let af: Fixed64<10, 2> = Fixed64(a);
+            let af: Fixed128<10, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<10, 3> = Fixed64(b);
-                let cf: Fixed64<10, 5> = af.checked_mul_generic(bf).unwrap();
-                assert_eq!(cf, Fixed64(a * b));
-                let df: Fixed64<10, 6> = af.checked_mul_generic(bf).unwrap();
-                assert_eq!(df, Fixed64(a * b * 10));
-                let ef: Fixed64<10, 0> = af.checked_mul_generic(bf).unwrap();
-                assert_eq!(ef, Fixed64(a * b / 100_000));
+                let bf: Fixed128<10, 3> = Fixed128(b);
+                let cf: Fixed128<10, 5> = af.checked_mul_generic(bf).unwrap();
+                assert_eq!(cf, Fixed128(a * b));
+                let df: Fixed128<10, 6> = af.checked_mul_generic(bf).unwrap();
+                assert_eq!(df, Fixed128(a * b * 10));
+                let ef: Fixed128<10, 0> = af.checked_mul_generic(bf).unwrap();
+                assert_eq!(ef, Fixed128(a * b / 100_000));
             }
         }
     }
@@ -1582,32 +1619,32 @@ mod test {
         assert_eq!(f(1.23) / f(-2.34), f(-0.52));
         assert_eq!(f(-1.23) / f(-2.34), f(0.52));
         assert_eq!(
-            f18_0(1.0).checked_div_generic(f18_0(7.0)).unwrap(),
-            f18_18("0.14285714285714285714285714285714285714")
+            f38_0(1.0).checked_div_generic(f38_0(7.0)).unwrap(),
+            f38_38("0.14285714285714285714285714285714285714")
         );
 
         assert_eq!(
-            f18_0(123.0).checked_div_generic::<18, 18, 18, 18>(f18_18("0.456")),
+            f38_0(123.0).checked_div_generic::<38, 38, 38, 38>(f38_38("0.456")),
             None
         );
 
         // General case.
         for a in -999..=999 {
-            let af: Fixed64<10, 2> = Fixed64(a);
+            let af: Fixed128<10, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<10, 2> = Fixed64(b);
-                assert_eq!(af.checked_div(&bf), (b != 0).then(|| Fixed64(a * 100 / b)));
+                let bf: Fixed128<10, 2> = Fixed128(b);
+                assert_eq!(af.checked_div(&bf), (b != 0).then(|| Fixed128(a * 100 / b)));
             }
         }
 
         // General case with overflow.
         for a in -999..=999 {
-            let af: Fixed64<3, 2> = Fixed64(a);
+            let af: Fixed128<3, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<3, 2> = Fixed64(b);
+                let bf: Fixed128<3, 2> = Fixed128(b);
                 let expected = if b != 0 {
                     let result = a * 100 / b;
-                    (result.unsigned_abs() <= 999).then_some(Fixed64(result))
+                    (result.unsigned_abs() <= 999).then_some(Fixed128(result))
                 } else {
                     None
                 };
@@ -1619,16 +1656,16 @@ mod test {
     #[test]
     fn div_generic() {
         for a in -999..=999 {
-            let af: Fixed64<10, 2> = Fixed64(a);
+            let af: Fixed128<10, 2> = Fixed128(a);
             for b in -999..=999 {
                 if b != 0 {
-                    let bf: Fixed64<10, 3> = Fixed64(b);
-                    let cf: Fixed64<10, 5> = af.checked_div_generic(bf).unwrap();
-                    assert_eq!(cf, Fixed64(a * 1_000_000 / b));
-                    let df: Fixed64<10, 6> = af.checked_div_generic(bf).unwrap();
-                    assert_eq!(df, Fixed64(a * 10_000_000 / b));
-                    let ef: Fixed64<10, 0> = af.checked_div_generic(bf).unwrap();
-                    assert_eq!(ef, Fixed64(a * 10 / b));
+                    let bf: Fixed128<10, 3> = Fixed128(b);
+                    let cf: Fixed128<10, 5> = af.checked_div_generic(bf).unwrap();
+                    assert_eq!(cf, Fixed128(a * 1_000_000 / b));
+                    let df: Fixed128<10, 6> = af.checked_div_generic(bf).unwrap();
+                    assert_eq!(df, Fixed128(a * 10_000_000 / b));
+                    let ef: Fixed128<10, 0> = af.checked_div_generic(bf).unwrap();
+                    assert_eq!(ef, Fixed128(a * 10 / b));
                 }
             }
         }
@@ -1644,37 +1681,37 @@ mod test {
 
         // General case.
         for a in -999..=999 {
-            let af: Fixed64<10, 2> = Fixed64(a);
+            let af: Fixed128<10, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<10, 2> = Fixed64(b);
-                assert_eq!(af + bf, Fixed64(a + b));
+                let bf: Fixed128<10, 2> = Fixed128(b);
+                assert_eq!(af + bf, Fixed128(a + b));
             }
         }
 
         // General case with overflow.
         for a in -999..=999 {
-            let af: Fixed64<3, 2> = Fixed64(a);
+            let af: Fixed128<3, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<3, 2> = Fixed64(b);
+                let bf: Fixed128<3, 2> = Fixed128(b);
                 let c = a + b;
-                let expected = (c.unsigned_abs() < 1000).then_some(Fixed64(c));
+                let expected = (c.unsigned_abs() < 1000).then_some(Fixed128(c));
                 assert_eq!(af.checked_add(&bf), expected);
             }
         }
 
         // General case with type conversion.
         for a in -999..=999 {
-            let af: Fixed64<10, 2> = Fixed64(a);
+            let af: Fixed128<10, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<10, 3> = Fixed64(b);
-                let cf: Fixed64<10, 5> = af.checked_add_generic(bf).unwrap();
-                assert_eq!(cf, Fixed64(a * 1000 + b * 100), "{af} + {bf} ?= {cf}");
-                let cf: Fixed64<10, 5> = bf.checked_add_generic(af).unwrap();
-                assert_eq!(cf, Fixed64(a * 1000 + b * 100), "{bf} + {af} ?= {cf}");
-                let df: Fixed64<10, 6> = af.checked_add_generic(bf).unwrap();
-                assert_eq!(df, Fixed64(a * 10_000 + b * 1000), "{af} + {bf} ?= {df}");
-                let ef: Fixed64<10, 0> = af.checked_add_generic(bf).unwrap();
-                assert_eq!(ef, Fixed64((a * 10 + b) / 1000), "{af} + {bf} ?= {ef}");
+                let bf: Fixed128<10, 3> = Fixed128(b);
+                let cf: Fixed128<10, 5> = af.checked_add_generic(bf).unwrap();
+                assert_eq!(cf, Fixed128(a * 1000 + b * 100), "{af} + {bf} ?= {cf}");
+                let cf: Fixed128<10, 5> = bf.checked_add_generic(af).unwrap();
+                assert_eq!(cf, Fixed128(a * 1000 + b * 100), "{bf} + {af} ?= {cf}");
+                let df: Fixed128<10, 6> = af.checked_add_generic(bf).unwrap();
+                assert_eq!(df, Fixed128(a * 10_000 + b * 1000), "{af} + {bf} ?= {df}");
+                let ef: Fixed128<10, 0> = af.checked_add_generic(bf).unwrap();
+                assert_eq!(ef, Fixed128((a * 10 + b) / 1000), "{af} + {bf} ?= {ef}");
             }
         }
     }
@@ -1689,35 +1726,35 @@ mod test {
 
         // General case.
         for a in -999..=999 {
-            let af: Fixed64<10, 2> = Fixed64(a);
+            let af: Fixed128<10, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<10, 2> = Fixed64(b);
-                assert_eq!(af - bf, Fixed64(a - b));
+                let bf: Fixed128<10, 2> = Fixed128(b);
+                assert_eq!(af - bf, Fixed128(a - b));
             }
         }
 
         // General case with overflow.
         for a in -999..=999 {
-            let af: Fixed64<3, 2> = Fixed64(a);
+            let af: Fixed128<3, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<3, 2> = Fixed64(b);
+                let bf: Fixed128<3, 2> = Fixed128(b);
                 let c = a - b;
-                let expected = (c.unsigned_abs() < 1000).then_some(Fixed64(c));
+                let expected = (c.unsigned_abs() < 1000).then_some(Fixed128(c));
                 assert_eq!(af.checked_sub(&bf), expected);
             }
         }
 
         // General case with type conversion.
         for a in -999..=999 {
-            let af: Fixed64<10, 2> = Fixed64(a);
+            let af: Fixed128<10, 2> = Fixed128(a);
             for b in -999..=999 {
-                let bf: Fixed64<10, 3> = Fixed64(b);
-                let cf: Fixed64<10, 5> = af.checked_sub_generic(bf).unwrap();
-                assert_eq!(cf, Fixed64(a * 1000 - b * 100), "{af} - {bf} ?= {cf}");
-                let cf: Fixed64<10, 5> = bf.checked_sub_generic(af).unwrap();
-                assert_eq!(cf, Fixed64(b * 100 - a * 1000), "{bf} - {af} ?= {cf}");
-                let df: Fixed64<10, 6> = af.checked_sub_generic(bf).unwrap();
-                assert_eq!(df, Fixed64(a * 10_000 - b * 1000));
+                let bf: Fixed128<10, 3> = Fixed128(b);
+                let cf: Fixed128<10, 5> = af.checked_sub_generic(bf).unwrap();
+                assert_eq!(cf, Fixed128(a * 1000 - b * 100), "{af} - {bf} ?= {cf}");
+                let cf: Fixed128<10, 5> = bf.checked_sub_generic(af).unwrap();
+                assert_eq!(cf, Fixed128(b * 100 - a * 1000), "{bf} - {af} ?= {cf}");
+                let df: Fixed128<10, 6> = af.checked_sub_generic(bf).unwrap();
+                assert_eq!(df, Fixed128(a * 10_000 - b * 1000));
             }
         }
     }
@@ -1725,7 +1762,7 @@ mod test {
     #[test]
     fn powi() {
         assert_eq!(
-            Fixed64::<10, 8>::from_str("1.12345678")
+            Fixed128::<10, 8>::from_str("1.12345678")
                 .unwrap()
                 .powi(8)
                 .to_string()
@@ -1743,7 +1780,7 @@ mod test {
 
     #[test]
     fn convert() {
-        let a = Fixed64::<10, 10>::from_str("0.0123456789").unwrap();
+        let a = Fixed128::<10, 10>::from_str("0.0123456789").unwrap();
         assert_eq!(&a.convert::<10, 0>().unwrap().to_string(), "0");
         assert_eq!(&a.convert::<10, 1>().unwrap().to_string(), "0");
         assert_eq!(&a.convert::<10, 2>().unwrap().to_string(), "0.01");
@@ -1794,7 +1831,7 @@ mod test {
             "0.0123456789"
         );
 
-        let b = Fixed64::<10, 5>::from_str("12345.67895").unwrap();
+        let b = Fixed128::<10, 5>::from_str("12345.67895").unwrap();
         assert_eq!(&b.convert::<10, 0>().unwrap().to_string(), "12345");
         assert_eq!(&b.convert::<10, 1>().unwrap().to_string(), "12345.6");
         assert_eq!(&b.convert::<10, 2>().unwrap().to_string(), "12345.67");
@@ -1839,36 +1876,36 @@ mod test {
 
     #[test]
     fn constants() {
-        assert_eq!(Fixed64::<5, 0>::MAX, Fixed64(99999));
-        assert_eq!(Fixed64::<5, 0>::MIN, Fixed64(-99999));
-        assert_eq!(Fixed64::<5, 0>::ZERO, Fixed64(0));
-        assert_eq!(Fixed64::<5, 0>::ONE, Fixed64(1));
+        assert_eq!(Fixed128::<5, 0>::MAX, Fixed128(99999));
+        assert_eq!(Fixed128::<5, 0>::MIN, Fixed128(-99999));
+        assert_eq!(Fixed128::<5, 0>::ZERO, Fixed128(0));
+        assert_eq!(Fixed128::<5, 0>::ONE, Fixed128(1));
 
-        assert_eq!(Fixed64::<5, 1>::MAX, Fixed64(99999));
-        assert_eq!(Fixed64::<5, 1>::MIN, Fixed64(-99999));
-        assert_eq!(Fixed64::<5, 1>::ZERO, Fixed64(0));
-        assert_eq!(Fixed64::<5, 1>::ONE, Fixed64(10));
+        assert_eq!(Fixed128::<5, 1>::MAX, Fixed128(99999));
+        assert_eq!(Fixed128::<5, 1>::MIN, Fixed128(-99999));
+        assert_eq!(Fixed128::<5, 1>::ZERO, Fixed128(0));
+        assert_eq!(Fixed128::<5, 1>::ONE, Fixed128(10));
 
-        assert_eq!(Fixed64::<5, 2>::MAX, Fixed64(99999));
-        assert_eq!(Fixed64::<5, 2>::MIN, Fixed64(-99999));
-        assert_eq!(Fixed64::<5, 2>::ZERO, Fixed64(0));
-        assert_eq!(Fixed64::<5, 2>::ONE, Fixed64(100));
+        assert_eq!(Fixed128::<5, 2>::MAX, Fixed128(99999));
+        assert_eq!(Fixed128::<5, 2>::MIN, Fixed128(-99999));
+        assert_eq!(Fixed128::<5, 2>::ZERO, Fixed128(0));
+        assert_eq!(Fixed128::<5, 2>::ONE, Fixed128(100));
 
-        assert_eq!(Fixed64::<5, 3>::MAX, Fixed64(99999));
-        assert_eq!(Fixed64::<5, 3>::MIN, Fixed64(-99999));
-        assert_eq!(Fixed64::<5, 3>::ZERO, Fixed64(0));
-        assert_eq!(Fixed64::<5, 3>::ONE, Fixed64(1000));
+        assert_eq!(Fixed128::<5, 3>::MAX, Fixed128(99999));
+        assert_eq!(Fixed128::<5, 3>::MIN, Fixed128(-99999));
+        assert_eq!(Fixed128::<5, 3>::ZERO, Fixed128(0));
+        assert_eq!(Fixed128::<5, 3>::ONE, Fixed128(1000));
 
-        assert_eq!(Fixed64::<5, 4>::MAX, Fixed64(99999));
-        assert_eq!(Fixed64::<5, 4>::MIN, Fixed64(-99999));
-        assert_eq!(Fixed64::<5, 4>::ZERO, Fixed64(0));
-        assert_eq!(Fixed64::<5, 4>::ONE, Fixed64(10000));
+        assert_eq!(Fixed128::<5, 4>::MAX, Fixed128(99999));
+        assert_eq!(Fixed128::<5, 4>::MIN, Fixed128(-99999));
+        assert_eq!(Fixed128::<5, 4>::ZERO, Fixed128(0));
+        assert_eq!(Fixed128::<5, 4>::ONE, Fixed128(10000));
 
-        assert_eq!(Fixed64::<5, 5>::MAX, Fixed64(99999));
-        assert_eq!(Fixed64::<5, 5>::MIN, Fixed64(-99999));
-        assert_eq!(Fixed64::<5, 5>::ZERO, Fixed64(0));
+        assert_eq!(Fixed128::<5, 5>::MAX, Fixed128(99999));
+        assert_eq!(Fixed128::<5, 5>::MIN, Fixed128(-99999));
+        assert_eq!(Fixed128::<5, 5>::ZERO, Fixed128(0));
         // This would panic at compile time.  See [super::_invalid_constant_test].
-        //let _ = Fixed64::<5, 5>::ONE;
+        //let _ = Fixed128::<5, 5>::ONE;
     }
 
     #[test]
@@ -1949,9 +1986,9 @@ mod test {
 
     #[test]
     fn sign() {
-        assert_eq!(f(-0.1).sign(), Fixed64::try_from(-1).unwrap());
-        assert_eq!(f(0.0).sign(), Fixed64::try_from(0).unwrap());
-        assert_eq!(f(0.5).sign(), Fixed64::try_from(1).unwrap());
+        assert_eq!(f(-0.1).sign(), Fixed128::try_from(-1).unwrap());
+        assert_eq!(f(0.0).sign(), Fixed128::try_from(0).unwrap());
+        assert_eq!(f(0.5).sign(), Fixed128::try_from(1).unwrap());
     }
 
     #[test]
@@ -1966,8 +2003,8 @@ mod test {
 
         // General case.
         for a in 0..=999 {
-            let af: Fixed64<10, 2> = Fixed64(a);
-            assert_eq!(af.sqrt(), Fixed64((a * 100).isqrt()));
+            let af: Fixed128<10, 2> = Fixed128(a);
+            assert_eq!(af.sqrt(), Fixed128((a * 100).isqrt()));
         }
     }
 
@@ -1983,15 +2020,15 @@ mod test {
             const PC: usize,
             const SC: usize,
         >(
-            a: Option<Fixed64<PA, SA>>,
-            b: Option<Fixed64<PB, SB>>,
-        ) -> Option<Fixed64<PC, SC>> {
+            a: Option<Fixed128<PA, SA>>,
+            b: Option<Fixed128<PB, SB>>,
+        ) -> Option<Fixed128<PC, SC>> {
             a.zip(b).and_then(|(a, b)| a.checked_add_generic(b))
         }
 
-        let a: Option<Fixed64<10, 2>> = Some("1.23".parse().unwrap());
-        let b: Option<Fixed64<5, 4>> = Some("4.5678".parse().unwrap());
-        let c: Option<Fixed64<10, 4>> = nullable_checked_add_generic(a, b);
+        let a: Option<Fixed128<10, 2>> = Some("1.23".parse().unwrap());
+        let b: Option<Fixed128<5, 4>> = Some("4.5678".parse().unwrap());
+        let c: Option<Fixed128<10, 4>> = nullable_checked_add_generic(a, b);
         assert_eq!(c, Some("5.7978".parse().unwrap()));
     }
 }

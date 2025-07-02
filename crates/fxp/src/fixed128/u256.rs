@@ -5,7 +5,7 @@ use std::{
     ops::{Add, Shr, Sub},
 };
 
-use crate::pow10;
+use super::pow10;
 
 const fn lo(x: u128) -> u128 {
     x & ((1 << 64) - 1)
@@ -239,7 +239,7 @@ impl I256 {
         }
     }
 
-    /// Shifts this value just enough gitis right that it fits in an `i128`.
+    /// Shifts this value just enough digits right that it fits in an `i128`.
     /// Returns the shifted value and the number of digits that were shifted.
     pub fn reduce_to_i128(self) -> (i128, usize) {
         // First reduce to the range of `u128`.
@@ -298,7 +298,7 @@ mod test {
     use itertools::Itertools;
     use num_bigint::BigUint;
 
-    use crate::u256::U256;
+    use super::U256;
 
     /// Iterator for 32 key values of `u64`.
     ///
