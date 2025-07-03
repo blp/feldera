@@ -1,15 +1,16 @@
 use std::{
     cmp::Ordering,
     fmt::{Debug, Display},
-    io::Write,
     ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign},
     str::FromStr,
 };
 
 use num_traits::{cast, CheckedAdd, CheckedDiv, CheckedMul, CheckedSub, One, Zero};
-use smallvec::{Array, SmallVec};
 
-use crate::fixed128::u256::I256;
+use crate::{
+    debug_generic, display_generic, div_ceil, div_floor, fixed128::u256::I256, Fixed64,
+    FixedConversions, OutOfRange,
+};
 
 mod u256;
 
@@ -40,112 +41,45 @@ mod u256;
 /// `i32` for `S ≤ 9`, but the implementation does not optimize for those cases.
 #[derive(Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "size_of", derive(size_of::SizeOf))]
-pub struct Fixed128<const P: usize, const S: usize>(i128);
+pub struct Fixed128<const P: usize, const S: usize>(pub(super) i128);
 
 /// A maximum-precision `Fixed128` with no decimal places.
 pub type FixedInteger = Fixed128<38, 0>;
 
+impl<const P: usize, const S: usize> FixedConversions<P, S> for Fixed128<P, S> {
+    const FITS_IN_64_BITS: bool = P <= 18;
+    fn to_fixed64(&self) -> Fixed64<P, S> {
+        const { assert!(P <= 18) };
+        Fixed64(self.0 as i64)
+    }
+
+    fn from_fixed64(x: Fixed64<P, S>) -> Self {
+        Self(x.0.into())
+    }
+
+    fn to_fixed128(&self) -> Fixed128<P, S> {
+        const {
+            assert!(P <= 18);
+        };
+        Fixed128(self.0)
+    }
+
+    fn from_fixed128(x: Fixed128<P, S>) -> Self {
+        Self(x.0)
+    }
+}
+
 impl<const P: usize, const S: usize> Debug for Fixed128<P, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if S == 0 {
-            write!(f, "{}", self.0)
-        } else if self.0 % Self::scale() == 0 {
-            write!(f, "{}", self.0 / Self::scale())
-        } else {
-            write!(
-                f,
-                "{}{}.{}",
-                if self.0 < 0 { "-" } else { "" },
-                self.0.abs() / Self::scale(),
-                (self.0.abs() % Self::scale()).abs()
-            )
-        }
+        debug_generic(self.0, Self::scale(), f)
     }
 }
 
 impl<const P: usize, const S: usize> Display for Fixed128<P, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut buf = SmallVec::<[u8; 64]>::new();
-        write!(&mut buf, "{:01$}", self.0.abs(), S + 1).unwrap();
-        debug_assert!(buf.len() > S);
-        let decimals = if let Some(precision) = f.precision() {
-            match precision.cmp(&S) {
-                Ordering::Less => {
-                    let new_len = buf.len() - (S - precision);
-                    let mut discard = buf[new_len..].iter();
-                    enum Rounding {
-                        Up,
-                        Down,
-                        Even,
-                    }
-                    impl Rounding {
-                        fn round<A>(&self, s: &mut SmallVec<A>)
-                        where
-                            A: Array<Item = u8>,
-                        {
-                            let round_up = match self {
-                                Rounding::Down => false,
-                                Rounding::Up => true,
-                                Rounding::Even => s.last().unwrap() % 2 == 1,
-                            };
-                            if round_up {
-                                let mut nines = 0;
-                                let c = loop {
-                                    match s.pop() {
-                                        Some(b'9') => nines += 1,
-                                        Some(c) => break c,
-                                        None => break b'0',
-                                    }
-                                };
-                                s.push(c + 1);
-                                for _ in 0..nines {
-                                    s.push(b'0');
-                                }
-                            }
-                        }
-                    }
-                    let rounding = match discard.next().unwrap() {
-                        b'0'..=b'4' => Rounding::Down,
-                        b'5' => loop {
-                            match discard.next() {
-                                Some(b'0') => (),
-                                Some(_) => break Rounding::Up,
-                                None => break Rounding::Even,
-                            }
-                        },
-                        b'6'..=b'9' => Rounding::Up,
-                        _ => unreachable!(),
-                    };
-                    buf.truncate(new_len);
-                    rounding.round(&mut buf);
-                }
-                Ordering::Equal => (),
-                Ordering::Greater => {
-                    for _ in S..precision {
-                        buf.push(b'0');
-                    }
-                }
-            }
-            precision
-        } else {
-            let mut decimals = S;
-            while decimals > 0 && buf.ends_with(b"0") {
-                buf.pop();
-                decimals -= 1;
-            }
-            decimals
-        };
-        if decimals > 0 {
-            buf.insert(buf.len() - decimals, b'.');
-        }
-
-        // SAFETY: `buf` contains only ASCII characters.
-        f.pad_integral(self.0 >= 0, "", unsafe { str::from_utf8_unchecked(&buf) })
+        display_generic(self.0, S, f)
     }
 }
-
-#[derive(Copy, Clone, Debug)]
-pub struct OutOfRange;
 
 /// Returns `10**exponent`, or `None` if `exponent > 38` (because the result
 /// would be greater than `i128::MAX`).
@@ -199,42 +133,6 @@ fn round_inner(value: i128, scale: i32, n: i32, halfway: Halfway) -> Option<i128
         Some(0)
     } else {
         None
-    }
-}
-
-/// Returns `floor(x / y)`.  This is copied out of `i128::div_floor` in the
-/// standard library, which is not yet stable.
-const fn div_floor(x: i128, y: i128) -> i128 {
-    let d = x / y;
-    let r = x % y;
-
-    // If the remainder is non-zero, we need to subtract one if the
-    // signs of lhs and rhs differ, as this means we rounded upwards
-    // instead of downwards. We do this branchlessly by creating a mask
-    // which is all-ones iff the signs differ, and 0 otherwise. Then by
-    // adding this mask (which corresponds to the signed value -1), we
-    // get our correction.
-    let correction = (x ^ y) >> (i128::BITS - 1);
-    if r != 0 {
-        d + correction
-    } else {
-        d
-    }
-}
-
-/// Returns `ceil(x / y)`.  This is copied out of `i128::div_ceil` in the
-/// standard library, which is not yet stable.
-const fn div_ceil(x: i128, y: i128) -> i128 {
-    let d = x / y;
-    let r = x % y;
-
-    // When remainder is non-zero we have a.div_ceil(b) == 1 + a.div_floor(b),
-    // so we can re-use the algorithm from div_floor, just adding 1.
-    let correction = 1 + ((x ^ y) >> (i128::BITS - 1));
-    if r != 0 {
-        d + correction
-    } else {
-        d
     }
 }
 
