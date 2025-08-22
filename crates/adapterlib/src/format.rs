@@ -69,6 +69,8 @@ pub trait InputBuffer: Send {
     /// those records.
     fn flush(&mut self);
 
+    fn stage(&mut self);
+
     /// Returns the number of buffered records and bytes.
     fn len(&self) -> BufferSize;
 
@@ -169,6 +171,12 @@ impl InputBuffer for Option<Box<dyn InputBuffer>> {
     fn flush(&mut self) {
         if let Some(buffer) = self.as_mut() {
             buffer.flush()
+        }
+    }
+
+    fn stage(&mut self) {
+        if let Some(buffer) = self.as_mut() {
+            buffer.stage()
         }
     }
 

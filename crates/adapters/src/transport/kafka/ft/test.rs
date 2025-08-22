@@ -338,6 +338,10 @@ impl InputBuffer for DummyInputBuffer {
         }
     }
 
+    fn stage(&mut self) {
+        todo!()
+    }
+
     fn len(&self) -> BufferSize {
         self.data
             .as_ref()

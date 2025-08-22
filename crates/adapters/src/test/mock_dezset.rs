@@ -225,6 +225,10 @@ where
         self.n_bytes = 0;
     }
 
+    fn stage(&mut self) {
+        todo!()
+    }
+
     fn len(&self) -> BufferSize {
         BufferSize {
             records: self.updates.len(),
@@ -338,6 +342,10 @@ where
         self.buffer.flush()
     }
 
+    fn stage(&mut self) {
+        todo!()
+    }
+
     fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {
         self.buffer.take_some(n)
     }
@@ -383,6 +391,10 @@ where
 {
     fn flush(&mut self) {
         self.buffer.flush()
+    }
+
+    fn stage(&mut self) {
+        todo!()
     }
 
     fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {
@@ -501,6 +513,10 @@ where
     fn flush(&mut self) {
         let mut state = self.handle.0.lock().unwrap();
         state.flushed.append(&mut self.updates);
+    }
+
+    fn stage(&mut self) {
+        todo!()
     }
 
     fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {

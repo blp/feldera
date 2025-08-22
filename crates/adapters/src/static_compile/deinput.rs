@@ -451,6 +451,13 @@ where
         self.n_bytes = 0;
     }
 
+    fn stage(&mut self) {
+        self.handle.stage(
+            std::mem::take(&mut self.updates),
+            std::mem::take(&mut self.n_bytes),
+        );
+    }
+
     fn hash(&self, hasher: &mut dyn Hasher) {
         for update in &self.updates {
             hasher.write_u64(update.default_hash())
@@ -595,6 +602,10 @@ where
         self.buffer.flush()
     }
 
+    fn stage(&mut self) {
+        self.buffer.stage()
+    }
+
     fn len(&self) -> BufferSize {
         self.buffer.len()
     }
@@ -689,6 +700,10 @@ where
         self.buffer.flush()
     }
 
+    fn stage(&mut self) {
+        self.buffer.stage()
+    }
+
     fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {
         self.buffer.take_some(n)
     }
@@ -764,6 +779,10 @@ where
 {
     fn flush(&mut self) {
         self.buffer.flush()
+    }
+
+    fn stage(&mut self) {
+        self.buffer.stage()
     }
 
     fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {
@@ -887,6 +906,13 @@ where
         self.n_bytes = 0;
     }
 
+    fn stage(&mut self) {
+        self.handle.stage(
+            std::mem::take(&mut self.updates),
+            std::mem::take(&mut self.n_bytes),
+        );
+    }
+
     fn len(&self) -> BufferSize {
         BufferSize {
             records: self.updates.len(),
@@ -999,6 +1025,10 @@ where
         self.buffer.flush()
     }
 
+    fn stage(&mut self) {
+        self.buffer.stage()
+    }
+
     fn len(&self) -> BufferSize {
         self.buffer.len()
     }
@@ -1088,6 +1118,10 @@ where
         self.buffer.flush()
     }
 
+    fn stage(&mut self) {
+        self.buffer.stage()
+    }
+
     fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {
         self.buffer.take_some(n)
     }
@@ -1163,6 +1197,10 @@ where
 {
     fn flush(&mut self) {
         self.buffer.flush()
+    }
+
+    fn stage(&mut self) {
+        self.buffer.stage()
     }
 
     fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {
@@ -1361,6 +1399,13 @@ where
         self.n_bytes = 0;
     }
 
+    fn stage(&mut self) {
+        self.handle.stage(
+            std::mem::take(&mut self.updates),
+            std::mem::take(&mut self.n_bytes),
+        );
+    }
+
     fn len(&self) -> BufferSize {
         BufferSize {
             records: self.updates.len(),
@@ -1519,6 +1564,10 @@ where
         self.buffer.flush()
     }
 
+    fn stage(&mut self) {
+        self.buffer.stage();
+    }
+
     fn len(&self) -> BufferSize {
         self.buffer.len()
     }
@@ -1645,6 +1694,10 @@ where
         self.buffer.flush()
     }
 
+    fn stage(&mut self) {
+        self.buffer.stage();
+    }
+
     fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {
         self.buffer.take_some(n)
     }
@@ -1752,6 +1805,10 @@ where
 {
     fn flush(&mut self) {
         self.buffer.flush()
+    }
+
+    fn stage(&mut self) {
+        self.buffer.stage();
     }
 
     fn take_some(&mut self, n: usize) -> Option<Box<dyn InputBuffer>> {

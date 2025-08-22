@@ -15,6 +15,7 @@ use crate::{
             time_series::LeastUpperBoundFunc,
             upsert::UpdateSetFactories,
         },
+        input::StagedAmount,
         Input, InputHandle, Update,
     },
     trace::{Batch, BatchFactories, BatchReaderFactories, Rkyv},
@@ -655,7 +656,7 @@ impl RootCircuit {
             let upsert_handle = <UpsertHandle<K, DynBool>>::new(
                 factories.input_pair_factory,
                 factories.input_pairs_factory,
-                input_handle,
+                todo!(),
             );
 
             let upsert: Stream<RootCircuit, OrdZSet<K>> =
@@ -748,7 +749,7 @@ impl RootCircuit {
             let zset_handle = <UpsertHandle<K, DynUpdate<V, U>>>::new(
                 factories.input_pair_factory,
                 factories.input_pairs_factory,
-                input_handle,
+                todo!(),
             );
 
             let upsert =
@@ -920,7 +921,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> CollectionHandle<K, V> {
 
     #[inline]
     fn num_partitions(&self) -> usize {
-        self.input_handle.0.mailbox.len()
+        self.input_handle.0.input_handle.mailbox.len()
     }
 
     /// Push a single `(key,value)` pair to the input stream.
@@ -1107,7 +1108,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> UpsertHandle<K, V> {
         Self {
             pair_factory,
             pairs_factory,
-            buffers: vec![pairs_factory.default_box(); input_handle.0.mailbox.len()],
+            buffers: vec![pairs_factory.default_box(); input_handle.0.input_handle.mailbox.len()],
             input_handle,
             hash_func,
         }
@@ -1115,7 +1116,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> UpsertHandle<K, V> {
 
     #[inline]
     fn num_partitions(&self) -> usize {
-        self.buffers.len()
+        self.input_handle.0.input_handle.mailbox.len()
     }
 
     /// Push a single `(key,value)` pair to the input stream.

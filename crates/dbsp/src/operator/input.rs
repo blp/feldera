@@ -16,8 +16,10 @@ use crate::{
     utils::Tup2,
     Circuit, DBData, DynZWeight, RootCircuit, Runtime, Stream, TypedBox, ZWeight,
 };
+use hashbrown::HashMap;
 use std::{
     borrow::{Borrow, Cow},
+    collections::VecDeque,
     fmt::Debug,
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -33,17 +35,18 @@ pub use crate::operator::dynamic::input_upsert::{PatchFunc, Update};
 pub type IndexedZSetStream<K, V> = Stream<RootCircuit, OrdIndexedZSet<K, V>>;
 pub type ZSetStream<K> = Stream<RootCircuit, OrdZSet<K>>;
 
-#[repr(transparent)]
 pub struct ZSetHandle<K> {
     handle: CollectionHandle<DynPair<DynData, DynUnit>, DynZWeight>,
-    phantom: PhantomData<fn(&K)>,
+    staged: Vec<VecDeque<Tup2<K, ZWeight>>>,
+    staged_bytes: usize,
 }
 
 impl<K> Clone for ZSetHandle<K> {
     fn clone(&self) -> Self {
         Self {
             handle: self.handle.clone(),
-            phantom: PhantomData,
+            staged: Vec::new(),
+            staged_bytes: 0,
         }
     }
 }
@@ -63,8 +66,14 @@ where
     fn new(handle: CollectionHandle<DynPair<DynData, DynUnit>, DynZWeight>) -> Self {
         Self {
             handle,
-            phantom: PhantomData,
+            staged: Vec::new(),
+            staged_bytes: 0,
         }
+    }
+
+    pub fn stage(&mut self, buffers: VecDeque<Tup2<K, ZWeight>>, n_bytes: usize) {
+        self.staged.push(buffers);
+        self.staged_bytes += n_bytes;
     }
 
     pub fn push(&self, k: K, mut w: ZWeight) {
@@ -111,17 +120,18 @@ where
     }
 }
 
-#[repr(transparent)]
 pub struct SetHandle<K> {
     handle: UpsertHandle<DynData, DynBool>,
-    phantom: PhantomData<fn(&K)>,
+    staged: Vec<VecDeque<Tup2<K, bool>>>,
+    staged_bytes: usize,
 }
 
 impl<K> Clone for SetHandle<K> {
     fn clone(&self) -> Self {
         Self {
             handle: self.handle.clone(),
-            phantom: PhantomData,
+            staged: Vec::new(),
+            staged_bytes: 0,
         }
     }
 }
@@ -133,10 +143,15 @@ where
     fn new(handle: UpsertHandle<DynData, DynBool>) -> Self {
         Self {
             handle,
-            phantom: PhantomData,
+            staged: Vec::new(),
+            staged_bytes: 0,
         }
     }
 
+    pub fn stage(&mut self, buffers: VecDeque<Tup2<K, bool>>, n_bytes: usize) {
+        self.staged.push(buffers);
+        self.staged_bytes += n_bytes;
+    }
     pub fn push(&self, mut k: K, mut v: bool) {
         self.handle.dyn_push(k.erase_mut(), v.erase_mut())
     }
@@ -147,17 +162,26 @@ where
     }
 }
 
-#[repr(transparent)]
-pub struct MapHandle<K, V, U> {
+pub struct MapHandle<K, V, U>
+where
+    V: DBData,
+    U: DBData,
+{
     handle: UpsertHandle<DynData, DynUpdate<DynData, DynData>>,
-    phantom: PhantomData<fn(&K, &V, &U)>,
+    staged: Vec<VecDeque<Tup2<K, Update<V, U>>>>,
+    staged_bytes: usize,
 }
 
-impl<K, V, U> Clone for MapHandle<K, V, U> {
+impl<K, V, U> Clone for MapHandle<K, V, U>
+where
+    V: DBData,
+    U: DBData,
+{
     fn clone(&self) -> Self {
         Self {
             handle: self.handle.clone(),
-            phantom: PhantomData,
+            staged: Vec::new(),
+            staged_bytes: 0,
         }
     }
 }
@@ -171,8 +195,14 @@ where
     fn new(handle: UpsertHandle<DynData, DynUpdate<DynData, DynData>>) -> Self {
         Self {
             handle,
-            phantom: PhantomData,
+            staged: Vec::new(),
+            staged_bytes: 0,
         }
+    }
+
+    pub fn stage(&mut self, buffers: VecDeque<Tup2<K, Update<V, U>>>, n_bytes: usize) {
+        self.staged.push(buffers);
+        self.staged_bytes += n_bytes;
     }
 
     pub fn push(&self, mut k: K, mut upd: Update<V, U>) {
@@ -739,6 +769,7 @@ impl<T: Clone> Mailbox<T> {
 }
 
 pub(crate) struct InputHandleInternal<T> {
+    //ahead: Vec<RwLock<HashMap<u64, Vec<T>>>>,
     pub(crate) mailbox: Vec<Mailbox<T>>,
     offset: usize,
 }
@@ -805,12 +836,39 @@ where
 /// `T::default()`).  The handle is then used to write new values
 /// to the mailboxes, which will be consumed at the next
 /// logical clock tick.
-pub struct InputHandle<T>(pub(crate) Arc<InputHandleInternal<T>>);
+pub struct InputHandle<T>(pub(crate) Arc<StagedInputHandleInternal<T>>);
 
+// Unlike `#[derive(Clone)]`, this doesn't require `T: Clone`.
 impl<T> Clone for InputHandle<T> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
+}
+
+pub struct Stage<T> {
+    contents: HashMap<u64, VecDeque<(T, StagedAmount)>>,
+    counts: VecDeque<usize>,
+}
+
+impl<T> Default for Stage<T> {
+    fn default() -> Self {
+        Self {
+            contents: Default::default(),
+            counts: Default::default(),
+        }
+    }
+}
+
+pub struct StagedInputHandleInternal<T> {
+    stage: Mutex<Stage<T>>,
+    data: Mutex<VecDeque<(Vec<T>, StagedAmount)>>,
+    pub(crate) input_handle: InputHandleInternal<T>,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct StagedAmount {
+    pub n_records: usize,
+    pub n_bytes: usize,
 }
 
 impl<T> InputHandle<T>
@@ -818,8 +876,16 @@ where
     T: Send + Clone + 'static,
 {
     fn new(empty_val: Arc<dyn Fn() -> T + Send + Sync>) -> Self {
+        fn inner<T>(input_handle: InputHandleInternal<T>) -> InputHandle<T> {
+            InputHandle(Arc::new(StagedInputHandleInternal {
+                stage: Mutex::new(Stage::default()),
+                data: Mutex::new(VecDeque::new()),
+                input_handle,
+            }))
+        }
+
         match Runtime::runtime() {
-            None => Self(Arc::new(InputHandleInternal::new(0..1, empty_val))),
+            None => inner(InputHandleInternal::new(0..1, empty_val)),
             Some(runtime) => {
                 let input_id = runtime.sequence_next();
 
@@ -827,10 +893,10 @@ where
                     .local_store()
                     .entry(InputId::new(input_id))
                     .or_insert_with(|| {
-                        Self(Arc::new(InputHandleInternal::new(
+                        inner(InputHandleInternal::new(
                             runtime.layout().local_workers(),
                             empty_val,
-                        )))
+                        ))
                     })
                     .value()
                     .clone()
@@ -842,17 +908,17 @@ where
     /// is, all of the workers on this host (all workers everywhere, for a
     /// single-host circuit).
     pub(crate) fn workers(&self) -> Range<usize> {
-        self.0.workers()
+        self.0.input_handle.workers()
     }
 
     fn mailbox(&self, worker: usize) -> &Mailbox<T> {
-        self.0.mailbox(worker)
+        self.0.input_handle.mailbox(worker)
     }
 
     /// Write value `v` to the specified worker's mailbox,
     /// overwriting any previous value in the mailbox.
     pub fn set_for_worker(&self, worker: usize, v: T) {
-        self.0.set_for_worker(worker, v);
+        self.0.input_handle.set_for_worker(worker, v);
     }
 
     /// Mutate the contents of the specified worker's mailbox
@@ -861,16 +927,63 @@ where
     where
         F: FnOnce(&mut T),
     {
-        self.0.update_for_worker(worker, f);
+        self.0.input_handle.update_for_worker(worker, f);
     }
 
     /// Write value `v` to all worker mailboxes.
     pub fn set_for_all(&self, v: T) {
-        self.0.set_for_all(v);
+        self.0.input_handle.set_for_all(v);
     }
 
     pub fn clear_for_all(&self) {
-        self.0.clear_for_all();
+        self.0.input_handle.clear_for_all();
+    }
+
+    pub fn stage<F>(&mut self, id: u64, value: T, amount: StagedAmount, digest: F)
+    where
+        F: FnOnce(Vec<T>, usize) -> Vec<T>,
+    {
+        let mut stage = self.0.stage.lock().unwrap();
+
+        let contents = stage.contents.entry(id).or_default();
+        let index = contents.len();
+        contents.push_back((value, amount));
+
+        if index >= stage.counts.len() {
+            stage.counts.push_back(0);
+        }
+        let n_ids = &mut stage.counts[index];
+        *n_ids += 1;
+        let n = Arc::strong_count(&self.0) - Runtime::runtime().is_some() as usize;
+        if *n_ids >= n {
+            let mut contents = Vec::with_capacity(n);
+            let mut amount = StagedAmount::default();
+            for (c, a) in stage
+                .contents
+                .values_mut()
+                .filter_map(|values| values.pop_front())
+            {
+                contents.push(c);
+                amount.n_bytes += a.n_bytes;
+                amount.n_records += a.n_records;
+            }
+
+            stage.counts.pop_front();
+            let mut data = self.0.data.lock().unwrap();
+            drop(stage);
+            data.push_back((
+                digest(contents, self.0.input_handle.workers().len()),
+                amount,
+            ));
+        }
+    }
+
+    fn flush(&mut self) -> StagedAmount {
+        let (values, amount) = self.0.data.lock().unwrap().pop_front().unwrap();
+        for (worker, value) in values.into_iter().enumerate() {
+            self.0.input_handle.set_for_worker(worker, value);
+        }
+        amount
     }
 }
 

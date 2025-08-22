@@ -76,6 +76,8 @@ pub struct EmptyInputBuffer;
 impl InputBuffer for EmptyInputBuffer {
     fn flush(&mut self) {}
 
+    fn stage(&mut self) {}
+
     fn hash(&self, _hasher: &mut dyn Hasher) {}
 
     fn len(&self) -> BufferSize {
