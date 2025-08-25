@@ -167,7 +167,7 @@ where
     V: DBData,
     U: DBData,
 {
-    handle: UpsertHandle<DynData, DynUpdate<DynData, DynData>>,
+    pub handle: UpsertHandle<DynData, DynUpdate<DynData, DynData>>,
     staged: Vec<VecDeque<Tup2<K, Update<V, U>>>>,
     staged_bytes: usize,
 }

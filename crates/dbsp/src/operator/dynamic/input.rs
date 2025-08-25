@@ -1,3 +1,5 @@
+use itertools::Itertools;
+
 use crate::{
     algebra::{
         IndexedZSet, OrdIndexedZSet, OrdIndexedZSetFactories, OrdZSet, OrdZSetFactories, ZSet,
@@ -15,10 +17,9 @@ use crate::{
             time_series::LeastUpperBoundFunc,
             upsert::UpdateSetFactories,
         },
-        input::StagedAmount,
         Input, InputHandle, Update,
     },
-    trace::{Batch, BatchFactories, BatchReaderFactories, Rkyv},
+    trace::{Batch, BatchFactories, BatchReaderFactories, Batcher, FallbackWSet, Rkyv},
     utils::Tup2,
     Circuit, DBData, DynZWeight, NumEntries, Stream, ZWeight,
 };
@@ -365,12 +366,17 @@ impl RootCircuit {
 
         let (input, input_handle) = Input::new(
             Location::caller(),
-            move |mut tuples: Box<DynPairs<_, _>>| {
+            move |tuples: Vec<Box<DynPairs<_, _>>>| {
                 let mut pairs = weighted_pairs_factory.default_box();
-                pairs.from_pairs(tuples.as_mut());
-                OrdZSet::dyn_from_tuples(&zset_factories, (), &mut pairs)
+                let mut batcher =
+                    <FallbackWSet<_, _> as Batch>::Batcher::new_batcher(&zset_factories, ());
+                for mut tuples in tuples {
+                    pairs.from_pairs(tuples.as_mut());
+                    batcher.push_batch(&mut pairs);
+                }
+                batcher.seal()
             },
-            Arc::new(|| pairs_factory.default_box()),
+            Arc::new(|| vec![pairs_factory.default_box()]),
         );
 
         // This stream doesn't strictly need to be sharded. We shard it to make sure that when it is materialized,
@@ -426,7 +432,7 @@ impl RootCircuit {
 
         let (input, input_handle) = Input::new(
             Location::caller(),
-            move |mut tuples: Box<DynPairs<K, DynPair<V, DynZWeight>>>| {
+            move |tuples: Vec<Box<DynPairs<K, DynPair<V, DynZWeight>>>>| {
                 let mut indexed_tuples = factories_clone
                     .indexed_zset_factories
                     .weighted_items_factory()
@@ -436,15 +442,17 @@ impl RootCircuit {
                     .weighted_item_factory()
                     .default_box();
 
-                for kvw in tuples.dyn_iter_mut() {
-                    let (k, vw) = kvw.split_mut();
-                    let (v, w) = vw.split_mut();
-                    let (kv, item_w) = item.split_mut();
-                    let (item_k, item_v) = kv.split_mut();
-                    k.clone_to(item_k);
-                    v.clone_to(item_v);
-                    w.clone_to(item_w);
-                    indexed_tuples.push_val(&mut *item);
+                for mut tuples in tuples {
+                    for kvw in tuples.dyn_iter_mut() {
+                        let (k, vw) = kvw.split_mut();
+                        let (v, w) = vw.split_mut();
+                        let (kv, item_w) = item.split_mut();
+                        let (item_k, item_v) = kv.split_mut();
+                        k.clone_to(item_k);
+                        v.clone_to(item_v);
+                        w.clone_to(item_w);
+                        indexed_tuples.push_val(&mut *item);
+                    }
                 }
                 OrdIndexedZSet::dyn_from_tuples(
                     &factories_clone.indexed_zset_factories,
@@ -452,7 +460,7 @@ impl RootCircuit {
                     &mut indexed_tuples,
                 )
             },
-            Arc::new(|| factories.pairs_factory.default_box()),
+            Arc::new(|| vec![factories.pairs_factory.default_box()]),
         );
 
         // This stream doesn't strictly need to be sharded. We shard it to make sure that when it is materialized,
@@ -478,7 +486,7 @@ impl RootCircuit {
         &self,
         persistent_id: Option<&str>,
         factories: &AddInputSetFactories<B>,
-        input_stream: Stream<Self, Box<DynPairs<K, DynBool>>>,
+        input_stream: Stream<Self, Vec<Box<DynPairs<K, DynBool>>>>,
     ) -> Stream<Self, B>
     where
         K: DataTrait + ?Sized,
@@ -487,22 +495,58 @@ impl RootCircuit {
         let factories_clone = factories.clone();
 
         let sorted = input_stream
-            .apply_owned(move |mut upserts| {
-                // Sort the vector by key, preserving the history of updates for each key.
+            .apply_owned(move |upserts| {
+                // Sort the vectors by key, preserving the history of updates for each key.
                 // Upserts cannot be merged or reordered, therefore we cannot use unstable sort.
-                upserts.sort_by_key();
+                let mut upserts = upserts
+                    .into_iter()
+                    .filter_map(|mut upserts| {
+                        upserts.sort_by_key();
 
-                // Find the last upsert for each key, that's the only one that matters.
-                upserts.dedup_by_key_keep_last();
+                        // Find the last upsert for each key, that's the only one that matters.
+                        upserts.dedup_by_key_keep_last();
+
+                        if upserts.is_empty() {
+                            Some((upserts, 0))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
 
                 let mut result = factories_clone.upsert_pairs_factory.default_box();
                 let mut tuple = factories_clone.upsert_pair_factory.default_box();
 
-                for upsert in upserts.dyn_iter_mut() {
+                let mut mins = Vec::new();
+                while !upserts.is_empty() {
+                    mins.clear();
+                    mins.push(0);
+                    for (index, (upsert, next)) in upserts.iter().enumerate().skip(1) {
+                        let a = upserts[mins[0]].0.index(upserts[mins[0]].1);
+                        let b = upsert.index(*next);
+                        match a.cmp(b) {
+                            std::cmp::Ordering::Less => (),
+                            std::cmp::Ordering::Equal => mins.push(index),
+                            std::cmp::Ordering::Greater => {
+                                mins.clear();
+                                mins.push(index);
+                            }
+                        }
+                    }
+                    let index = upserts[mins[0]].1;
+                    let upsert = upserts[mins[0]].0.index_mut(index);
+
                     let (k, v) = upsert.split_mut();
                     let mut v = if **v { Some(()) } else { None };
                     tuple.from_vals(k, v.erase_mut());
                     result.push_val(&mut *tuple);
+
+                    for index in mins.drain(..).rev() {
+                        upserts[index].1 += 1;
+                        if upserts[index].1 >= upserts[index].0.len() {
+                            upserts.remove(index);
+                        }
+                    }
                 }
 
                 result
@@ -518,7 +562,7 @@ impl RootCircuit {
         &self,
         persistent_id: Option<&str>,
         factories: &AddInputMapFactories<B, U>,
-        input_stream: Stream<Self, Box<DynPairs<K, DynUpdate<V, U>>>>,
+        input_stream: Stream<Self, Vec<Box<DynPairs<K, DynUpdate<V, U>>>>>,
         patch_func: PatchFunc<V, U>,
     ) -> Stream<Self, B>
     where
@@ -529,9 +573,12 @@ impl RootCircuit {
     {
         let sorted = input_stream
             .apply_owned(move |mut upserts| {
-                // Sort the vector by key, preserving the history of updates for each key.
+                // Sort the vectors by key, preserving the history of updates for each key.
                 // Upserts cannot be merged or reordered, therefore we cannot use unstable sort.
-                upserts.sort_by_key();
+                upserts.retain_mut(|pairs| {
+                    pairs.sort_by_key();
+                    !pairs.is_empty()
+                });
 
                 upserts
             })
@@ -547,7 +594,7 @@ impl RootCircuit {
         &self,
         persistent_id: Option<&str>,
         factories: &AddInputMapWithWaterlineFactories<B, U, E>,
-        input_stream: Stream<Self, Box<DynPairs<K, DynUpdate<V, U>>>>,
+        input_stream: Stream<Self, Vec<Box<DynPairs<K, DynUpdate<V, U>>>>>,
         patch_func: PatchFunc<V, U>,
         init_waterline: Box<dyn Fn() -> Box<W>>,
         extract_ts: Box<dyn Fn(&B::Key, &B::Val, &mut W)>,
@@ -570,9 +617,12 @@ impl RootCircuit {
     {
         let sorted = input_stream
             .apply_owned(move |mut upserts| {
-                // Sort the vector by key, preserving the history of updates for each key.
+                // Sort the vectors by key, preserving the history of updates for each key.
                 // Upserts cannot be merged or reordered, therefore we cannot use unstable sort.
-                upserts.sort_by_key();
+                upserts.retain_mut(|pairs| {
+                    pairs.sort_by_key();
+                    !pairs.is_empty()
+                });
 
                 upserts
             })
@@ -649,14 +699,14 @@ impl RootCircuit {
         self.region("input_set", || {
             let (input, input_handle) = Input::new(
                 Location::caller(),
-                |tuples: Box<DynPairs<K, DynBool>>| tuples,
-                Arc::new(|| factories.input_pairs_factory.default_box()),
+                |tuples: Vec<Box<DynPairs<K, DynBool>>>| tuples,
+                Arc::new(|| vec![factories.input_pairs_factory.default_box()]),
             );
             let input_stream = self.add_source(input);
             let upsert_handle = <UpsertHandle<K, DynBool>>::new(
                 factories.input_pair_factory,
                 factories.input_pairs_factory,
-                todo!(),
+                input_handle,
             );
 
             let upsert: Stream<RootCircuit, OrdZSet<K>> =
@@ -742,14 +792,14 @@ impl RootCircuit {
         self.region("input_map", || {
             let (input, input_handle) = Input::new(
                 Location::caller(),
-                |tuples: Box<DynPairs<K, DynUpdate<V, U>>>| tuples,
-                Arc::new(|| factories.input_pairs_factory.default_box()),
+                |tuples: Vec<Box<DynPairs<K, DynUpdate<V, U>>>>| tuples,
+                Arc::new(|| vec![factories.input_pairs_factory.default_box()]),
             );
             let input_stream = self.add_source(input);
             let zset_handle = <UpsertHandle<K, DynUpdate<V, U>>>::new(
                 factories.input_pair_factory,
                 factories.input_pairs_factory,
-                todo!(),
+                input_handle,
             );
 
             let upsert =
@@ -788,8 +838,8 @@ impl RootCircuit {
         self.region("input_map_with_waterline", || {
             let (input, input_handle) = Input::new(
                 Location::caller(),
-                |tuples: Box<DynPairs<K, DynUpdate<V, U>>>| tuples,
-                Arc::new(|| factories.input_pairs_factory.default_box()),
+                |tuples: Vec<Box<DynPairs<K, DynUpdate<V, U>>>>| tuples,
+                Arc::new(|| vec![factories.input_pairs_factory.default_box()]),
             );
             let input_stream = self.add_source(input);
             let zset_handle = <UpsertHandle<K, DynUpdate<V, U>>>::new(
@@ -889,7 +939,7 @@ where
 /// consumes updates buffered in each mailbox, leaving the mailbox empty.
 pub struct CollectionHandle<K: DataTrait + ?Sized, V: DataTrait + ?Sized> {
     pair_factory: &'static dyn Factory<DynPair<K, V>>,
-    input_handle: InputHandle<Box<DynPairs<K, V>>>,
+    input_handle: InputHandle<Vec<Box<DynPairs<K, V>>>>,
     // Used to send tuples to workers in round robin.  Oftentimes the
     // workers will immediately repartition the inputs based on the hash
     // of the key; however this is more efficient than doing it here, as
@@ -910,7 +960,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> Clone for CollectionHandle<K,
 impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> CollectionHandle<K, V> {
     fn new(
         pair_factory: &'static dyn Factory<DynPair<K, V>>,
-        input_handle: InputHandle<Box<DynPairs<K, V>>>,
+        input_handle: InputHandle<Vec<Box<DynPairs<K, V>>>>,
     ) -> Self {
         Self {
             pair_factory,
@@ -935,7 +985,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> CollectionHandle<K, V> {
             next_worker + self.input_handle.workers().start,
             |tuples| {
                 tuple.from_vals(k, v);
-                tuples.push_val(&mut *tuple);
+                tuples.first_mut().unwrap().push_val(&mut *tuple);
             },
         );
     }
@@ -983,6 +1033,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> CollectionHandle<K, V> {
             let worker = (next_worker + i) % num_partitions + worker_ofs;
             if partition_size == vals.len() {
                 self.input_handle.update_for_worker(worker, |tuples| {
+                    let tuples = tuples.first_mut().unwrap();
                     if tuples.is_empty() {
                         swap(tuples, vals);
                     } else {
@@ -995,6 +1046,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> CollectionHandle<K, V> {
             // Draining from the end should be more efficient as it doesn't
             // require memcpy'ing the tail of the vector to the front.
             self.input_handle.update_for_worker(worker, |tuples| {
+                let tuples = tuples.first_mut().unwrap();
                 let len = vals.len();
                 tuples.append_range(vals.as_vec_mut(), len - partition_size, len);
             });
@@ -1009,6 +1061,14 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> CollectionHandle<K, V> {
         if remainder > 0 {
             self.next_worker
                 .store(next_worker + remainder, Ordering::Release);
+        }
+    }
+
+    pub fn dyn_push_partitioned(&self, vals: Vec<Box<DynPairs<K, V>>>) {
+        for (vals, worker) in vals.into_iter().zip_eq(0..self.num_partitions()) {
+            self.input_handle.update_for_worker(worker, |tuples| {
+                tuples.push(vals);
+            });
         }
     }
 
@@ -1063,7 +1123,7 @@ pub struct UpsertHandle<K: DataTrait + ?Sized, V: DataTrait + ?Sized> {
     pair_factory: &'static dyn Factory<DynPair<K, V>>,
     pairs_factory: &'static dyn Factory<DynPairs<K, V>>,
     buffers: Vec<Box<DynPairs<K, V>>>,
-    input_handle: InputHandle<Box<DynPairs<K, V>>>,
+    pub input_handle: InputHandle<Vec<Box<DynPairs<K, V>>>>,
     // Sharding the input collection based on the hash of the key is more
     // expensive than simple round robin partitioning used by
     // `CollectionHandle`; however it is necessary here, since the `Upsert`
@@ -1089,7 +1149,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> UpsertHandle<K, V> {
     fn new(
         pair_factory: &'static dyn Factory<DynPair<K, V>>,
         pairs_factory: &'static dyn Factory<DynPairs<K, V>>,
-        input_handle: InputHandle<Box<DynPairs<K, V>>>,
+        input_handle: InputHandle<Vec<Box<DynPairs<K, V>>>>,
     ) -> Self {
         Self::with_hasher(
             pair_factory,
@@ -1102,7 +1162,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> UpsertHandle<K, V> {
     fn with_hasher(
         pair_factory: &'static dyn Factory<DynPair<K, V>>,
         pairs_factory: &'static dyn Factory<DynPairs<K, V>>,
-        input_handle: InputHandle<Box<DynPairs<K, V>>>,
+        input_handle: InputHandle<Vec<Box<DynPairs<K, V>>>>,
         hash_func: Arc<dyn HashFunc<K>>,
     ) -> Self {
         Self {
@@ -1129,14 +1189,14 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> UpsertHandle<K, V> {
                 |tuples| {
                     let mut tuple = self.pair_factory.default_box();
                     tuple.from_vals(k, v);
-                    tuples.push_val(&mut *tuple);
+                    tuples.first_mut().unwrap().push_val(&mut *tuple);
                 },
             );
         } else {
             self.input_handle.update_for_worker(0, |tuples| {
                 let mut tuple = self.pair_factory.default_box();
                 tuple.from_vals(k, v);
-                tuples.push_val(&mut *tuple);
+                tuples.first_mut().unwrap().push_val(&mut *tuple);
             });
         }
     }
@@ -1172,6 +1232,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> UpsertHandle<K, V> {
             vals.clear();
             for worker in 0..num_partitions {
                 self.input_handle.update_for_worker(worker, |tuples| {
+                    let tuples = tuples.first_mut().unwrap();
                     if tuples.is_empty() {
                         *tuples =
                             replace(&mut self.buffers[worker], self.pairs_factory.default_box());
@@ -1182,11 +1243,20 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> UpsertHandle<K, V> {
             }
         } else {
             self.input_handle.update_for_worker(0, |tuples| {
+                let tuples = tuples.first_mut().unwrap();
                 if tuples.is_empty() {
                     *tuples = replace(vals, self.pairs_factory.default_box());
                 } else {
                     tuples.append(vals.as_vec_mut());
                 }
+            });
+        }
+    }
+
+    pub fn dyn_push_partitioned(&self, vals: Vec<Box<DynPairs<K, V>>>) {
+        for (vals, worker) in vals.into_iter().zip_eq(0..self.num_partitions()) {
+            self.input_handle.update_for_worker(worker, |tuples| {
+                tuples.push(vals);
             });
         }
     }
