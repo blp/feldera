@@ -323,6 +323,7 @@ impl Parser for DummyParser {
     fn fork(&self) -> Box<dyn Parser> {
         Box::new(Self(self.0.clone()))
     }
+
 }
 
 struct DummyInputBuffer {

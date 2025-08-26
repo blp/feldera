@@ -1121,7 +1121,7 @@ impl<K: ?Sized, F> HashFunc<K> for F where F: Fn(&K) -> u32 + Send + Sync {}
 /// the mailbox empty.
 pub struct UpsertHandle<K: DataTrait + ?Sized, V: DataTrait + ?Sized> {
     pair_factory: &'static dyn Factory<DynPair<K, V>>,
-    pairs_factory: &'static dyn Factory<DynPairs<K, V>>,
+    pub pairs_factory: &'static dyn Factory<DynPairs<K, V>>,
     buffers: Vec<Box<DynPairs<K, V>>>,
     pub input_handle: InputHandle<Vec<Box<DynPairs<K, V>>>>,
     // Sharding the input collection based on the hash of the key is more
@@ -1130,7 +1130,7 @@ pub struct UpsertHandle<K: DataTrait + ?Sized, V: DataTrait + ?Sized> {
     // operator requires that all updates to the same key are processed
     // by the same worker thread and in the same order they were pushed
     // by the client.
-    hash_func: Arc<dyn HashFunc<K>>,
+    pub hash_func: Arc<dyn HashFunc<K>>,
 }
 
 impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> Clone for UpsertHandle<K, V> {
@@ -1175,7 +1175,7 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> UpsertHandle<K, V> {
     }
 
     #[inline]
-    fn num_partitions(&self) -> usize {
+    pub fn num_partitions(&self) -> usize {
         self.input_handle.0.input_handle.mailbox.len()
     }
 
@@ -1253,6 +1253,19 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> UpsertHandle<K, V> {
         }
     }
 
+    pub fn dyn_stage(
+        &mut self,
+        vals: &mut Box<DynPairs<K, V>>,
+        partitions: &mut Vec<Box<DynPairs<K, V>>>,
+    ) {
+        let num_partitions = self.num_partitions();
+
+        for kv in vals.dyn_iter_mut() {
+            let k = kv.fst();
+            partitions[((self.hash_func)(k) as usize) % num_partitions].push_val(kv)
+        }
+    }
+
     pub fn dyn_push_partitioned(&self, vals: Vec<Box<DynPairs<K, V>>>) {
         for (vals, worker) in vals.into_iter().zip_eq(0..self.num_partitions()) {
             self.input_handle.update_for_worker(worker, |tuples| {
@@ -1260,6 +1273,8 @@ impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> UpsertHandle<K, V> {
             });
         }
     }
+
+    //pub fn stage(&self, source: impl Iterator<
 
     /// Clear all inputs buffered since the start of the last clock cycle.
     ///

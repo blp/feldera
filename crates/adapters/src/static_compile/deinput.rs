@@ -15,6 +15,8 @@ use anyhow::{anyhow, bail, Result as AnyResult};
 use apache_avro::{types::Value as AvroValue, Schema as AvroSchema};
 use arrow::array::RecordBatch;
 use dbsp::dynamic::Data;
+use dbsp::operator::input::StagedAmount;
+use dbsp::operator::StagedBuffers;
 use dbsp::{
     algebra::HasOne, operator::Update, utils::Tup2, DBData, InputHandle, MapHandle, SetHandle,
     ZSetHandle, ZWeight,
@@ -25,6 +27,7 @@ use feldera_types::format::csv::CsvParserConfig;
 use feldera_types::serde_with_context::{DeserializeWithContext, SqlSerdeConfig};
 use serde_arrow::Deserializer as ArrowDeserializer;
 use serde_json::de::SliceRead;
+use std::any::Any;
 use std::hash::Hasher;
 use std::iter::zip;
 use std::{collections::VecDeque, marker::PhantomData, ops::Neg};
@@ -560,6 +563,10 @@ where
             self.buffer.n_bytes = fraction(len, self.buffer.updates.len(), self.buffer.n_bytes);
             self.buffer.updates.truncate(len);
         }
+    }
+
+    fn flush_staged(&mut self) -> StagedAmount {
+        todo!()
     }
 }
 
@@ -1385,6 +1392,19 @@ where
             handle,
         }
     }
+
+    fn new_stage(&self, data: Vec<Box<dyn InputBuffer>>) -> Box<dyn StagedBuffers> {
+        // Oops this can't work.
+        /*
+        data.into_iter().map(|buffer| {
+            let buffer = buffer.downcast::<Self>();
+        });*/
+        /*)
+        let stage: Vec<Box<DynPairs<K, V>>> =
+            Vec::with_capacity(self.handle.handle.num_partitions());*/
+
+        todo!()
+    }
 }
 
 impl<K, V, U> InputBuffer for DeMapStreamBuffer<K, V, U>
@@ -1543,6 +1563,14 @@ where
             self.buffer.n_bytes = fraction(len, self.buffer.updates.len(), self.buffer.n_bytes);
             self.buffer.updates.truncate(len);
         }
+    }
+
+    fn gather_staged(&mut self) -> Box<dyn StagedBuffers> {
+        self.buffer.handle.gather_staged()
+    }
+
+    fn flush_staged(&mut self) -> StagedAmount {
+        self.buffer.handle.handle.input_handle.flush_staged()
     }
 }
 

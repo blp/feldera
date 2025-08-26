@@ -205,4 +205,5 @@ impl Parser for MockInputParser {
         let state = self.0.lock().unwrap();
         state.parser.splitter()
     }
+
 }

@@ -172,7 +172,10 @@ impl FileInputReader {
             splitter.seek(offset);
         }
 
-        let mut queue = VecDeque::<(Range<u64>, Box<dyn InputBuffer>)>::new();
+        let mut queue = VecDeque::new();
+        let mut staged_range = None;
+        let mut staged_buffers = Vec::new();
+        let mut staged_amt = BufferSize::default();
         let mut extending = false;
         let mut eof = false;
         let mut num_records = 0;
@@ -187,38 +190,27 @@ impl FileInputReader {
                         extending = false;
                     }
                     Ok(InputReaderCommand::Queue { .. }) => {
-                        let mut total = BufferSize::empty();
-                        let mut hasher = consumer.hasher();
-                        let limit = consumer.max_batch_size();
-                        let mut range: Option<Range<u64>> = None;
-                        while let Some((offsets, mut buffer)) = queue.pop_front() {
-                            range = match range {
-                                Some(range) => Some(range.start..offsets.end),
-                                None => Some(offsets),
-                            };
-                            total += buffer.len();
-                            if let Some(hasher) = hasher.as_mut() {
-                                buffer.hash(hasher);
-                            }
-                            buffer.flush();
-                            if total.records >= limit {
-                                break;
-                            }
+                        if queue.is_empty() {
+                            queue.push_back((
+                                parser.gather_staged(),
+                                staged_range.take().unwrap_or({
+                                    let ofs = splitter.position();
+                                    ofs..ofs
+                                }),
+                            ));
+                            staged_amt = BufferSize::default();
                         }
-
-                        let offsets = range.unwrap_or_else(|| {
-                            let ofs = splitter.position();
-                            ofs..ofs
-                        });
+                        let (mut staged_buffers, offsets) = queue.pop_front().unwrap();
                         let seek = serde_json::to_value(Metadata {
                             offsets: offsets.clone(),
                         })
                         .unwrap();
 
+                        let amt = staged_buffers.flush();
                         let resume = match get_barrier(&path) {
-                            None => Resume::new_metadata_only(seek, hasher),
+                            None => Resume::new_metadata_only(seek, None),
                             Some(barrier) => {
-                                num_records += total.records;
+                                num_records += amt.n_records;
                                 if num_records < barrier {
                                     Resume::Barrier
                                 } else {
@@ -226,8 +218,13 @@ impl FileInputReader {
                                 }
                             }
                         };
-
-                        consumer.extended(total, Some(resume));
+                        consumer.extended(
+                            BufferSize {
+                                records: amt.n_records,
+                                bytes: amt.n_bytes,
+                            },
+                            Some(resume),
+                        );
                     }
                     Ok(InputReaderCommand::Replay { metadata, .. }) => {
                         let Metadata { offsets } = serde_json_path_to_error::from_value(metadata)?;
@@ -279,13 +276,23 @@ impl FileInputReader {
                     break;
                 };
                 let (buffer, errors) = parser.parse(chunk);
-                let amt = buffer.len();
                 consumer.parse_errors(errors);
 
                 if let Some(buffer) = buffer {
                     let end = splitter.position();
-                    queue.push_back((start..end, buffer));
+                    let amt = buffer.len();
+                    staged_amt += amt;
+                    staged_range = match staged_range {
+                        Some(range) => Some(range.start..end),
+                        None => Some(start..end),
+                    };
+                    staged_buffers.push(buffer);
                     consumer.buffered(amt);
+
+                    if staged_amt.records >= consumer.max_batch_size() {
+                        queue.push_back((parser.gather_staged(), staged_range.take().unwrap()));
+                        staged_amt = BufferSize::default();
+                    }
                 }
             }
             if n == 0 && !follow {

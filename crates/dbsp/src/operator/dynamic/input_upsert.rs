@@ -7,9 +7,7 @@ use crate::{
         OwnershipPreference, Scope,
     },
     declare_trait_object,
-    dynamic::{
-        ClonableTrait, Data, DataTrait, DynOpt, DynPairs, Erase, Factory, WithFactory,
-    },
+    dynamic::{ClonableTrait, Data, DataTrait, DynOpt, DynPairs, Erase, Factory, WithFactory},
     operator::{
         dynamic::{
             time_series::LeastUpperBoundFunc,

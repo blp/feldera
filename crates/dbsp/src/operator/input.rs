@@ -4,7 +4,10 @@ use crate::{
         operator_traits::{Operator, SourceOperator},
         LocalStoreMarker, Scope,
     },
-    dynamic::{DowncastTrait, DynBool, DynData, DynPair, DynUnit, Erase, LeanVec},
+    dynamic::{
+        DataTrait, DowncastTrait, DynBool, DynData, DynPair, DynPairs, DynUnit, Erase, LeanVec,
+        Pair, Vector,
+    },
     operator::dynamic::{
         input::{
             AddInputIndexedZSetFactories, AddInputMapFactories, AddInputMapWithWaterlineFactories,
@@ -17,6 +20,7 @@ use crate::{
     Circuit, DBData, DynZWeight, RootCircuit, Runtime, Stream, TypedBox, ZWeight,
 };
 use hashbrown::HashMap;
+use itertools::Itertools;
 use std::{
     borrow::{Borrow, Cow},
     collections::VecDeque,
@@ -186,6 +190,30 @@ where
     }
 }
 
+pub trait StagedBuffers {
+    fn flush(&mut self) -> StagedAmount;
+}
+
+struct MapBuffers<K: DataTrait + ?Sized, V: DataTrait + ?Sized> {
+    input_handle: InputHandle<Vec<Box<DynPairs<K, V>>>>,
+    vals: Vec<Box<DynPairs<K, V>>>,
+}
+
+impl<K: DataTrait + ?Sized, V: DataTrait + ?Sized> StagedBuffers for MapBuffers<K, V> {
+    fn flush(&mut self) -> StagedAmount {
+        for (vals, worker) in self
+            .vals
+            .drain(..)
+            .zip_eq(0..self.input_handle.0.input_handle.mailbox.len())
+        {
+            self.input_handle.update_for_worker(worker, |tuples| {
+                tuples.push(vals);
+            });
+        }
+        StagedAmount::default()
+    }
+}
+
 impl<K, V, U> MapHandle<K, V, U>
 where
     K: DBData,
@@ -210,8 +238,21 @@ where
     }
 
     pub fn append(&mut self, vals: &mut Vec<Tup2<K, Update<V, U>>>) {
-        let vals = Box::new(LeanVec::from(take(vals)));
+        let vals = take(vals);
+        let vals = Box::new(LeanVec::from(vals));
         self.handle.dyn_append(&mut vals.erase_box())
+    }
+
+    pub fn gather_staged(&mut self) -> Box<dyn StagedBuffers> {
+        let num_partitions = self.handle.num_partitions();
+        let mut partitions = vec![self.handle.pairs_factory.default_box(); num_partitions];
+        for vals in self.staged.drain(..) {
+            let vec = Vec::from(vals);
+            let vals = Box::new(LeanVec::from(vec));
+            self.handle
+                .dyn_stage(&mut vals.erase_box(), &mut partitions);
+        }
+        todo!()
     }
 }
 
@@ -978,7 +1019,7 @@ where
         }
     }
 
-    fn flush(&mut self) -> StagedAmount {
+    pub fn flush_staged(&mut self) -> StagedAmount {
         let (values, amount) = self.0.data.lock().unwrap().pop_front().unwrap();
         for (worker, value) in values.into_iter().enumerate() {
             self.0.input_handle.set_for_worker(worker, value);

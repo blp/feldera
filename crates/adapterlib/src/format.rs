@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::borrow::Cow;
 use std::fmt::{Display, Error as FmtError, Formatter};
 use std::hash::Hasher;
@@ -5,6 +6,7 @@ use std::ops::{Add, AddAssign};
 
 use actix_web::HttpRequest;
 use anyhow::Result as AnyResult;
+use dbsp::operator::input::StagedBuffers;
 use erased_serde::Serialize as ErasedSerialize;
 use feldera_types::config::ConnectorConfig;
 use feldera_types::program_schema::Relation;
@@ -64,7 +66,7 @@ pub trait InputFormat: Send + Sync {
 /// typically an [InputReader](crate::transport::InputReader), gathers one or
 /// more [InputBuffer]s and pushes them to the circuit when the controller
 /// requests it.
-pub trait InputBuffer: Send {
+pub trait InputBuffer: Any + Send {
     /// Pushes all of the records into the circuit input handle, and discards
     /// those records.
     fn flush(&mut self);
@@ -193,6 +195,10 @@ pub trait Parser: Send + Sync {
     /// XXX it would be even better if this were `&self` and avoided keeping
     /// state entirely.
     fn parse(&mut self, data: &[u8]) -> (Option<Box<dyn InputBuffer>>, Vec<ParseError>);
+
+    fn gather_staged(&mut self) -> Box<dyn StagedBuffers> {
+        todo!()
+    }
 
     /// Returns an object that can be used to break a stream of incoming data
     /// into complete records to pass to [Parser::parse].
