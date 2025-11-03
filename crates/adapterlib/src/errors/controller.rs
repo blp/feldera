@@ -559,6 +559,7 @@ impl ConfigError {
 /// API.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
+
 pub enum ControllerError {
     /// I/O error.
     #[serde(serialize_with = "serialize_io_error")]
@@ -1122,9 +1123,9 @@ impl Display for ControllerError {
 }
 
 impl ControllerError {
-    pub fn io_error(context: String, io_error: IoError) -> Self {
+    pub fn io_error(context: impl Display, io_error: IoError) -> Self {
         Self::IoError {
-            context,
+            context: context.to_string(),
             io_error,
             backtrace: Backtrace::capture(),
         }
