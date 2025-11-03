@@ -1430,9 +1430,9 @@ impl ControllerError {
         Self::ControllerPanic
     }
 
-    pub fn storage_error(context: impl Into<String>, error: StorageError) -> Self {
+    pub fn storage_error(context: impl Display, error: StorageError) -> Self {
         Self::StorageError {
-            context: context.into(),
+            context: context.to_string(),
             error,
             backtrace: Box::new(Backtrace::capture()),
         }
