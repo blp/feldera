@@ -270,8 +270,11 @@ impl ControllerBuilder {
         Err(ControllerError::EnterpriseFeature("standby"))
     }
 
-    pub(crate) fn open_checkpoint(&self) -> Result<ControllerInit, ControllerError> {
-        ControllerInit::new(self.config.clone(), self.storage.clone())
+    pub(crate) fn open_checkpoint(
+        &self,
+        layout: Option<Layout>,
+    ) -> Result<ControllerInit, ControllerError> {
+        ControllerInit::new(layout, self.config.clone(), self.storage.clone())
     }
 
     pub(crate) fn storage(&self) -> Option<Arc<dyn StorageBackend>> {
@@ -434,7 +437,7 @@ impl Controller {
             + 'static,
     {
         let builder = ControllerBuilder::new(config)?;
-        let mut init = builder.open_checkpoint()?;
+        let mut init = builder.open_checkpoint(None)?;
         if let Some(diff) = init.pipeline_diff.as_mut() {
             diff.clear_program_diff()
         }
@@ -453,7 +456,7 @@ impl Controller {
             + 'static,
     {
         let builder = ControllerBuilder::new(config)?;
-        let init = builder.open_checkpoint()?;
+        let init = builder.open_checkpoint(None)?;
         init.init(None, circuit_factory, error_cb)
     }
 
@@ -1444,6 +1447,12 @@ impl Controller {
     pub fn completion_status(&self, token: &CompletionToken) -> Result<bool, ControllerError> {
         self.status().completion_status(token)
     }
+
+    /// Returns an object for monitoring the step that the controller has
+    /// completed.
+    pub fn step_watcher(&self) -> tokio::sync::watch::Receiver<Step> {
+        self.inner.step_receiver.clone()
+    }
 }
 
 struct SyncCheckpointRequest {
@@ -1479,6 +1488,11 @@ struct CircuitThread {
 
     /// The step currently running or replaying.
     step: Step,
+
+    /// Used to notify watchers when a step has been completed.
+    ///
+    /// This is updated to match `step` whenever it changes.
+    step_sender: tokio::sync::watch::Sender<Step>,
 
     /// Metadata for `step - 1`; that is, the metadata that would be part of a
     /// [Checkpoint] for `step`, to allow the input endpoints to seek to the
@@ -1688,6 +1702,7 @@ impl CircuitThread {
             HashMap::new()
         };
 
+        let (step_sender, step_receiver) = tokio::sync::watch::channel(step);
         let (parker, backpressure_thread, command_receiver, controller) = ControllerInner::new(
             pipeline_config,
             circuit.runtime(),
@@ -1698,6 +1713,7 @@ impl CircuitThread {
             initial_start_time,
             &resume_info,
             &output_statistics,
+            step_receiver,
         )?;
 
         controller
@@ -1764,6 +1780,7 @@ impl CircuitThread {
             running_checkpoint: None,
             sync_checkpoint_request: None,
             step,
+            step_sender,
             input_metadata: input_metadata.unwrap_or_default(),
             last_commit_progress_update: Instant::now(),
         })
@@ -1880,6 +1897,7 @@ impl CircuitThread {
             };
 
         self.step += 1;
+        self.step_sender.send_replace(self.step);
 
         // Wake up the backpressure thread to unpause endpoints blocked due to
         // backpressure.
@@ -2939,7 +2957,6 @@ impl StepTrigger {
     /// - The time of the last checkpoint.
     /// - Whether we're currently `replaying`.
     /// - Whether the pipeline is currently `bootstrapping`.
-    /// - Whether the pipeline is currently `running`.
     /// - Whether a checkpoint has already been requested.
     ///
     /// Returns the action for the controller to take.
@@ -3065,11 +3082,12 @@ pub struct ControllerInit {
 
 impl ControllerInit {
     fn without_resume(
+        layout: Option<Layout>,
         config: PipelineConfig,
         storage: Option<CircuitStorageConfig>,
     ) -> Result<Self, ControllerError> {
         Ok(Self {
-            circuit_config: Self::circuit_config(&config, storage)?,
+            circuit_config: Self::circuit_config(layout, &config, storage)?,
             pipeline_config: config,
             processed_records: 0,
             initial_start_time: None,
@@ -3084,18 +3102,19 @@ impl ControllerInit {
     /// Open the latest checkpoint in `storage`, if any, and compute the final pipeline config to use based
     /// on the new `config` supplied by the user and the checkpotinted config.
     fn new(
+        layout: Option<Layout>,
         mut config: PipelineConfig,
         storage: Option<CircuitStorageConfig>,
     ) -> Result<Self, ControllerError> {
         let Some(storage) = storage else {
-            return Self::without_resume(config, None);
+            return Self::without_resume(layout, config, None);
         };
 
         // Try to read a checkpoint.
         let checkpoint = match Checkpoint::read(&*storage.backend, &StoragePath::from(STATE_FILE)) {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 info!("starting fresh pipeline without resuming from checkpoint");
-                return Self::without_resume(config, Some(storage));
+                return Self::without_resume(layout, config, Some(storage));
             }
             Err(error) => return Err(error),
             Ok(checkpoint) => checkpoint,
@@ -3155,7 +3174,8 @@ impl ControllerInit {
         // without change elsewhere.
         let config = PipelineConfig {
             global: RuntimeConfig {
-                // Can't change number of workers yet.
+                // Can't change number of workers or hosts yet.
+                hosts: checkpoint_config.global.hosts,
                 workers: checkpoint_config.global.workers,
 
                 // The checkpoint determines the fault tolerance model, but the
@@ -3205,6 +3225,7 @@ impl ControllerInit {
             },
 
             // Other settings from the pipeline manager.
+            multihost: config.multihost,
             secrets_dir: config.secrets_dir,
             name: config.name,
             given_name: config.given_name,
@@ -3213,7 +3234,7 @@ impl ControllerInit {
         };
 
         Ok(Self {
-            circuit_config: Self::circuit_config(&config, Some(storage))?,
+            circuit_config: Self::circuit_config(layout, &config, Some(storage))?,
             pipeline_config: config,
             step,
             input_metadata: Some(input_metadata.0),
@@ -3226,11 +3247,13 @@ impl ControllerInit {
     }
 
     fn circuit_config(
+        layout: Option<Layout>,
         pipeline_config: &PipelineConfig,
         storage: Option<CircuitStorageConfig>,
     ) -> Result<CircuitConfig, ControllerError> {
         Ok(CircuitConfig {
-            layout: Layout::new_solo(pipeline_config.global.workers as usize),
+            layout: layout
+                .unwrap_or_else(|| Layout::new_solo(pipeline_config.global.workers as usize)),
             pin_cpus: pipeline_config.global.pin_cpus.clone(),
             storage,
             mode: Mode::Persistent,
@@ -3993,6 +4016,7 @@ pub struct ControllerInner {
     error_cb: Box<dyn Fn(Arc<ControllerError>, Option<String>) + Send + Sync>,
     session_ctxt: SessionContext,
     fault_tolerance: Option<FtModel>,
+    step_receiver: tokio::sync::watch::Receiver<Step>,
     // The mutex is acquired from async context by actix and
     // from the sync context by the circuit thread.
     transaction_info: Mutex<TransactionInfo>,
@@ -4028,6 +4052,7 @@ impl ControllerInner {
         initial_start_time: Option<DateTime<Utc>>,
         resume_info: &HashMap<String, (JsonValue, CheckpointInputEndpointMetrics)>,
         output_statistics: &HashMap<String, CheckpointOutputEndpointMetrics>,
+        step_receiver: tokio::sync::watch::Receiver<Step>,
     ) -> Result<(Parker, BackpressureThread, Receiver<Command>, Arc<Self>), ControllerError> {
         let status = Arc::new(ControllerStatus::new(
             config.clone(),
@@ -4058,6 +4083,7 @@ impl ControllerInner {
             transaction_info: Mutex::new(TransactionInfo::new()),
             restoring: AtomicBool::new(config.global.fault_tolerance.is_enabled()),
             transaction_number: AtomicU64::new(0),
+            step_receiver,
         });
         controller.initialize_adhoc_queries();
 

@@ -18,6 +18,7 @@ use crate::{dyn_event, Catalog};
 use actix_web::body::MessageBody;
 use actix_web::dev::Service;
 use actix_web::http::KeepAlive;
+use actix_web::HttpResponseBuilder;
 use actix_web::{
     dev::{ServiceFactory, ServiceRequest},
     get,
@@ -32,6 +33,8 @@ use atomic::Atomic;
 use chrono::Utc;
 use clap::Parser;
 use colored::{ColoredString, Colorize};
+use dbsp::circuit::checkpointer::Checkpointer;
+use dbsp::circuit::Layout;
 use dbsp::{circuit::CircuitConfig, DBSPHandle};
 use dbsp::{RootCircuit, Runtime};
 use dyn_clone::DynClone;
@@ -50,6 +53,7 @@ use feldera_types::completion_token::{
     CompletionStatusArgs, CompletionStatusResponse, CompletionTokenResponse,
 };
 use feldera_types::constants::STATUS_FILE;
+use feldera_types::coordination::CoordinationActivate;
 use feldera_types::pipeline_diff::PipelineDiff;
 use feldera_types::query_params::{ActivateParams, MetricsFormat, MetricsParameters};
 use feldera_types::runtime_status::{
@@ -81,7 +85,7 @@ use std::time::Duration;
 use std::{
     borrow::Cow,
     net::TcpListener,
-    sync::{atomic::Ordering, Arc, Mutex, Weak},
+    sync::{Arc, Mutex, Weak},
     thread,
 };
 use tokio::spawn;
@@ -251,10 +255,14 @@ pub(crate) struct ServerState {
 
     metadata: String,
 
+    storage: Option<Arc<dyn StorageBackend>>,
+
     // rate limiter based on tags
     // NOTE: we assume that there are a finite small number
     // of tags, so using String is fine.
     rate_limiter: TokenBucketRateLimiter<String>,
+
+    layout: Mutex<Option<Layout>>,
 }
 
 impl ServerState {
@@ -264,6 +272,7 @@ impl ServerState {
         desired_status: RuntimeDesiredStatus,
         bootstrap_policy: BootstrapPolicy,
         deployment_id: Uuid,
+        storage: Option<Arc<dyn StorageBackend>>,
     ) -> Self {
         // Max 10 errors per minute
         let rate_limiter = TokenBucketRateLimiter::new(10, Duration::from_secs(60));
@@ -277,7 +286,9 @@ impl ServerState {
             desired_status: Mutex::new(desired_status),
             bootstrap_policy: Atomic::new(bootstrap_policy),
             deployment_id,
+            storage,
             rate_limiter,
+            layout: Default::default(),
         }
     }
 
@@ -288,6 +299,7 @@ impl ServerState {
             RuntimeDesiredStatus::Paused,
             BootstrapPolicy::Allow,
             deployment_id,
+            None,
         )
     }
 
@@ -593,6 +605,11 @@ pub fn run_server(
                 );
                 info!("Desired status from storage: {:?}", stored.desired_status);
             }) {
+            _ if args.initial == RuntimeDesiredStatus::Coordination => {
+                // Always defer to the coordinator if there is one.
+                // XXX what about bootstrap_policy?
+                (args.initial, args.bootstrap_policy)
+            }
             Some(stored) if stored.deployment_id == args.deployment_id => {
                 // This is an automatic restart (otherwise the deployment ID would
                 // have changed).  Use the stored desired status.
@@ -641,7 +658,8 @@ pub fn run_server(
 
         if !matches!(
             initial_status,
-            RuntimeDesiredStatus::Running
+            RuntimeDesiredStatus::Coordination
+                | RuntimeDesiredStatus::Running
                 | RuntimeDesiredStatus::Paused
                 | RuntimeDesiredStatus::Standby,
         ) {
@@ -654,6 +672,7 @@ pub fn run_server(
             initial_status,
             bootstrap_policy,
             args.deployment_id,
+            builder.storage().clone(),
         ));
 
         // Initialize the pipeline in a separate thread.  On success, this thread
@@ -1008,43 +1027,56 @@ fn do_bootstrap(
     circuit_factory: CircuitFactoryFunc,
     state: &WebData<ServerState>,
 ) -> Result<(), ControllerError> {
-    let weak_state_ref = Arc::downgrade(state);
-    match state.desired_status() {
-        RuntimeDesiredStatus::Unavailable => unreachable!(),
-        RuntimeDesiredStatus::Running
-        | RuntimeDesiredStatus::Paused
-        | RuntimeDesiredStatus::Suspended => {
-            // First, if necessary, download the latest checkpoint from S3.
-            if let Some(sync) = builder.is_pull_necessary() {
-                builder.pull_once(sync)?;
+    loop {
+        match state.desired_status() {
+            RuntimeDesiredStatus::Unavailable => unreachable!(),
+            RuntimeDesiredStatus::Coordination => {
+                println!("waiting for coordinator");
+                std::thread::sleep(Duration::from_secs(1));
             }
-        }
-        RuntimeDesiredStatus::Standby => {
-            state.set_phase(PipelinePhase::Initializing(InitializationState::Standby));
+            RuntimeDesiredStatus::Running
+            | RuntimeDesiredStatus::Paused
+            | RuntimeDesiredStatus::Suspended => {
+                // First, if necessary, download the latest checkpoint from S3.
+                if let Some(sync) = builder.is_pull_necessary() {
+                    builder.pull_once(sync)?;
+                }
+                break;
+            }
+            RuntimeDesiredStatus::Standby => {
+                state.set_phase(PipelinePhase::Initializing(InitializationState::Standby));
 
-            builder.continuous_pull(|| state.desired_status() != RuntimeDesiredStatus::Standby)?;
+                builder
+                    .continuous_pull(|| state.desired_status() != RuntimeDesiredStatus::Standby)?;
 
-            let mut desired_status = state.desired_status.lock().unwrap();
-            if *desired_status == RuntimeDesiredStatus::Standby {
-                warn!("Exited standby mode without specifying a new desired state, defaulting to paused");
-                *desired_status = RuntimeDesiredStatus::Paused;
-                state.desired_status_change.notify_waiters();
+                let mut desired_status = state.desired_status.lock().unwrap();
+                if *desired_status == RuntimeDesiredStatus::Standby {
+                    warn!("Exited standby mode without specifying a new desired state, defaulting to paused");
+                    *desired_status = RuntimeDesiredStatus::Paused;
+                    state.desired_status_change.notify_waiters();
+                }
+                break;
             }
         }
     }
 
-    let controller_init = builder.open_checkpoint()?;
+    let layout = state.layout.lock().unwrap().take();
+    let controller_init = builder.open_checkpoint(layout)?;
 
     let controller = controller_init.init(
         Some((**state).clone()),
         circuit_factory,
-        Box::new(move |e, t| error_handler(&weak_state_ref, e, t))
-            as Box<dyn Fn(Arc<ControllerError>, Option<String>) + Send + Sync>,
+        Box::new({
+            let weak_state_ref = Arc::downgrade(state);
+            move |e, t| error_handler(&weak_state_ref, e, t)
+        }) as Box<dyn Fn(Arc<ControllerError>, Option<String>) + Send + Sync>,
     )?;
 
     let desired_status = state.desired_status.lock().unwrap();
     match *desired_status {
-        RuntimeDesiredStatus::Unavailable | RuntimeDesiredStatus::Standby => unreachable!(),
+        RuntimeDesiredStatus::Unavailable
+        | RuntimeDesiredStatus::Standby
+        | RuntimeDesiredStatus::Coordination => unreachable!(),
         RuntimeDesiredStatus::Paused | RuntimeDesiredStatus::Suspended => controller.pause(),
         RuntimeDesiredStatus::Running => controller.start(),
     };
@@ -1074,7 +1106,6 @@ where
                 HttpResponse::Ok().body("<html><head><title>DBSP server</title></head></html>")
             }),
         )
-        .service(checkpoint_sync)
         .service(start)
         .service(pause)
         .service(activate)
@@ -1098,6 +1129,8 @@ where
         .service(lir)
         .service(checkpoint)
         .service(checkpoint_status)
+        .service(checkpoint_list)
+        .service(checkpoint_sync)
         .service(sync_checkpoint_status)
         .service(suspend)
         .service(input_endpoint)
@@ -1106,6 +1139,7 @@ where
         .service(start_input_endpoint)
         .service(input_endpoint_status)
         .service(output_endpoint_status)
+        .service(coordination_activate)
 }
 
 /// Implements `/start`, `/pause`, `/activate`:
@@ -1170,21 +1204,11 @@ async fn activate(
     state: WebData<ServerState>,
     args: Query<ActivateParams>,
 ) -> Result<HttpResponse, PipelineError> {
-    let desired_status = match args.initial.as_str() {
-        "paused" => RuntimeDesiredStatus::Paused,
-        "running" => RuntimeDesiredStatus::Running,
-        _ => {
-            return Err(PipelineError::InvalidActivateStatusString(
-                args.initial.clone(),
-            ))
-        }
-    };
-
-    match desired_status {
+    match args.initial {
         RuntimeDesiredStatus::Running | RuntimeDesiredStatus::Paused => {
-            state_transition(state, "activate", desired_status, true).await
+            state_transition(state, "activate", args.initial, true).await
         }
-        _ => Err(PipelineError::InvalidActivateStatus(desired_status)),
+        _ => Err(PipelineError::InvalidActivateStatus(args.initial)),
     }
 }
 
@@ -1639,6 +1663,17 @@ async fn checkpoint_status(state: WebData<ServerState>) -> impl Responder {
     HttpResponse::Ok().json(state.checkpoint_state.lock().unwrap().status.clone())
 }
 
+#[get("/checkpoint_list")]
+async fn checkpoint_list(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
+    let checkpoints = match &state.storage {
+        Some(backend) => {
+            Checkpointer::read_checkpoints(&**backend).map_err(ControllerError::dbsp_error)?
+        }
+        None => Default::default(),
+    };
+    Ok(HttpResponse::Ok().json(checkpoints))
+}
+
 #[get("/checkpoint/sync_status")]
 async fn sync_checkpoint_status(state: WebData<ServerState>) -> impl Responder {
     HttpResponse::Ok().json(state.sync_checkpoint_state.lock().unwrap().status.clone())
@@ -1656,7 +1691,9 @@ async fn suspend(state: WebData<ServerState>) -> Result<impl Responder, Pipeline
         RuntimeDesiredStatus::Standby => {
             return Err(PipelineError::InvalidTransition("suspend", *desired_status))
         }
-        RuntimeDesiredStatus::Running | RuntimeDesiredStatus::Paused => {
+        RuntimeDesiredStatus::Coordination
+        | RuntimeDesiredStatus::Running
+        | RuntimeDesiredStatus::Paused => {
             info!("suspend: Transitioning from {desired_status:?} to Suspended");
             *desired_status = RuntimeDesiredStatus::Suspended;
             state.desired_status_change.notify_waiters();
@@ -2034,6 +2071,35 @@ async fn completion_status(
     }
 }
 
+#[post("/coordination/activate")]
+async fn coordination_activate(
+    state: WebData<ServerState>,
+    args: web::Json<CoordinationActivate>,
+) -> Result<HttpResponse, PipelineError> {
+    let layout = Layout::new_multihost(&args.exchanges, args.local_address)
+        .map_err(PipelineError::invalid_param)?;
+    match args.desired_status {
+        RuntimeDesiredStatus::Coordination
+        | RuntimeDesiredStatus::Unavailable
+        | RuntimeDesiredStatus::Suspended => {
+            return Err(ControllerError::InvalidInitialStatus(args.desired_status).into())
+        }
+        RuntimeDesiredStatus::Paused
+        | RuntimeDesiredStatus::Running
+        | RuntimeDesiredStatus::Standby => (),
+    }
+
+    *state.layout.lock().unwrap() = Some(layout);
+    *state.desired_status.lock().unwrap() = args.desired_status;
+    state.desired_status_change.notify_waiters();
+    Ok(HttpResponse::Ok().finish())
+}
+
+#[post("/coordination/steps")]
+async fn coordination_steps(state: WebData<ServerState>) -> impl Responder {
+    HttpResponseBuilder::new(StatusCode::OK).streaming(todo!())
+}
+
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct StoredStatus {
     /// Desired status.
@@ -2181,6 +2247,7 @@ outputs:
             RuntimeDesiredStatus::Paused,
             BootstrapPolicy::Allow,
             Uuid::new_v4(),
+            None,
         ));
         let state_clone = state.clone();
 
@@ -2470,6 +2537,7 @@ outputs:
             RuntimeDesiredStatus::Paused,
             BootstrapPolicy::Allow,
             Uuid::default(),
+            None,
         ));
         let state_clone = state.clone();
 

@@ -180,7 +180,6 @@ pub enum PipelineError {
     },
     Suspended,
     InvalidActivateStatus(RuntimeDesiredStatus),
-    InvalidActivateStatusString(String),
     InvalidTransition(&'static str, RuntimeDesiredStatus),
 }
 
@@ -188,6 +187,14 @@ impl From<ControllerError> for PipelineError {
     fn from(error: ControllerError) -> Self {
         Self::ControllerError {
             error: Arc::new(error),
+        }
+    }
+}
+
+impl PipelineError {
+    pub fn invalid_param(error: impl Display) -> Self {
+        Self::InvalidParam {
+            error: error.to_string(),
         }
     }
 }
@@ -282,12 +289,6 @@ impl Display for PipelineError {
                     "Invalid activation status {status:?} (only running and paused are valid)"
                 )
             }
-            Self::InvalidActivateStatusString(status) => {
-                write!(
-                    f,
-                    "Invalid activation status ?initial={status} (only running and paused are valid)"
-                )
-            }
             Self::InvalidTransition(transition, status) => {
                 write!(f, "Cannot execute {transition} transition starting from {status:?}")
             }
@@ -312,7 +313,6 @@ impl DetailedError for PipelineError {
             Self::AdHocQueryError { .. } => Cow::from("AdHocQueryError"),
             Self::Suspended => Cow::from("Suspended"),
             Self::InvalidActivateStatus(_) => Cow::from("InvalidActivateStatus"),
-            Self::InvalidActivateStatusString(_) => Cow::from("InvalidActivateStatusString"),
             Self::InvalidTransition(_, _) => Cow::from("InvalidTransition"),
         }
     }
@@ -346,7 +346,6 @@ impl ResponseError for PipelineError {
             Self::AdHocQueryError { .. } => StatusCode::BAD_REQUEST,
             Self::Suspended => StatusCode::SERVICE_UNAVAILABLE,
             Self::InvalidActivateStatus(_) => StatusCode::BAD_REQUEST,
-            Self::InvalidActivateStatusString(_) => StatusCode::BAD_REQUEST,
             Self::InvalidTransition(_, _) => StatusCode::BAD_REQUEST,
         }
     }

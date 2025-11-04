@@ -1092,7 +1092,7 @@ impl Display for ControllerError {
                 )
             }
             Self::InvalidInitialStatus(status) => {
-                write!(f, "Invalid initial status {status:?} provided on command line or read from storage (only running, paused, and standby are valid)")
+                write!(f, "Invalid initial status {status:?} provided on command line or read from storage (only coordination, running, paused, and standby are valid)")
             }
             Self::InvalidStandby(standby) => {
                 write!(f, "Cannot enter standby mode: {standby}")

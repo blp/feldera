@@ -5,8 +5,8 @@ use crate::has_unstable_feature;
 use clap::Parser;
 use feldera_ir::Dataflow;
 use feldera_types::config::{
-    ConnectorConfig, InputEndpointConfig, OutputEndpointConfig, PipelineConfig, ProgramIr,
-    RuntimeConfig, TransportConfig,
+    ConnectorConfig, InputEndpointConfig, MultihostConfig, OutputEndpointConfig, PipelineConfig,
+    ProgramIr, RuntimeConfig, TransportConfig,
 };
 use feldera_types::program_schema::{ProgramSchema, PropertyValue, SourcePosition, SqlIdentifier};
 use regex::Regex;
@@ -798,6 +798,15 @@ pub fn generate_pipeline_config(
         name: Some(format!("pipeline-{pipeline_id}")),
         given_name: Some(pipeline_name.to_string()),
         global: runtime_config.clone(),
+        multihost: if runtime_config.hosts > 1
+            || runtime_config.dev_tweaks.contains_key("multihost")
+        {
+            Some(MultihostConfig {
+                hosts: runtime_config.hosts,
+            })
+        } else {
+            None
+        },
         storage_config: None, // Set by the runner based on global field
         secrets_dir: None,
         inputs: program_info.input_connectors.clone(),
