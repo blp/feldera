@@ -7,10 +7,7 @@ use dbsp::{
     circuit::Layout, utils::Tup3, DBSPHandle, OrdIndexedZSet, OutputHandle, RootCircuit, Runtime,
     ZSetHandle,
 };
-use futures::{
-    future::{self, Ready},
-    prelude::*,
-};
+use futures::{future, prelude::*};
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
@@ -110,13 +107,14 @@ impl Server {
     }
 }
 impl Circuit for Server {
-    type InitFut = Ready<()>;
-    fn init(self, _: context::Context, layout: Layout) -> Self::InitFut {
-        self.replace(layout);
-        future::ready(())
+    async fn init(self, _: context::Context, layout: Layout) {
+        self.replace(layout)
     }
-    type RunFut = Ready<Vec<(String, VaxMonthly, i64)>>;
-    fn run(self, _: context::Context, mut records: Vec<Tup2<Record, i64>>) -> Self::RunFut {
+    async fn run(
+        self,
+        _: context::Context,
+        mut records: Vec<Tup2<Record, i64>>,
+    ) -> Vec<(String, VaxMonthly, i64)> {
         self.inner()
             .as_ref()
             .unwrap()
@@ -128,16 +126,18 @@ impl Circuit for Server {
             .circuit
             .transaction()
             .unwrap();
-        future::ready(
-            self.inner()
-                .as_ref()
-                .unwrap()
-                .output_handle
-                .consolidate()
-                .iter()
-                .collect(),
-        )
+        self.inner()
+            .as_ref()
+            .unwrap()
+            .output_handle
+            .consolidate()
+            .iter()
+            .collect()
     }
+}
+
+async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
+    tokio::spawn(fut);
 }
 
 #[tokio::main]
@@ -152,7 +152,7 @@ async fn main() -> AnyResult<()> {
         .filter_map(|r| future::ready(r.ok()))
         .map(server::BaseChannel::with_defaults)
         .max_channels_per_key(1, |t| t.transport().peer_addr().unwrap().ip())
-        .map(|channel| channel.execute(server.clone().serve()))
+        .map(|channel| channel.execute(server.clone().serve()).for_each(spawn))
         .buffer_unordered(10)
         .for_each(|_| async {})
         .await;
