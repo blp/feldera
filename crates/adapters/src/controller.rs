@@ -2991,11 +2991,6 @@ impl StepTrigger {
         // Used to force a step regardless of input
         let committing = self.controller.transaction_commit_requested();
 
-        fn step(trigger: &mut StepTrigger) -> Action {
-            trigger.buffer_timeout = None;
-            Action::Step
-        }
-
         let now = Instant::now();
 
         // The last condition detects a transition from bootstrapping to normal
@@ -3003,14 +2998,14 @@ impl StepTrigger {
         // mode in order to initialize output table snapshots of output relations that
         // did not participate in bootstrapping.
         let result = if replaying || committing || bootstrapping || self.bootstrapping {
-            step(self)
+            Action::Step
         } else if checkpoint.is_some_and(|t| now >= t) && !checkpoint_requested {
             Action::Checkpoint
         } else if self.controller.status.unset_step_requested()
             || buffered_records > self.min_batch_size_records
             || self.buffer_timeout.is_some_and(|t| now >= t)
         {
-            step(self)
+            Action::Step
         } else {
             if buffered_records > 0 && self.buffer_timeout.is_none() {
                 self.buffer_timeout = Some(now + self.max_buffering_delay);
@@ -3023,6 +3018,9 @@ impl StepTrigger {
         };
 
         self.bootstrapping = bootstrapping;
+        if result == Action::Step {
+            self.buffer_timeout = None;
+        }
 
         result
     }
