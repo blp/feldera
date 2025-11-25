@@ -30,6 +30,7 @@ use actix_web::{
 };
 use async_stream;
 use atomic::Atomic;
+use bytes::Bytes;
 use chrono::Utc;
 use clap::Parser;
 use colored::{ColoredString, Colorize};
@@ -75,6 +76,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::ffi::OsStr;
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::io::ErrorKind;
@@ -92,6 +94,7 @@ use tokio::spawn;
 use tokio::sync::Notify;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
+use tokio_stream::wrappers::WatchStream;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tracing::{debug, error, info, info_span, warn, Instrument, Level, Subscriber};
 use tracing_subscriber::fmt::format::Format;
@@ -2095,9 +2098,12 @@ async fn coordination_activate(
     Ok(HttpResponse::Ok().finish())
 }
 
-#[post("/coordination/steps")]
-async fn coordination_steps(state: WebData<ServerState>) -> impl Responder {
-    HttpResponseBuilder::new(StatusCode::OK).streaming(todo!())
+#[post("/coordination/status")]
+async fn coordination_status(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
+    Ok(HttpResponseBuilder::new(StatusCode::OK).streaming(
+        WatchStream::new(state.controller()?.step_watcher())
+            .map(|step| Ok::<_, Infallible>(Bytes::from(format!("{step}\n")))),
+    ))
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
