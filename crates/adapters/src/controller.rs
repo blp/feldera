@@ -181,7 +181,7 @@ static COMMIT_UPDATE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Creates a [Controller].
 pub struct ControllerBuilder {
-    config: PipelineConfig,
+    pub config: PipelineConfig,
     storage: Option<CircuitStorageConfig>,
 }
 

@@ -12,7 +12,9 @@ use actix_web::http::StatusCode;
 use actix_web::{HttpResponse, HttpResponseBuilder, ResponseError};
 use anyhow::Error as AnyError;
 use dbsp::{
-    circuit::circuit_builder::BootstrapInfo, storage::backend::StorageError, Error as DbspError,
+    circuit::{circuit_builder::BootstrapInfo, LayoutError},
+    storage::backend::StorageError,
+    Error as DbspError,
 };
 use feldera_types::{
     error::{DetailedError, ErrorResponse},
@@ -165,6 +167,8 @@ pub enum ConfigError {
 
     FtRequiresStorage,
     FtRequiresFtInput,
+
+    InvalidLayout(LayoutError),
 }
 
 impl StdError for ConfigError {}
@@ -199,6 +203,7 @@ impl DbspDetailedError for ConfigError {
             Self::FtRequiresFtInput => Cow::from("FtWithNonFtInput"),
             Self::CyclicDependency { .. } => Cow::from("CyclicDependency"),
             Self::EmptyStartAfter { .. } => Cow::from("EmptyStartAfter"),
+            Self::InvalidLayout(_) => Cow::from("LayoutError"),
         }
     }
 }
@@ -371,6 +376,7 @@ impl Display for ConfigError {
             }
             Self::FtRequiresStorage => write!(f, "Fault tolerance is configured, which requires storage, but storage is not enabled"),
             Self::FtRequiresFtInput => write!(f, "Fault tolerance is configured, but it cannot be enabled because the pipeline has at least one non-fault-tolerant input adapter"),
+            Self::InvalidLayout(e) => write!(f, "Multihost layout error: {e}"),
         }
     }
 }

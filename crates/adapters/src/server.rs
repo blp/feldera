@@ -39,6 +39,7 @@ use dbsp::circuit::Layout;
 use dbsp::{circuit::CircuitConfig, DBSPHandle};
 use dbsp::{RootCircuit, Runtime};
 use dyn_clone::DynClone;
+use feldera_adapterlib::errors::controller::ConfigError;
 use feldera_adapterlib::PipelineState;
 use feldera_observability as observability;
 use feldera_storage::{StorageBackend, StoragePath};
@@ -265,7 +266,7 @@ pub(crate) struct ServerState {
     // of tags, so using String is fine.
     rate_limiter: TokenBucketRateLimiter<String>,
 
-    layout: Mutex<Option<Layout>>,
+    coordination_activate: Mutex<Option<CoordinationActivate>>,
 }
 
 impl ServerState {
@@ -291,7 +292,7 @@ impl ServerState {
             deployment_id,
             storage,
             rate_limiter,
-            layout: Default::default(),
+            coordination_activate: Default::default(),
         }
     }
 
@@ -1026,14 +1027,39 @@ fn get_env_filter(config: &PipelineConfig) -> EnvFilter {
 }
 
 fn do_bootstrap(
-    builder: ControllerBuilder,
+    mut builder: ControllerBuilder,
     circuit_factory: CircuitFactoryFunc,
     state: &WebData<ServerState>,
 ) -> Result<(), ControllerError> {
-    loop {
+    let layout = loop {
         match state.desired_status() {
             RuntimeDesiredStatus::Unavailable => unreachable!(),
             RuntimeDesiredStatus::Coordination => {
+                if let Some(mut ca) = state.coordination_activate.lock().unwrap().take() {
+                    let layout =
+                        Layout::new_multihost(&ca.exchanges, ca.local_address).map_err(|e| {
+                            ControllerError::Config {
+                                config_error: Box::new(ConfigError::InvalidLayout(e)),
+                            }
+                        })?;
+
+                    match ca.desired_status {
+                        RuntimeDesiredStatus::Coordination
+                        | RuntimeDesiredStatus::Unavailable
+                        | RuntimeDesiredStatus::Suspended => {
+                            return Err(
+                                ControllerError::InvalidInitialStatus(ca.desired_status).into()
+                            )
+                        }
+                        RuntimeDesiredStatus::Paused
+                        | RuntimeDesiredStatus::Running
+                        | RuntimeDesiredStatus::Standby => (),
+                    }
+                    builder.config.inputs = std::mem::take(&mut ca.inputs);
+                    builder.config.outputs = std::mem::take(&mut ca.outputs);
+                    *state.desired_status.lock().unwrap() = ca.desired_status;
+                    break Some(layout);
+                }
                 println!("waiting for coordinator");
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -1044,7 +1070,7 @@ fn do_bootstrap(
                 if let Some(sync) = builder.is_pull_necessary() {
                     builder.pull_once(sync)?;
                 }
-                break;
+                break None;
             }
             RuntimeDesiredStatus::Standby => {
                 state.set_phase(PipelinePhase::Initializing(InitializationState::Standby));
@@ -1058,12 +1084,11 @@ fn do_bootstrap(
                     *desired_status = RuntimeDesiredStatus::Paused;
                     state.desired_status_change.notify_waiters();
                 }
-                break;
+                break None;
             }
         }
-    }
+    };
 
-    let layout = state.layout.lock().unwrap().take();
     let controller_init = builder.open_checkpoint(layout)?;
 
     let controller = controller_init.init(
@@ -1142,7 +1167,7 @@ where
         .service(start_input_endpoint)
         .service(input_endpoint_status)
         .service(output_endpoint_status)
-        .service(coordination_activate)
+        .service(coordination_activate_handler)
         .service(coordination_request)
         .service(coordination_status)
 }
@@ -2077,25 +2102,11 @@ async fn completion_status(
 }
 
 #[post("/coordination/activate")]
-async fn coordination_activate(
+async fn coordination_activate_handler(
     state: WebData<ServerState>,
     args: web::Json<CoordinationActivate>,
 ) -> Result<HttpResponse, PipelineError> {
-    let layout = Layout::new_multihost(&args.exchanges, args.local_address)
-        .map_err(PipelineError::invalid_param)?;
-    match args.desired_status {
-        RuntimeDesiredStatus::Coordination
-        | RuntimeDesiredStatus::Unavailable
-        | RuntimeDesiredStatus::Suspended => {
-            return Err(ControllerError::InvalidInitialStatus(args.desired_status).into())
-        }
-        RuntimeDesiredStatus::Paused
-        | RuntimeDesiredStatus::Running
-        | RuntimeDesiredStatus::Standby => (),
-    }
-
-    *state.layout.lock().unwrap() = Some(layout);
-    *state.desired_status.lock().unwrap() = args.desired_status;
+    *state.coordination_activate.lock().unwrap() = Some(args.into_inner());
     state.desired_status_change.notify_waiters();
     Ok(HttpResponse::Ok().finish())
 }

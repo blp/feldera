@@ -1,10 +1,13 @@
 //! Interface between the coordinator and the pipeline.
 
-use std::net::SocketAddr;
+use std::{borrow::Cow, collections::BTreeMap, net::SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::runtime_status::RuntimeDesiredStatus;
+use crate::{
+    config::{InputEndpointConfig, OutputEndpointConfig},
+    runtime_status::RuntimeDesiredStatus,
+};
 
 /// `/coordination/activate` request, sent by coordinator to pipeline to
 /// transition out of [RuntimeDesiredStatus::Coordination].
@@ -13,7 +16,13 @@ pub struct CoordinationActivate {
     pub exchanges: Vec<(SocketAddr, usize)>,
     pub local_address: SocketAddr,
     pub desired_status: RuntimeDesiredStatus,
-    // add: pipeline configuration
+
+    /// Input endpoint configuration.
+    pub inputs: BTreeMap<Cow<'static, str>, InputEndpointConfig>,
+
+    /// Output endpoint configuration.
+    #[serde(default)]
+    pub outputs: BTreeMap<Cow<'static, str>, OutputEndpointConfig>,
     // add: checkpoint to start from (if there's no checkpoint to start from
     // then we need to delete all the checkpoints)
 }

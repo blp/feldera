@@ -204,7 +204,7 @@ impl Layout {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub enum LayoutError {
     /// The socket address passed to `new_multihost()` isn't in the list of
     /// hosts.
