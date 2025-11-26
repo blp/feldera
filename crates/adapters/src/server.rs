@@ -54,7 +54,7 @@ use feldera_types::completion_token::{
     CompletionStatusArgs, CompletionStatusResponse, CompletionTokenResponse,
 };
 use feldera_types::constants::STATUS_FILE;
-use feldera_types::coordination::CoordinationActivate;
+use feldera_types::coordination::{CoordinationActivate, CoordinationRequest};
 use feldera_types::pipeline_diff::PipelineDiff;
 use feldera_types::query_params::{ActivateParams, MetricsFormat, MetricsParameters};
 use feldera_types::runtime_status::{
@@ -1143,6 +1143,8 @@ where
         .service(input_endpoint_status)
         .service(output_endpoint_status)
         .service(coordination_activate)
+        .service(coordination_request)
+        .service(coordination_status)
 }
 
 /// Implements `/start`, `/pause`, `/activate`:
@@ -2098,11 +2100,21 @@ async fn coordination_activate(
     Ok(HttpResponse::Ok().finish())
 }
 
-#[post("/coordination/status")]
+#[post("/coordination/request")]
+async fn coordination_request(
+    state: WebData<ServerState>,
+    args: web::Json<CoordinationRequest>,
+) -> Result<HttpResponse, PipelineError> {
+    state.controller()?.set_coordination_request(*args);
+    Ok(HttpResponse::Ok().finish())
+}
+
+#[get("/coordination/status")]
 async fn coordination_status(state: WebData<ServerState>) -> Result<HttpResponse, PipelineError> {
     Ok(HttpResponseBuilder::new(StatusCode::OK).streaming(
-        WatchStream::new(state.controller()?.step_watcher())
-            .map(|step| Ok::<_, Infallible>(Bytes::from(format!("{step}\n")))),
+        WatchStream::new(state.controller()?.step_watcher()).map(|value| {
+            Ok::<_, Infallible>(Bytes::from(serde_json::to_string(&value).unwrap() + "\n"))
+        }),
     ))
 }
 

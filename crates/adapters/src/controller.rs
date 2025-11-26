@@ -79,6 +79,7 @@ use feldera_storage::metrics::{
     WRITE_LATENCY_MICROSECONDS,
 };
 use feldera_types::checkpoint::CheckpointMetadata;
+use feldera_types::coordination::{CoordinationAction, CoordinationRequest, CoordinationStatus};
 use feldera_types::format::json::JsonLines;
 use feldera_types::pipeline_diff::PipelineDiff;
 use feldera_types::runtime_status::BootstrapPolicy;
@@ -1450,8 +1451,13 @@ impl Controller {
 
     /// Returns an object for monitoring the step that the controller has
     /// completed.
-    pub fn step_watcher(&self) -> tokio::sync::watch::Receiver<Step> {
+    pub fn step_watcher(&self) -> tokio::sync::watch::Receiver<CoordinationStatus> {
         self.inner.step_receiver.clone()
+    }
+
+    pub fn set_coordination_request(&self, coordination_request: CoordinationRequest) {
+        *self.inner.coordination_request.lock().unwrap() = Some(coordination_request);
+        self.inner.unpark_circuit();
     }
 }
 
@@ -1492,7 +1498,7 @@ struct CircuitThread {
     /// Used to notify watchers when a step has been completed.
     ///
     /// This is updated to match `step` whenever it changes.
-    step_sender: tokio::sync::watch::Sender<Step>,
+    step_sender: tokio::sync::watch::Sender<CoordinationStatus>,
 
     /// Metadata for `step - 1`; that is, the metadata that would be part of a
     /// [Checkpoint] for `step`, to allow the input endpoints to seek to the
@@ -1702,7 +1708,8 @@ impl CircuitThread {
             HashMap::new()
         };
 
-        let (step_sender, step_receiver) = tokio::sync::watch::channel(step);
+        let (step_sender, step_receiver) =
+            tokio::sync::watch::channel(CoordinationStatus::new(step, CoordinationAction::Idle));
         let (parker, backpressure_thread, command_receiver, controller) = ControllerInner::new(
             pipeline_config,
             circuit.runtime(),
@@ -1859,11 +1866,14 @@ impl CircuitThread {
             }
             output_backpressure_warning = None;
 
+            let coordination_request = self.controller.coordination_request.lock().unwrap().clone();
             match trigger.trigger(
                 self.last_checkpoint,
                 self.replaying(),
                 self.circuit.bootstrap_in_progress(),
                 self.checkpoint_requested(),
+                coordination_request,
+                self.step,
             ) {
                 Action::Step => {
                     if !self.step()? {
@@ -1890,6 +1900,8 @@ impl CircuitThread {
     }
 
     fn step(&mut self) -> Result<bool, ControllerError> {
+        self.step_sender
+            .send_replace(CoordinationStatus::new(self.step, CoordinationAction::Step));
         let total_consumed =
             match SamplySpan::new(debug_span!("input")).in_scope(|| self.input_step())? {
                 Some(total_consumed) => total_consumed,
@@ -1897,7 +1909,8 @@ impl CircuitThread {
             };
 
         self.step += 1;
-        self.step_sender.send_replace(self.step);
+        self.step_sender
+            .send_replace(CoordinationStatus::new(self.step, CoordinationAction::Idle));
 
         // Wake up the backpressure thread to unpause endpoints blocked due to
         // backpressure.
@@ -2923,7 +2936,7 @@ struct StepTrigger {
 }
 
 /// Action for the controller to take.
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Action {
     /// Park until time `.0`, or forever if `None`.
     Park(Option<Instant>),
@@ -2958,6 +2971,7 @@ impl StepTrigger {
     /// - Whether we're currently `replaying`.
     /// - Whether the pipeline is currently `bootstrapping`.
     /// - Whether a checkpoint has already been requested.
+    /// - The current [CoordinationRequest] and the current step.
     ///
     /// Returns the action for the controller to take.
     fn trigger(
@@ -2966,6 +2980,8 @@ impl StepTrigger {
         replaying: bool,
         bootstrapping: bool,
         checkpoint_requested: bool,
+        coordination_request: Option<CoordinationRequest>,
+        step: Step,
     ) -> Action {
         // If any input endpoints are blocking suspend, then those are the only
         // ones that we count; otherwise, count all of them.
@@ -2993,6 +3009,24 @@ impl StepTrigger {
 
         let now = Instant::now();
 
+        fn trigger_on_coordination_request(
+            coordination_request: Option<CoordinationRequest>,
+            step: Step,
+        ) -> Option<bool> {
+            let request = coordination_request?;
+            match request.action {
+                CoordinationAction::Idle => Some(false),
+                CoordinationAction::Step => Some(request.step >= step),
+                CoordinationAction::Trigger => {
+                    if request.step < step {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+
         // The last condition detects a transition from bootstrapping to normal
         // operation and makes sure that the circuit performs an extra step in the normal
         // mode in order to initialize output table snapshots of output relations that
@@ -3001,10 +3035,12 @@ impl StepTrigger {
             Action::Step
         } else if checkpoint.is_some_and(|t| now >= t) && !checkpoint_requested {
             Action::Checkpoint
-        } else if self.controller.status.unset_step_requested()
-            || buffered_records > self.min_batch_size_records
-            || self.buffer_timeout.is_some_and(|t| now >= t)
-        {
+        } else if self.controller.status.unset_step_requested() {
+            Action::Step
+        } else if trigger_on_coordination_request(coordination_request, step).unwrap_or_else(|| {
+            buffered_records > self.min_batch_size_records
+                || self.buffer_timeout.is_some_and(|t| now >= t)
+        }) {
             Action::Step
         } else {
             if buffered_records > 0 && self.buffer_timeout.is_none() {
@@ -4014,7 +4050,8 @@ pub struct ControllerInner {
     error_cb: Box<dyn Fn(Arc<ControllerError>, Option<String>) + Send + Sync>,
     session_ctxt: SessionContext,
     fault_tolerance: Option<FtModel>,
-    step_receiver: tokio::sync::watch::Receiver<Step>,
+    step_receiver: tokio::sync::watch::Receiver<CoordinationStatus>,
+    coordination_request: Mutex<Option<CoordinationRequest>>,
     // The mutex is acquired from async context by actix and
     // from the sync context by the circuit thread.
     transaction_info: Mutex<TransactionInfo>,
@@ -4050,7 +4087,7 @@ impl ControllerInner {
         initial_start_time: Option<DateTime<Utc>>,
         resume_info: &HashMap<String, (JsonValue, CheckpointInputEndpointMetrics)>,
         output_statistics: &HashMap<String, CheckpointOutputEndpointMetrics>,
-        step_receiver: tokio::sync::watch::Receiver<Step>,
+        step_receiver: tokio::sync::watch::Receiver<CoordinationStatus>,
     ) -> Result<(Parker, BackpressureThread, Receiver<Command>, Arc<Self>), ControllerError> {
         let status = Arc::new(ControllerStatus::new(
             config.clone(),
@@ -4082,6 +4119,12 @@ impl ControllerInner {
             restoring: AtomicBool::new(config.global.fault_tolerance.is_enabled()),
             transaction_number: AtomicU64::new(0),
             step_receiver,
+            coordination_request: Mutex::new(
+                config
+                    .multihost
+                    .is_some()
+                    .then_some(CoordinationRequest::new(0, CoordinationAction::Idle)),
+            ),
         });
         controller.initialize_adhoc_queries();
 

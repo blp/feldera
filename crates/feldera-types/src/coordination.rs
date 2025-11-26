@@ -41,6 +41,12 @@ pub struct CoordinationStatus {
     pub action: CoordinationAction,
 }
 
+impl CoordinationStatus {
+    pub fn new(step: Step, action: CoordinationAction) -> Self {
+        Self { step, action }
+    }
+}
+
 /// `/coordination/request` request, sent by coordinator to pipeline to control
 /// running behavior.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

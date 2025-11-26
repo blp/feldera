@@ -36,19 +36,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()
             .expect("Could not use WEBCONSOLE_BUILD_DIR as a website location")
     } else {
-        ChangeDetection::exclude(|path: &Path| {
-            EXCLUDE_LIST
-            .iter()
-            .any(|exclude| path.to_str().unwrap().starts_with(exclude))
-            // Also exclude web-console folder itself because we mutate things inside
-            // of it
-            || path.to_str().unwrap() == "../../js-packages/web-console/"
-        })
-        .path("../../js-packages/web-console/")
-        .path("../../js-packages/profiler-lib/")
-        .path("build.rs")
-        .generate();
-
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
         let out_dir_parts = out_dir.iter().collect::<Vec<_>>();
         let rel_build_dir = out_dir_parts[out_dir_parts.len() - 2..]
